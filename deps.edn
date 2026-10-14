@@ -1,0 +1,6 @@
+{:paths ["src"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.6"}
+        datalevin/datalevin {:local/root "../datalevin"}}
+ :aliases {:test {:extra-paths ["test"]
+                  :jvm-opts ["-Dclojure.compiler.direct-linking=true"]
+                  :main-opts ["-m" "datalevin.federation.test-runner"]}}}
