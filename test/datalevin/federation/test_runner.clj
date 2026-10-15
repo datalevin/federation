@@ -1,11 +1,12 @@
 (ns datalevin.federation.test-runner
-  (:require [clojure.test :as test]
-            [datalevin.federation.contract-test]
-            [datalevin.federation.local-test]
-            [datalevin.federation.local-batch-test]))
+  (:require [clojure.test :as test]))
 
-(defn -main [& _]
-  (let [{:keys [fail error]} (test/run-tests 'datalevin.federation.contract-test
-                                           'datalevin.federation.local-test
-                                           'datalevin.federation.local-batch-test)]
+(defn -main [& namespaces]
+  (let [namespaces (if (seq namespaces)
+                     (mapv symbol namespaces)
+                     '[datalevin.federation.contract-test
+                       datalevin.federation.local-test
+                       datalevin.federation.local-batch-test])
+        _ (run! require namespaces)
+        {:keys [fail error]} (apply test/run-tests namespaces)]
     (System/exit (if (zero? (+ fail error)) 0 1))))
