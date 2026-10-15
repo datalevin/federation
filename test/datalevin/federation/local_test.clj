@@ -63,16 +63,19 @@
                 :query-source {:limits {:retained-bytes 16777216 :spill-bytes 0}}}
         explain (d/explain {:run? true} query s)]
     (is (= #{[19999]} (d/q query s)))
-    (is (= 20000 (get-in explain [:cursors 0 :metrics :read-rows])))
+    (is (= 40000 (get-in explain [:cursors 0 :metrics :read-rows])))
+    (is (= 5 (get-in explain [:cursors 0 :metrics :batches])))
     (is (= 1 (:result-rows explain)))
     (is (= :query-source/limit
            (category #(d/q (assoc-in query [:query-source :limits :retained-bytes] 1024) s))))
     (is (= :query-source/limit
            (category #(d/q (assoc-in query [:query-source :limits :batch-bytes] 1) s)))))
   (let [s (local/source descriptor [[1 "a"] [2 "b"] [3 "c"]])
-        query '{:find [?id] :in [$s] :where [[$s ?id _]] :limit 1}
+        query '{:find [?id] :in [$s] :where [[$s ?id _]] :limit 1
+                :query-source {:limits {:batch-rows 2}}}
         explain (d/explain {:run? true} query s)]
-    (is (= 1 (get-in explain [:cursors 0 :metrics :read-rows])))
+    (is (= 4 (get-in explain [:cursors 0 :metrics :read-rows])))
+    (is (= 1 (get-in explain [:cursors 0 :metrics :batches])))
     (is (= :query-source/limit
            (category #(d/q (-> query (dissoc :limit)
                                 (assoc :query-source {:limits {:result-rows 1}})) s))))))

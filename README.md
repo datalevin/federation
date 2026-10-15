@@ -30,15 +30,23 @@ It copies mutable leaves on construction; `local/replace-rows!` atomically
 publishes a new version without changing accepted metadata. Open sessions pin
 and charge their complete row version, so replacement cannot change an active
 query's view. Passing this caller-owned object grants local read access.
-The adapter plans one scan per pattern and leaves predicates to core. It emits
-owned single-row batches and reports physical rows examined separately from
-rows returned. It advertises no optional features and performs no discovery.
+The adapter plans one scan per pattern and leaves predicates to core. It sizes
+multi-row batches against the requested row and byte limits, reserves memory
+once per batch, then copies owned values from the pinned snapshot. Physical
+rows examined include both the sizing and copy passes, plus byte-boundary
+lookahead; rows returned are reported separately. Early stop may read ahead
+within the current batch. It advertises no optional features and performs no
+discovery.
 
 The [execution tests](test/datalevin/federation/local_test.clj) compare eager
 results, native joins, aliases under writes, decimal key/predicate behavior,
 nominal reference-valued EAV facts, and resource limits. F1 remains in progress;
 the core [supported subset and remaining cases](../datalevin/doc/query-source-spi.md#9-source-conformance)
 apply to this adapter too.
+
+The [batch tests](test/datalevin/federation/local_batch_test.clj) check exact
+row/byte boundaries, mutable ownership after close, empty/missing EAV values,
+and reservation failure without consuming rows.
 
 `compile-relation` accepts the main-schema definition map, a relation ID, and a
 context containing a compute-context ID and recorded semantic dependencies.

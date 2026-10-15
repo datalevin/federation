@@ -58,44 +58,87 @@
                          (when (= (bindings sym) x) bindings)
                          (assoc bindings sym x)))))) bindings (map vector terms row)))
 
+(def ^:private empty-vector-charge (value/value-charge []))
+
+(defn- batch-window [rows start columns project max-rows max-bytes]
+  ;; Keep only one projected row at a time. Its values are borrowed from the
+  ;; already charged snapshot/bindings; cursor scratch covers its containers.
+  (loop [index (long start), n 0, bytes 0]
+    (if (or (= index (count rows)) (= n max-rows))
+      {:end index :row-count n :byte-count bytes}
+      (if-let [row (project (nth rows index))]
+        (let [candidate (if (zero? n)
+                          (spi/batch-charge-bytes columns [row])
+                          ;; Each append adds one vector slot and one row's
+                          ;; charge. Derive that increment from the shared
+                          ;; value helper instead of repeating size constants.
+                          (+' bytes (-' (value/value-charge [row]) empty-vector-charge)))]
+          (if (value/at-most? candidate max-bytes)
+            (recur (inc index) (inc n) (long candidate))
+            (if (pos? n)
+              ;; Do not consume the row that belongs to the next batch.
+              {:end index :row-count n :byte-count bytes}
+              (throw (ex-info "Local row exceeds batch limit"
+                              {:error :query-source/limit :phase :batch :category :batch-bytes
+                               :maximum max-bytes :attempted candidate})))))
+        (recur (inc index) n bytes)))))
+
+(defn- copy-window [rows start end project]
+  (loop [index (long start), owned (transient [])]
+    (if (= index end)
+      (persistent! owned)
+      (recur (inc index)
+             (if-let [row (project (nth rows index))]
+               (conj! owned (copy-value row))
+               owned)))))
+
 (defrecord Cursor [snapshot plan descriptor request position state session-state metrics reservation]
   spi/IQuerySourceCursor
   (-next-batch! [_ {:keys [control max-rows max-bytes]}]
     (active! state control)
     (active! session-state control)
-    (when-not (and (identical? control (:control request)) (pos-int? max-rows) (pos-int? max-bytes))
+    (when-not (and (identical? control (:control request))
+                  (integer? max-rows) (<= 1 max-rows Long/MAX_VALUE)
+                  (integer? max-bytes) (<= 1 max-bytes Long/MAX_VALUE))
       (fail! :query-source/invalid :fetch))
     (let [started (System/nanoTime)
           rows @snapshot
           columns (:columns plan)
+          variables (mapv :variable columns)
           eav? (= :eav (get-in descriptor [:pattern-contract :kind]))
-          match (loop []
-                  (spi/check-active! control)
-                  (when (< @position (count rows))
-                    (let [row (nth rows @position)]
-                      (swap! position inc)
-                      (swap! metrics update :read-rows inc)
-                      (if-let [binding (when-not (and eav? (or (nil? (get row 0)) (nil? (get row 2))))
+          read-rows (volatile! 0)
+          project (fn [row]
+                    (active! session-state control)
+                    (vswap! read-rows inc)
+                    (when-let [binding (when-not (and eav? (or (nil? (get row 0)) (nil? (get row 2))))
                                          (match-row (:bindings plan) (:terms (:clause plan)) row))]
-                        (mapv binding (map :variable columns))
-                        (recur)))))
-          batch (if match [match] [])
-          bytes (spi/batch-charge-bytes columns batch)]
-      (when (> bytes max-bytes)
-        (throw (ex-info "Local row exceeds batch limit"
-                        {:error :query-source/limit :phase :batch :category :batch-bytes
-                         :maximum max-bytes :attempted bytes})))
-      ;; Single-row batches let the provider reserve the exact conservative
-      ;; size before copying mutable leaves, without an unaccounted row buffer.
-      (let [reservation (when match (spi/reserve! control {:retained-bytes bytes :in-flight-batches 1}))]
-        (try
-          (let [owned (copy-value batch)]
-            (swap! metrics #(-> % (update :batches inc) (update :rows + (count owned))
-                                (update :charged-bytes + bytes)
-                                (update :elapsed-ns + (- (System/nanoTime) started))))
-            {:columns columns :rows owned :row-count (count owned) :byte-count bytes
-             :reservation reservation :exhausted? (= @position (count rows))})
-          (catch Throwable e (when reservation (spi/release! reservation)) (throw e))))))
+                      (mapv binding variables)))
+          start @position]
+      (try
+        (let [{:keys [end row-count byte-count]}
+              (batch-window rows start columns project (long max-rows) (long max-bytes))
+              ;; Reserve once, before allocating the output vector or copying
+              ;; mutable leaves. No row buffer is retained by the sizing pass.
+              token (when (pos? row-count)
+                      (spi/reserve! control {:retained-bytes byte-count :in-flight-batches 1}))]
+          (try
+            (let [owned (if token (copy-window rows start end project) [])
+                  bytes (spi/batch-charge-bytes columns owned)]
+              ;; Copying may discard collection metadata. Report the exact
+              ;; output charge while retaining the conservative reservation.
+              (when-not (and (= row-count (count owned))
+                             (value/at-most? bytes (long byte-count)))
+                (fail! :query-source/invalid :batch))
+              (spi/check-active! control)
+              (reset! position end)
+              (swap! metrics #(-> % (update :batches inc) (update :rows + row-count)
+                                  (update :charged-bytes + bytes)))
+              {:columns columns :rows owned :row-count row-count :byte-count bytes
+               :reservation token :exhausted? (= end (count rows))})
+            (catch Throwable e (when token (spi/release! token)) (throw e))))
+        (finally
+          (swap! metrics #(-> % (update :read-rows + @read-rows)
+                              (update :elapsed-ns + (- (System/nanoTime) started))))))))
   (-cursor-metrics [_] @metrics)
   (-close-cursor! [_]
     (swap! state assoc :closed? true)
@@ -114,7 +157,8 @@
       (when-not (and plan (= (:id plan) (:alternative-id cursor-request))
                      (= (:source-symbol plan) (:source-symbol cursor-request)))
         (fail! :query-source/invalid :open))
-      (let [reservation (spi/reserve! (:control request) {:retained-bytes 1024})
+      (let [scratch (+' 1024 (*' 2 (value/value-charge [(:terms (:clause plan)) (:columns plan)])))
+            reservation (spi/reserve! (:control request) {:retained-bytes scratch})
             cursor (->Cursor (atom @snapshot) plan descriptor request (atom 0) (atom {}) state
                              (atom {:batches 0 :rows 0 :charged-bytes 0 :read-rows 0
                                     :read-bytes nil :external-requests 0 :elapsed-ns 0}) reservation)]
