@@ -1,6 +1,6 @@
 # datalevin-federation
 
-Planned source adapters and semantic mappings for Datalevin direct analytics.
+Source adapters and semantic mappings for Datalevin direct analytics.
 This project owns every production query-source adapter, including local
 relations, PostgreSQL, and optional dataset/Parquet/DataFusion integrations.
 
@@ -13,8 +13,10 @@ relations, PostgreSQL, and optional dataset/Parquet/DataFusion integrations.
 
 F0 includes an accepted-metadata [mapping compiler](src/datalevin/federation/mapping.clj),
 [canonical fingerprint encoding](src/datalevin/federation/fingerprint.clj), and
-[contract fixtures](test/datalevin/federation/contract_test.clj). No provider I/O,
-production adapter, schema installation, or EntityRef runtime codec is implemented.
+[contract fixtures](test/datalevin/federation/contract_test.clj). The initial F1
+[local adapter](src/datalevin/federation/local.clj) now runs through embedded
+`d/q`, including native joins and multiple fragments. Provider I/O, schema
+installation, and an EntityRef runtime codec remain future work.
 Build, dependencies, tests, and releases remain separate from Datalevin proper.
 
 With the matching Datalevin checkout at `../datalevin`, run:
@@ -22,6 +24,21 @@ With the matching Datalevin checkout at `../datalevin`, run:
 ```sh
 clojure -M:test
 ```
+
+`local/source` accepts an SPI descriptor and a vector of declared-schema rows.
+It copies mutable leaves on construction; `local/replace-rows!` atomically
+publishes a new version without changing accepted metadata. Open sessions pin
+and charge their complete row version, so replacement cannot change an active
+query's view. Passing this caller-owned object grants local read access.
+The adapter plans one scan per pattern and leaves predicates to core. It emits
+owned single-row batches and reports physical rows examined separately from
+rows returned. It advertises no optional features and performs no discovery.
+
+The [execution tests](test/datalevin/federation/local_test.clj) compare eager
+results, native joins, aliases under writes, decimal key/predicate behavior,
+nominal reference-valued EAV facts, and resource limits. F1 remains in progress;
+the core [supported subset and remaining cases](../datalevin/doc/query-source-spi.md#9-source-conformance)
+apply to this adapter too.
 
 `compile-relation` accepts the main-schema definition map, a relation ID, and a
 context containing a compute-context ID and recorded semantic dependencies.
