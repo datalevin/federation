@@ -5,7 +5,8 @@
             [datalevin.query.source :as spi]
             [datalevin.query.source.control :as control]
             [datalevin.query.source.value :as value]
-            [datalevin.util :as u]))
+            [datalevin.util :as u])
+  (:import [java.time Duration Instant Period]))
 
 (def descriptor
   {:spi-versions #{1} :source-instance-id :test-local :compute-context-id :embedded
@@ -160,3 +161,29 @@
       (is (= [1 2] (vec (fetch)))))
     (is (= :query-source/unsupported
            (category #(d/q '[:find ?v . :in $s :where [$s _ ?v]] s))))))
+
+
+(deftest immutable-time-data-matches-eager-and-native-queries
+  (let [info (assoc-in descriptor [:pattern-contract :columns 1 :type] :data)
+        rows [[1 (Instant/ofEpochSecond -1 123456789)]
+              [2 (Instant/ofEpochSecond -1 123456790)]
+              [3 (Duration/ofSeconds -1 123456789)]
+              [4 (Period/of 1 0 0)] [5 (Period/of 0 12 0)]]
+        s (local/source info (conj rows (first rows)))
+        dir (u/tmp-dir (str "federation-time-" (random-uuid)))
+        conn (d/create-conn dir {:event/time {}}
+                            {:wal? false :background-sampling? false})]
+    (try
+      (doseq [q ['{:find [?id ?v] :in [$s] :where [[$s ?id ?v]]
+                   :query-source {:limits {:batch-rows 2}}}
+                 '[:find (count ?v) . :with ?id :in $s :where [$s ?id ?v]]
+                 '[:find ?a ?b :in $s :where [$s ?a ?v] [$s ?b ?v]]]]
+        (is (= (d/q q (conj rows (first rows))) (d/q q s))))
+      (d/transact! conn (mapv (fn [[e v]] {:db/id e :event/time v}) rows))
+      (let [q '[:find ?e ?v :in $ $s :where [?e :event/time ?v] [$s ?e ?v]]]
+        (is (= (set rows) (d/q q @conn rows) (d/q q @conn s))))
+      (is (= #{[1]} (d/q '[:find ?e :in $s ?v :where [$s ?e ?v]]
+                         s (second (first rows)))))
+      (local/replace-rows! s [[1 Duration/ZERO]])
+      (is (= #{[1 Duration/ZERO]} (d/q '[:find ?e ?v :in $s :where [$s ?e ?v]] s)))
+      (finally (d/close conn) (u/delete-files dir)))))
