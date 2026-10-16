@@ -2,7 +2,7 @@
   "Declared-schema local relations. Every invocation pins one immutable version."
   (:require [datalevin.query.source :as spi]
             [datalevin.query.source.value :as value])
-  (:import [java.util UUID]))
+  (:import [java.util Objects UUID]))
 
 (defn- fail! [error phase]
   (throw (ex-info "Local query source failed" {:error error :phase phase})))
@@ -38,15 +38,17 @@
   (spi/check-active! control))
 
 (defn- match-row [bindings terms row]
-  (reduce (fn [bindings [term x]]
-            (when bindings
+  (reduce (fn [bound [term x]]
+            (when bound
               (case (first term)
-                :ignore bindings
-                :const (when (= (second term) x) bindings)
+                :ignore bound
+                :const (when (= (second term) x) bound)
                 :var (let [sym (second term)]
-                       (if (contains? bindings sym)
-                         (when (= (bindings sym) x) bindings)
-                         (assoc bindings sym x)))))) bindings (map vector terms row)))
+                       (if (contains? bound sym)
+                         (when (if (contains? bindings sym)
+                                 (Objects/equals (bound sym) x)
+                                 (= (bound sym) x)) bound)
+                         (assoc bound sym x)))))) bindings (map vector terms row)))
 
 (def ^:private empty-vector-charge (value/value-charge []))
 

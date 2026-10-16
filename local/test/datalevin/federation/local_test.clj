@@ -94,6 +94,16 @@
   {:kind :custom :name :test/entity-ref :version 1 :fingerprint "test-ref:v1"
    :parameters {:domain domain :key-types [:long]}})
 
+(deftest scalar-tuple-collection-and-relation-inputs-match-eager-keys
+  (let [rows [[1 1.0M] [2 1.00M] [3 2M]]
+        info (assoc-in descriptor [:pattern-contract :columns 1 :type] :bigdec)
+        s (local/source info rows)]
+    (doseq [[binding input] [['?value 1.0M] ['[?value] [1.0M]]
+                            ['[?value ...] [1.0M]] ['[[?value]] [[1.0M]]]]]
+      (let [q {:find '[?id ?value] :in ['$s binding] :where '[[$s ?id ?value]]}]
+        (is (= #{[1 1.0M]} (d/q q s input)))
+        (is (= (d/q q rows input) (d/q q s input)))))))
+
 (deftype Ref [type key]
   value/IQuerySourceValue
   (-logical-type [_] type)
