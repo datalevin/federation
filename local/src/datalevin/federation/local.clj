@@ -2,7 +2,7 @@
   "Declared-schema local relations. Every invocation pins one immutable version."
   (:require [datalevin.query.source :as spi]
             [datalevin.query.source.value :as value])
-  (:import [java.util Date UUID]))
+  (:import [java.util UUID]))
 
 (defn- fail! [error phase]
   (throw (ex-info "Local query source failed" {:error error :phase phase})))
@@ -15,16 +15,6 @@
           [{:type (:entity-type types) :nullable? false}
            {:type :keyword :nullable? false}
            {:type (:value-type types) :nullable? false}]))))
-
-(defn- copy-value [x]
-  (cond
-    (bytes? x) (aclone ^bytes x)
-    (= Date (class x)) (Date. (.getTime ^Date x))
-    (vector? x) (mapv copy-value x)
-    (value/plain-map? x) (into {} (map (fn [[k v]] [(copy-value k) (copy-value v)])) x)
-    (set? x) (into #{} (map copy-value) x)
-    (list? x) (apply list (map copy-value x))
-    :else x))
 
 (defn- accepted-rows [descriptor rows]
   (when-not (vector? rows) (fail! :query-source/unsupported :local-input))
@@ -39,7 +29,7 @@
         (when (and eav? (not= 3 (count row))) (fail! :query-source/invalid :local-input))
         (when-not (and eav? (or (nil? (get row 0)) (nil? (get row 2))))
           (value/rows! columns [row]))))
-    (copy-value rows)))
+    (value/owned-copy rows)))
 
 (defn- active! [state control]
   (when (:closed? @state)
@@ -89,7 +79,7 @@
       (persistent! owned)
       (recur (inc index)
              (if-let [row (project (nth rows index))]
-               (conj! owned (copy-value row))
+               (conj! owned (value/owned-copy row))
                owned)))))
 
 (defrecord Cursor [snapshot plan descriptor request position state session-state metrics reservation]
@@ -124,8 +114,8 @@
           (try
             (let [owned (if token (copy-window rows start end project) [])
                   bytes (spi/batch-charge-bytes columns owned)]
-              ;; Copying may discard collection metadata. Report the exact
-              ;; output charge while retaining the conservative reservation.
+              ;; Report the exact output charge. The preflight reservation must
+              ;; cover the owned copy, including its preserved metadata.
               (when-not (and (= row-count (count owned))
                              (value/at-most? bytes (long byte-count)))
                 (fail! :query-source/invalid :batch))

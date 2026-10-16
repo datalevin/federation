@@ -170,6 +170,58 @@
         (let [before (long (:retained-bytes (control/usage control)))
               batch (fetch! fixture 2 100000)]
           (is (= [[1 [:x]] [2 [:x]]] (:rows batch)))
-          (is (< (long (:byte-count batch))
+          (is (= (mapv meta [bound bound]) (mapv (comp meta second) (:rows batch))))
+          (is (= (long (:byte-count batch))
                  (- (long (:retained-bytes (control/usage control))) before)))
           (release! batch))))))
+
+(deftest local-batches-preserve-and-own-metadata-including-bound-values
+  (doseq [bound? [false true]]
+    (let [bytes (byte-array [1 2]) date (Date. 1000)
+          x (with-meta [(with-meta 'leaf {:date date})] {:bytes bytes})
+          info (assoc-in descriptor [:pattern-contract :columns 1] {:type :data :nullable? false})
+          input (mapv #(vector % x) (range 4))]
+      (with-cursor info input terms (if bound? {'?v x} {}) {}
+        (fn [{:keys [cursor session] :as fixture}]
+          (let [a (fetch! fixture 2 10000)
+                values (mapv second (:rows a))]
+            (release! a)
+            (doseq [v values]
+              (is (= [1 2] (vec (:bytes (meta v)))))
+              (is (= 1000 (.getTime ^Date (:date (meta (first v)))))))
+            (aset-byte ^bytes (:bytes (meta (first values))) 0 (byte 8))
+            (.setTime ^Date (:date (meta (ffirst values))) 8000)
+            (is (= [1 2] (vec bytes)))
+            (is (= 1000 (.getTime date)))
+            (let [b (fetch! fixture 2 10000)]
+              (release! b)
+              (spi/-close-cursor! cursor)
+              (spi/-close-session! session)
+              (doseq [v (concat (next values) (map second (:rows b)))]
+                (is (= [1 2] (vec (:bytes (meta v)))))
+                (is (= 1000 (.getTime ^Date (:date (meta (first v))))))))))))))
+
+(deftest local-batches-preserve-default-sorted-collections
+  (doseq [make-value [(fn [date] (sorted-map :date date :ratio 1/2 :char \λ))
+                      (fn [date] (sorted-set date (Date. 2000)))]]
+    (let [date (Date. 1000)
+          x (with-meta (make-value date) {:stamp date})
+          info (assoc-in descriptor [:pattern-contract :columns 1] {:type :data :nullable? false})
+          collected (atom [])]
+      (with-cursor info (mapv #(vector % x) (range 5)) terms {} {}
+        (fn [{:keys [cursor session] :as fixture}]
+          (.setTime date 9000)
+          (dotimes [_ 3]
+            (let [batch (fetch! fixture 2 10000)]
+              (swap! collected into (map second (:rows batch)))
+              (release! batch)))
+          (spi/-close-cursor! cursor)
+          (spi/-close-session! session)))
+      (is (= 5 (count @collected)))
+      (doseq [v @collected]
+        (is (= (class x) (class v)))
+        (is (= (seq (make-value (Date. 1000))) (seq v)))
+        (is (= 1000 (.getTime ^Date (:stamp (meta v))))))
+      (.setTime ^Date (:stamp (meta (first @collected))) 8000)
+      (doseq [v (next @collected)]
+        (is (= 1000 (.getTime ^Date (:stamp (meta v)))))))))
