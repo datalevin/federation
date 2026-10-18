@@ -1,5 +1,5 @@
 (ns datalevin.federation.contract-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is testing]]
             [datalevin.federation.fingerprint :as fp]
             [datalevin.federation.mapping :as mapping]
             [datalevin.query.source :as source]))
@@ -153,3 +153,43 @@
                         #(-> % (dissoc :type) (assoc :reference :customer)))
              (assoc-in schema [:sales/source :datalevin/definition-kind] :relation)]]
     (is (thrown? clojure.lang.ExceptionInfo (compile-schema s)))))
+
+(deftest reference-type-identity-fields-survive-compilation
+  (let [s (-> schema
+              (update-in (conj relation-path :physical-schema :columns) conj
+                         {:name "parent_id" :physical-type {:kind :int64} :nullable? true})
+              (assoc-in (conj relation-path :attributes :order/parent)
+                        {:expression [:column "parent_id"]
+                         :reference {:identity-domain-id [source-id :order 0] :key-types [:long]}
+                         :cardinality :one :null :absent}))
+        contract (get-in context [:dependencies :entity-ref-type])
+        compile-type #(mapping/compile-relation s :sales/orders
+                                               (assoc-in context [:dependencies :entity-ref-type] %))
+        original (compile-type contract)
+        type-of #(get-in % [:source-info :pattern-contract :attributes :order/id :entity-type])
+        original-type (type-of original)
+        variants [[:same contract true]
+                  [:map-order (into (array-map) (reverse (seq contract))) true]
+                  [:metadata (with-meta contract {:fixture/note "docs"}) true]
+                  [:version (update contract :version inc) false]
+                  [:fingerprint (assoc contract :fingerprint "fixture-entity-ref:v2") false]
+                  [:extra (assoc contract :fixture/extra {:meaning "v2"}) false]
+                  [:extra-value (assoc contract :fixture/extra {:meaning "v3"}) false]]]
+    (doseq [[label accepted same?] variants]
+      (testing (str label)
+        (let [compiled (compile-type accepted)
+              type (type-of compiled)]
+          (is (= same? (= original-type type)))
+          (is (= (assoc accepted :kind :custom :parameters (:parameters original-type)) type))
+          (is (= type (get-in compiled [:source-info :pattern-contract :attributes :order/parent :value-type])))
+          (is (= (:parameters original-type) (:parameters type)))
+          (is (= (get-in original [:definition :schema-fingerprint])
+                 (get-in compiled [:definition :schema-fingerprint])))
+          (is (= same? (= (get-in original [:definition :definition-fingerprint])
+                          (get-in compiled [:definition :definition-fingerprint]))))
+          (when same? (is (= (hash original-type) (hash type)))))))
+    (is (= 5 (count (set (map #(type-of (compile-type (second %))) variants)))))
+    (doseq [invalid [(assoc contract :extra :v2)
+                     (assoc contract :version 0)
+                     (assoc contract :fingerprint "")]]
+      (is (thrown? clojure.lang.ExceptionInfo (compile-type invalid))))))

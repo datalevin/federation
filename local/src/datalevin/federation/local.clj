@@ -2,7 +2,8 @@
   "Declared-schema local relations. Every invocation pins one immutable version."
   (:require [datalevin.query.source :as spi]
             [datalevin.query.source.value :as value])
-  (:import [java.util Objects UUID]))
+  (:import [java.util UUID]
+           [datalevin.utl QueryKey]))
 
 (defn- fail! [error phase]
   (throw (ex-info "Local query source failed" {:error error :phase phase})))
@@ -37,51 +38,86 @@
   (when (:cancelled? @state) (fail! :query-source/cancelled :execution))
   (spi/check-active! control))
 
+(defn- limit! [category maximum attempted]
+  (throw (ex-info "Local value exceeds resource limit"
+                  {:error :query-source/limit
+                   :phase (if (= category :batch-bytes) :batch :reserve)
+                   :category category :maximum maximum :attempted attempted})))
+
+(defn- bounded-charge
+  "Stop sizing at the first excess charge or cancellation, before copying.
+  The final atomic reservation still checks concurrent/shared ledger use."
+  [check! initial scale maximum overflow! measure!]
+  (let [bytes (volatile! initial)
+        observe! (fn [increment]
+                   (check!)
+                   (let [total (+' @bytes (*' scale increment))]
+                     (vreset! bytes total)
+                     (when-not (value/at-most? total (long maximum))
+                       (overflow! total))))]
+    (observe! 0)
+    (measure! observe!)
+    @bytes))
+
+(defn- retained-charge [request check! overhead scale x]
+  (let [maximum (get-in request [:limits :retained-bytes] Long/MAX_VALUE)]
+    (bounded-charge check! overhead scale maximum
+                    #(limit! :retained-bytes maximum %)
+                    #(value/value-charge x %))))
+
 (defn- match-row [bindings terms row]
   (reduce (fn [bound [term x]]
             (when bound
               (case (first term)
                 :ignore bound
-                :const (when (= (second term) x) bound)
+                :const (when (QueryKey/equiv (second term) x) bound)
                 :var (let [sym (second term)]
                        (if (contains? bound sym)
                          (when (if (contains? bindings sym)
-                                 (Objects/equals (bound sym) x)
-                                 (= (bound sym) x)) bound)
+                                 (QueryKey/equals (bound sym) x)
+                                 (QueryKey/equiv (bound sym) x)) bound)
                          (assoc bound sym x)))))) bindings (map vector terms row)))
 
 (def ^:private empty-vector-charge (value/value-charge []))
+(def ^:private batch-full (ex-info "Local batch boundary" {}))
 
-(defn- batch-window [rows start columns project max-rows max-bytes]
+(defn- batch-window [rows start columns project check! max-rows max-bytes]
   ;; Keep only one projected row at a time. Its values are borrowed from the
   ;; already charged snapshot/bindings; cursor scratch covers its containers.
   (loop [index (long start), n 0, bytes 0]
     (if (or (= index (count rows)) (= n max-rows))
       {:end index :row-count n :byte-count bytes}
       (if-let [row (project (nth rows index))]
-        (let [candidate (if (zero? n)
-                          (spi/batch-charge-bytes columns [row])
-                          ;; Each append adds one vector slot and one row's
-                          ;; charge. Derive that increment from the shared
-                          ;; value helper instead of repeating size constants.
-                          (+' bytes (-' (value/value-charge [row]) empty-vector-charge)))]
-          (if (value/at-most? candidate max-bytes)
+        (let [candidate
+              (try
+                (bounded-charge check! (if (zero? n) 0 (- bytes empty-vector-charge))
+                                1 max-bytes
+                                (fn [attempted]
+                                  (if (zero? n)
+                                    (limit! :batch-bytes max-bytes attempted)
+                                    (throw batch-full)))
+                                (if (zero? n)
+                                  #(value/batch-charge-bytes columns [row] %)
+                                  ;; Derive each append's charge from the shared
+                                  ;; helper, without allocating a row buffer.
+                                  #(value/value-charge [row] %)))
+                (catch Throwable e
+                  (when-not (identical? e batch-full) (throw e))
+                  nil))]
+          (if candidate
             (recur (inc index) (inc n) (long candidate))
-            (if (pos? n)
-              ;; Do not consume the row that belongs to the next batch.
-              {:end index :row-count n :byte-count bytes}
-              (throw (ex-info "Local row exceeds batch limit"
-                              {:error :query-source/limit :phase :batch :category :batch-bytes
-                               :maximum max-bytes :attempted candidate})))))
+            ;; The oversized row remains for the next fetch; no partial size
+            ;; or copy from it is retained in the returned batch.
+            {:end index :row-count n :byte-count bytes}))
         (recur (inc index) n bytes)))))
 
-(defn- copy-window [rows start end project]
+(defn- copy-window [rows start end project check!]
   (loop [index (long start), owned (transient [])]
     (if (= index end)
       (persistent! owned)
       (recur (inc index)
              (if-let [row (project (nth rows index))]
-               (conj! owned (value/owned-copy row))
+               (conj! owned (value/owned-copy row check!))
                owned)))))
 
 (defrecord Cursor [snapshot plan descriptor request position state session-state metrics reservation]
@@ -98,6 +134,7 @@
           columns (:columns plan)
           variables (mapv :variable columns)
           eav? (= :eav (get-in descriptor [:pattern-contract :kind]))
+          check! #(active! session-state control)
           read-rows (volatile! 0)
           project (fn [row]
                     (active! session-state control)
@@ -108,14 +145,16 @@
           start @position]
       (try
         (let [{:keys [end row-count byte-count]}
-              (batch-window rows start columns project (long max-rows) (long max-bytes))
+              (batch-window rows start columns project check! (long max-rows) (long max-bytes))
               ;; Reserve once, before allocating the output vector or copying
               ;; mutable leaves. No row buffer is retained by the sizing pass.
               token (when (pos? row-count)
                       (spi/reserve! control {:retained-bytes byte-count :in-flight-batches 1}))]
           (try
-            (let [owned (if token (copy-window rows start end project) [])
-                  bytes (spi/batch-charge-bytes columns owned)]
+            (let [owned (if token (copy-window rows start end project check!) [])
+                  bytes (bounded-charge check! 0 1 byte-count
+                                        #(limit! :batch-bytes byte-count %)
+                                        #(value/batch-charge-bytes columns owned %))]
               ;; Report the exact output charge. The preflight reservation must
               ;; cover the owned copy, including its preserved metadata.
               (when-not (and (= row-count (count owned))
@@ -149,7 +188,8 @@
       (when-not (and plan (= (:id plan) (:alternative-id cursor-request))
                      (= (:source-symbol plan) (:source-symbol cursor-request)))
         (fail! :query-source/invalid :open))
-      (let [scratch (+' 1024 (*' 2 (value/value-charge [(:terms (:clause plan)) (:columns plan)])))
+      (let [scratch (retained-charge request #(active! state (:control request)) 1024 2
+                                      [(:terms (:clause plan)) (:columns plan)])
             reservation (spi/reserve! (:control request) {:retained-bytes scratch})
             cursor (->Cursor (atom @snapshot) plan descriptor request (atom 0) (atom {}) state
                              (atom {:batches 0 :rows 0 :charged-bytes 0 :read-rows 0
@@ -180,9 +220,9 @@
     (let [rows @data
           ;; Charge the pinned version, including old versions kept alive by
           ;; replace-rows!, rather than treating retained snapshot data as free.
-          bytes (reduce (fn [n row]
-                          (spi/check-active! (:control request))
-                          (+' n 48 (value/value-charge row))) 2048 rows)
+          ;; Include outer vector metadata, even for an empty row version.
+          bytes (retained-charge request #(spi/check-active! (:control request))
+                                 2048 1 rows)
           reservation (spi/reserve! (:control request) {:retained-bytes bytes})]
       (try
         (->Session data descriptor (atom rows) request
@@ -202,10 +242,16 @@
              (let [columns (->> (map vector (:terms clause) (pattern-columns descriptor clause))
                                 (keep (fn [[term column]]
                                         (when (= :var (first term)) (assoc column :variable (second term)))))
-                                (reduce (fn [m column] (assoc m (:variable column) column)) {}) vals vec)
-                   reservation (spi/reserve! (:control request)
-                                             {:retained-bytes (+' 1024 (*' 2 (value/value-charge
-                                                                             [columns clause (:bindings request)])))})
+                                (reduce (fn [m {:keys [variable] :as column}]
+                                          ;; A repeated variable must satisfy every
+                                          ;; occurrence, regardless of column order.
+                                          (assoc m variable
+                                                 (update column :nullable?
+                                                         #(and % (get-in m [variable :nullable?] true)))))
+                                        {}) vals vec)
+                   bytes (retained-charge request #(active! (:state session) (:control request))
+                                          1024 2 [columns clause (:bindings request)])
+                   reservation (spi/reserve! (:control request) {:retained-bytes bytes})
                    _ (swap! (:plan-reservations session) conj reservation)
                    handle (Object.)
                    plan {:id (:id clause) :clause clause :columns columns

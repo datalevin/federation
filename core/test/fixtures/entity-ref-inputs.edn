@@ -1,0 +1,26 @@
+[{:id "scalar"
+  :domain [#uuid "11111111-1111-4111-8111-111111111111" :order 0]
+  :key-types [:long] :key [7]}
+ {:id "composite"
+  :domain [#uuid "11111111-1111-4111-8111-111111111111" :order 0]
+  :key-types [:string :long] :key ["tenant-a" 7]}
+ {:id "shared"
+  :domain :shared/order :key-types [:long] :key [7]}
+ {:id "epoch"
+  :domain [#uuid "11111111-1111-4111-8111-111111111111" :order 1]
+  :key-types [:long] :key [7]}
+ {:id "version"
+  :domain [#uuid "11111111-1111-4111-8111-111111111111" :order 0]
+  :version 2 :fingerprint "fixture-entity-ref:wire-v2"
+  :key-types [:long] :key [7]}
+ {:id "bytes"
+  :domain :shared/order :key-types [:bytes] :key-hex "00017fff"}
+ {:id "export"
+  :domain [#uuid "11111111-1111-4111-8111-111111111111" :export-row 0]
+  :key-types [:uuid {:kind :tuple :elements [:string :long]}]
+  :key [#uuid "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" ["part-1" 42]]}
+ {:id "decimal"
+  :domain :shared/order :key-types [:bigdec] :key [1.00M]}
+ {:id "extra"
+  :domain :shared/order :key-types [:long] :key [7]
+  :extras {:fixture/contract {:meaning "alternate" :revision 2}}}]

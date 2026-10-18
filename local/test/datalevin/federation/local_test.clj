@@ -3,6 +3,7 @@
             [datalevin.core :as d]
             [datalevin.federation.local :as local]
             [datalevin.query.source :as spi]
+            [datalevin.query.source.contract :as contract]
             [datalevin.query.source.control :as control]
             [datalevin.query.source.value :as value]
             [datalevin.util :as u])
@@ -131,14 +132,15 @@
     (is (= :query-source/invalid
            (category #(d/q '[:find ?o :in $s ?c :where [$s ?o :order/customer ?c]] s order))))))
 
-(deftest immutable-owned-bytes-and-query-equality-guard
+(deftest immutable-owned-bytes-and-query-equality
   (let [info (assoc-in descriptor [:pattern-contract :columns 1] {:type :bytes :nullable? false})
         original (byte-array [1 2])
         s (local/source info [[1 original]])
         fetch (fn []
                 (let [control (control/create)
                       request {:control control :spi-version 1 :features #{} :consistency :snapshot
-                               :source-descriptors [info]}
+                               :query-id (random-uuid) :authorization {:principal-id :test}
+                               :limits (control/limits control) :source-descriptors [info]}
                       session (spi/-open-session s request)]
                   (try
                     (let [response (spi/-plan-source s session
@@ -147,9 +149,8 @@
                                                                 :terms [[:ignore] [:var '?v]]}]}))
                           alternative (first (:alternatives response))
                           cursor (spi/-open-cursor session
-                                   (merge request {:definition-fingerprint (:definition-fingerprint info)
-                                                   :alternative-id (:id alternative) :plan (:plan alternative)
-                                                   :source-symbol '$s}))
+                                   (contract/cursor-request request '$s
+                                     (:definition-fingerprint info) alternative))
                           batch (spi/-next-batch! cursor {:control control :max-rows 1 :max-bytes 10000})]
                       (try (ffirst (:rows batch))
                            (finally (spi/release! (:reservation batch)) (spi/-close-cursor! cursor))))
@@ -159,8 +160,11 @@
       (is (= [1 2] (vec first-result)))
       (aset-byte first-result 0 (byte 8))
       (is (= [1 2] (vec (fetch)))))
-    (is (= :query-source/unsupported
-           (category #(d/q '[:find ?v . :in $s :where [$s _ ?v]] s))))))
+    (let [q '[:find ?v . :in $s :where [$s _ ?v]]
+          result (d/q q s)]
+      (is (= [1 2] (vec result)))
+      (aset-byte result 0 (byte 7))
+      (is (= [1 2] (vec (d/q q s)))))))
 
 
 (deftest immutable-time-data-matches-eager-and-native-queries
@@ -187,3 +191,24 @@
       (local/replace-rows! s [[1 Duration/ZERO]])
       (is (= #{[1 Duration/ZERO]} (d/q '[:find ?e ?v :in $s :where [$s ?e ?v]] s)))
       (finally (d/close conn) (u/delete-files dir)))))
+
+(deftest local-byte-values-use-shared-query-equality
+  (doseq [[type wrap] [[:bytes identity]
+                       [:data #(vector % :tag)]
+                       [:data #(hash-map :blob %)]
+                       [:data #(hash-map % :value)]
+                       [:data #(hash-set % :tag)]]
+          :let [a (wrap (byte-array [0 31])) b (wrap (byte-array [1 0]))
+                rows [[1 a] [2 (value/owned-copy a)] [3 b]]
+                source (local/source (assoc-in descriptor [:pattern-contract :columns 1 :type] type) rows)]]
+    (doseq [q ['[:find ?id :in $s ?v :where [$s ?id ?v]]
+               '[:find ?id :in $s ?v :where [$s ?id ?x] [(= ?x ?v)]]]
+            :let [input (value/owned-copy a)]]
+      (is (= #{[1] [2]} (d/q q source input)))
+      (is (= (d/q q rows input) (d/q q source input))))
+    (let [q '[:find ?a ?b :in $s :where [$s ?a ?v] [$s ?b ?v]]]
+      (is (= (d/q q rows) (d/q q source))))
+    (is (= 2 (d/q '[:find (count ?v) . :in $s :where [$s _ ?v]] source)))
+    (is (= 3 (d/q '[:find (count ?v) . :with ?id :in $s :where [$s ?id ?v]] source)))
+    (let [q {:find '[?id] :in '[$s] :where [['$s '?id (value/owned-copy a)]]}]
+      (is (= #{[1] [2]} (d/q q source))))))

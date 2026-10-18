@@ -5,12 +5,9 @@
             :url "https://www.eclipse.org/legal/epl-2.0/"}
   ;; The application supplies a Datalevin build with the query-source SPI.
   ;; Published 1.2.5 supplies the build dependencies, but does not yet have it.
+  ;; Development links the sibling checkout through checkouts/datalevin; see README.
   :dependencies [[org.clojure/clojure "1.12.6"]
                  [datalevin "1.2.5" :scope "provided"]]
-  :profiles {:dev
-             {:resource-paths ["../../datalevin/src"
-                               "../../datalevin/resources"
-                               "../../datalevin/target/classes"]}}
   :filespecs [{:type :path :path "../LICENSE"}]
   :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
              "--add-opens=java.base/java.nio=ALL-UNNAMED"

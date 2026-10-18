@@ -80,3 +80,31 @@
     (throw (ex-info "Unknown digest purpose" {:error :federation/metadata})))
   (str "federation-" (name purpose) ":v1:sha256:"
        (hex (.digest (MessageDigest/getInstance "SHA-256") (canonical-bytes payload)))))
+
+(defn canonical-accepted-bytes
+  "Canonical-v2 metadata encoding. Retain v1's scalar framing and add character
+  and ratio scalars, including inside collections, for complete portable types."
+  ^bytes [x]
+  (cond
+    (char? x) (frame "c" (utf8 (str (int x))))
+    (ratio? x) (frame "h" (concat-bytes [(canonical-accepted-bytes (numerator x))
+                                         (canonical-accepted-bytes (denominator x))]))
+    (and (map? x) (not (record? x)))
+    (frame "m" (concat-bytes
+                 (mapcat identity
+                         (sort (fn [[a] [b]] (compare-bytes a b))
+                               (map (fn [[k v]] [(canonical-accepted-bytes k)
+                                                 (canonical-accepted-bytes v)]) x)))))
+    (set? x) (frame "s" (concat-bytes (sort compare-bytes (map canonical-accepted-bytes x))))
+    (vector? x) (frame "v" (concat-bytes (map canonical-accepted-bytes x)))
+    (list? x) (frame "q" (concat-bytes (map canonical-accepted-bytes x)))
+    :else (canonical-bytes x)))
+
+(defn accepted-fingerprint
+  "Digest the revised accepted representation using canonical-v2 and a versioned
+  payload interpretation. This never substitutes for an existing v1 digest."
+  [purpose payload]
+  (when-not (#{:schema :definition} purpose)
+    (throw (ex-info "Unknown digest purpose" {:error :federation/metadata})))
+  (str "federation-" (name purpose) ":v2:sha256:"
+       (hex (.digest (MessageDigest/getInstance "SHA-256") (canonical-accepted-bytes payload)))))

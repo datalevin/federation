@@ -2,7 +2,7 @@
 {:paths ["core/src" "local/src"]
  :deps {org.clojure/clojure {:mvn/version "1.12.6"}
         datalevin/datalevin {:local/root "../datalevin"}}
- :aliases {:test {:extra-paths ["test" "core/test" "local/test"]
+ :aliases {:test {:extra-paths ["test" "core/test" "local/test" "../datalevin/test-src"]
                   :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
                              "--add-opens=java.base/java.nio=ALL-UNNAMED"
                              "--add-opens=java.base/java.util=ALL-UNNAMED"
@@ -13,9 +13,12 @@
            :core {:replace-paths ["core/src"]
                   :extra-paths ["test" "core/test"]
                   :main-opts ["-m" "datalevin.federation.test-runner"
-                              "datalevin.federation.contract-test"]}
+                              "datalevin.federation.contract-test"
+                              "datalevin.federation.identity-test"
+                              "datalevin.federation.mapping-v2-test"]}
            :local {:replace-paths ["local/src"]
                    :extra-paths ["test" "local/test"]
                    :main-opts ["-m" "datalevin.federation.test-runner"
                                "datalevin.federation.local-test"
-                               "datalevin.federation.local-batch-test"]}}}
+                               "datalevin.federation.local-batch-test"
+                               "datalevin.federation.local-conformance-test"]}}}

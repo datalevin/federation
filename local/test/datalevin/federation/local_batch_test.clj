@@ -1,32 +1,44 @@
 (ns datalevin.federation.local-batch-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is testing]]
+            [datalevin.core :as d]
             [datalevin.federation.local :as local]
             [datalevin.federation.local-test :refer [descriptor category]]
             [datalevin.query.source :as spi]
             [datalevin.query.source.contract :as contract]
-            [datalevin.query.source.control :as control])
+            [datalevin.query.source.control :as control]
+            [datalevin.query.source.value :as value])
   (:import [java.util Date]))
 
-(defn- with-cursor [info rows terms bindings limits f]
+(defn- with-session [info rows limits f]
   (let [ctl (control/create {:limits limits})
         s (local/source info rows)
-        common {:control ctl :spi-version 1 :features #{} :consistency :snapshot
+        common {:control ctl :limits (control/limits ctl)
+                :query-id (random-uuid) :authorization {:principal-id :test}
+                :spi-version 1 :features #{} :consistency :snapshot
                 :source-descriptors [info]}
         session (spi/-open-session s common)]
-    (try
-      (let [response (spi/-plan-source s session
-                       (merge common {:source-descriptor info :source-symbol '$s :bindings bindings
-                                      :clauses [{:id 0 :kind :pattern :terms terms}]}))
-            alternative (first (:alternatives response))
-            cursor (spi/-open-cursor session
-                     (merge common {:definition-fingerprint (:definition-fingerprint info)
-                                    :alternative-id (:id alternative) :plan (:plan alternative)
-                                    :source-symbol '$s}))]
-        (f {:control ctl :source s :session session :cursor cursor :columns (:columns alternative)}))
+    (try (f {:control ctl :source s :session session :request common})
       (finally
         (spi/-close-session! session)
         (control/close! ctl)
         (is (every? zero? (vals (dissoc (control/usage ctl) :external-requests))))))))
+
+(defn- plan! [{:keys [source session request]} info terms bindings]
+  (first (:alternatives
+           (spi/-plan-source source session
+             (merge request {:source-descriptor info :source-symbol '$s :bindings bindings
+                             :clauses [{:id 0 :kind :pattern :terms terms}]})))))
+
+(defn- open-cursor! [{:keys [session request]} info alternative]
+  (spi/-open-cursor session
+    (contract/cursor-request request '$s (:definition-fingerprint info) alternative)))
+
+(defn- with-cursor [info rows terms bindings limits f]
+  (with-session info rows limits
+    (fn [fixture]
+      (let [alternative (plan! fixture info terms bindings)
+            cursor (open-cursor! fixture info alternative)]
+        (f (assoc fixture :cursor cursor :columns (:columns alternative)))))))
 
 (defn- fetch! [{:keys [control cursor columns]} max-rows max-bytes]
   (let [request {:control control :max-rows max-rows :max-bytes max-bytes}
@@ -225,3 +237,139 @@
       (.setTime ^Date (:stamp (meta (first @collected))) 8000)
       (doseq [v (next @collected)]
         (is (= 1000 (.getTime ^Date (:stamp (meta v)))))))))
+
+(def ^:private data-descriptor
+  (assoc-in descriptor [:pattern-contract :columns 1] {:type :data :nullable? false}))
+
+(deftype MeasuredLeaf [id bytes on-size on-compare]
+  value/IQuerySourceValue
+  (-logical-type [_] {:kind :custom :name :test/measured-leaf :version 1
+                     :fingerprint "measured:v1" :parameters {}})
+  (-retained-bytes [_]
+    (when-let [f @on-size] (f))
+    bytes)
+  Comparable
+  (compareTo [_ other]
+    (when-let [f @on-compare] (f id))
+    (Long/compare (long id) (long (.-id ^MeasuredLeaf other)))))
+
+(defn- leaf [id bytes on-size]
+  (MeasuredLeaf. id bytes on-size (atom nil)))
+
+(defn- error-data [f]
+  (try (f) nil (catch clojure.lang.ExceptionInfo e (ex-data e))))
+
+(deftest pinned-snapshot-includes-outer-metadata
+  (doseq [rows [[] [[1 "x"]]]]
+    (let [input (with-meta rows {:payload (byte-array 32768)})
+          source (local/source descriptor input)
+          q '{:find [?id] :in [$s] :where [[$s ?id _]]
+              :query-source {:limits {:retained-bytes 16384}}}
+          error (error-data #(d/q q source))]
+      (is (= :query-source/limit (:error error)))
+      (is (= :acquisition (:phase error)))
+      (is (= :retained-bytes (:category error)))
+      (with-session descriptor input {}
+        (fn [{:keys [control source session]}]
+          (is (<= (value/value-charge input) (:retained-bytes (control/usage control))))
+          (let [charge (:retained-bytes (control/usage control))]
+            (local/replace-rows! source [])
+            (is (= charge (:retained-bytes (control/usage control))))
+            (spi/-close-session! session)
+            (is (zero? (:retained-bytes (control/usage control))))))))))
+
+(deftest acquisition-stops-before-later-nested-values
+  (doseq [mode [:limit :cancel :overflow]]
+    (testing (name mode)
+      (let [first-action (atom nil) later-action (atom nil) visited (atom 0)
+            rows [[1 [(leaf 1 (if (= mode :overflow) Long/MAX_VALUE 65536) first-action)
+                      (leaf 2 64 later-action)]]]
+            source (local/source data-descriptor rows)
+            ctl (control/create {:limits {:retained-bytes (case mode
+                                                           :limit 16384
+                                                           :cancel 1048576
+                                                           :overflow Long/MAX_VALUE)}})
+            request {:control ctl :limits (control/limits ctl) :spi-version 1
+                     :features #{} :consistency :snapshot :source-descriptors [data-descriptor]}]
+        (try
+          (reset! later-action #(swap! visited inc))
+          (when (= mode :cancel)
+            (reset! first-action #(control/cancel! ctl {:error :query-source/cancelled :phase :acquisition})))
+          (is (= (if (= mode :cancel) :query-source/cancelled :query-source/limit)
+                 (category #(spi/-open-session source request))))
+          (is (zero? @visited))
+          (is (every? zero? (vals (control/usage ctl))))
+          (finally (control/close! ctl)))))))
+
+(deftest planning-and-cursor-sizing-observe-nested-cancellation
+  (doseq [phase [:planning :open]]
+    (testing (name phase)
+      (let [first-action (atom nil) later-action (atom nil) visited (atom 0)
+            x [(leaf 1 64 first-action) (leaf 2 64 later-action)]]
+        (with-session data-descriptor [] {}
+          (fn [{:keys [control] :as fixture}]
+            (let [constant-terms [[:var '?id] [:const x]]
+                  alternative (when (= phase :open)
+                                (plan! fixture data-descriptor constant-terms {}))
+                  baseline (control/usage control)]
+              (reset! first-action #(control/cancel! control {:error :query-source/cancelled :phase phase}))
+              (reset! later-action #(swap! visited inc))
+              (is (= :query-source/cancelled
+                     (category #(if alternative
+                                  (open-cursor! fixture data-descriptor alternative)
+                                  (plan! fixture data-descriptor constant-terms {})))))
+              (is (zero? @visited))
+              (is (= baseline (control/usage control))))))))))
+
+(deftest batch-sizing-stops-at-the-first-excess-nested-charge
+  (let [first-action (atom nil) later-action (atom nil) visited (atom 0)
+        large [1 [(leaf 1 65536 first-action) (leaf 2 64 later-action)]]]
+    (with-cursor data-descriptor [[0 :small] large] terms {} {}
+      (fn [{:keys [control columns] :as fixture}]
+        (let [baseline (control/usage control)
+              maximum (spi/batch-charge-bytes columns [[0 :small]])]
+          (reset! later-action #(swap! visited inc))
+          (let [batch (fetch! fixture 2 maximum)]
+            (is (= [[0 :small]] (:rows batch)))
+            (is (false? (:exhausted? batch)))
+            (is (zero? @visited))
+            (release! batch))
+          (is (= :query-source/limit (category #(fetch! fixture 2 16384))))
+          (is (zero? @visited))
+          (is (= baseline (control/usage control)))
+          (reset! later-action nil)
+          (let [batch (fetch! fixture 2 Long/MAX_VALUE)]
+            (is (= [large] (:rows batch)))
+            (is (true? (:exhausted? batch)))
+            (release! batch)
+            (is (= baseline (control/usage control)))))))))
+
+(deftest cancellation-inside-batch-sizing-releases-state
+  (let [first-action (atom nil) later-action (atom nil) visited (atom 0)
+        rows [[1 [(leaf 1 64 first-action) (leaf 2 64 later-action)]]]]
+    (with-cursor data-descriptor rows terms {} {}
+      (fn [{:keys [control cursor] :as fixture}]
+        (let [baseline (control/usage control)]
+          (reset! first-action #(control/cancel! control {:error :query-source/cancelled :phase :fetch}))
+          (reset! later-action #(swap! visited inc))
+          (is (= :query-source/cancelled (category #(fetch! fixture 1 100000))))
+          (is (zero? @visited))
+          (is (zero? (:rows (spi/-cursor-metrics cursor))))
+          (is (= baseline (control/usage control))))))))
+
+(deftest cancellation-inside-owned-copy-releases-the-batch-reservation
+  (let [on-compare (atom nil) comparisons (atom [])
+        values (into (sorted-set)
+                     (map #(MeasuredLeaf. % 64 (atom nil) on-compare)) (range 8))]
+    (with-cursor data-descriptor [[1 values]] terms {} {}
+      (fn [{:keys [control cursor] :as fixture}]
+        (let [baseline (control/usage control)]
+          ;; Default sorted-set copying calls its elements' natural comparison.
+          ;; Cancel on the first comparison, after the output has been reserved.
+          (reset! on-compare #(do (swap! comparisons conj %)
+                                 (control/cancel! control {:error :query-source/cancelled :phase :fetch})))
+          (is (= :query-source/cancelled (category #(fetch! fixture 1 100000))))
+          ;; One set insertion can compare twice; no later element is copied.
+          (is (= 1 (count (set @comparisons))))
+          (is (zero? (:rows (spi/-cursor-metrics cursor))))
+          (is (= baseline (control/usage control))))))))
