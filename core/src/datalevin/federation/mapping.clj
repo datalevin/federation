@@ -1,5 +1,5 @@
 (ns datalevin.federation.mapping
-  "F0 compilation of accepted metadata. No discovery, installation, or row I/O."
+  "Compilation of accepted metadata. No discovery, installation, or row I/O."
   (:require [datalevin.federation.fingerprint :as fp]
             [datalevin.federation.entity-ref :as ref]
             [datalevin.query.source :as source]
@@ -38,106 +38,6 @@
 
 (defn- entity-type-from-reference [type-contract reference]
   (entity-type type-contract (:identity-domain-id reference) (:key-types reference)))
-
-(defn compile-relation
-  "Compile one accepted :relation and its :source entry to an EAV descriptor.
-
-  Context supplies :compute-context-id and recorded :dependencies containing
-  :provider, :conversion-version and :entity-ref-type. Resolved references use
-  {:identity-domain-id ... :key-types [...]}; unresolved aliases are rejected.
-  Returns {:definition accepted-body-with-digests :source-info descriptor}."
-  [schema relation-id {:keys [compute-context-id dependencies]}]
-  (let [mapping (definition schema relation-id :relation)
-        source-body (definition schema (:source mapping) :source)
-        source-id (:source-instance-id source-body)
-        entity (:entity mapping)
-        key (:key entity)
-        key-columns (mapv :column key)
-        key-types (mapv :type key)
-        type-contract (:entity-ref-type dependencies)
-        domain (or (:identity-domain-id entity)
-                   [source-id (:domain entity) (:identity-epoch entity)])
-        entity-type (entity-type type-contract domain key-types)
-        identity-attribute (:identity-attribute entity)
-        physical (:physical-schema mapping)
-        columns (into {} (map (juxt :name identity)) (:columns physical))
-        attributes (:attributes mapping)]
-    (require! (and (uuid? source-id) (map? dependencies)
-                   (keyword? (:provider source-body))
-                   (= (:provider source-body) (get-in dependencies [:provider :name]))
-                   (pos-int? (get-in dependencies [:provider :version]))
-                   (pos-int? (:conversion-version dependencies))
-                   (= :datalevin.federation/entity-ref (:name type-contract))
-                   (vector? key) (seq key) (every? string? key-columns)
-                   (= (count key-columns) (count (set key-columns)))
-                   (keyword? (:domain entity)) (nat-int? (:identity-epoch entity))
-                   (keyword? identity-attribute) (map? attributes)
-                   (not (contains? attributes identity-attribute))
-                   (#{:provider :validated :trusted} (:constraint-source entity))
-                   (or (= :trusted (:constraint-source entity))
-                       (= key-columns (:primary-key physical))
-                       (some #{key-columns} (:unique-keys physical)))
-                   (vector? (:from mapping)) (seq (:from mapping))
-                   (every? string? (:from mapping))
-                   (= (count columns) (count (:columns physical)))
-                   (every? #(and (contains? columns %) (false? (:nullable? (columns %)))) key-columns)))
-    (let [logical-attributes
-          (into {}
-                (map (fn [[attribute body]]
-                       (require! (and (keyword? attribute) (= :one (:cardinality body))
-                                      (= :absent (:null body))
-                                      (every? #(contains? columns %) (expression-columns (:expression body)))
-                                      (not= (contains? body :type) (contains? body :reference))))
-                       (when-let [reference (:reference body)]
-                         (require! (and (map? reference) (some? (:identity-domain-id reference))
-                                        (vector? (:key-types reference)) (seq (:key-types reference))
-                                        (= (count (expression-columns (:expression body)))
-                                           (count (:key-types reference))))))
-                       [attribute (select-keys body [:expression :type :reference :cardinality :null])]))
-                attributes)
-          pattern-contract
-          {:kind :eav
-           :attributes
-           (into {identity-attribute
-                  {:entity-type entity-type
-                   :value-type (if (= 1 (count key-types)) (first key-types)
-                                   {:kind :tuple :elements key-types})}}
-                 (map (fn [[attribute body]]
-                        [attribute {:entity-type entity-type
-                                    :value-type (if-let [reference (:reference body)]
-                                                  (entity-type-from-reference type-contract reference)
-                                                  (:type body))}])) logical-attributes)}
-          used-columns (into (set key-columns)
-                             (mapcat #(expression-columns (:expression %)))
-                             (vals logical-attributes))
-          requirements {:columns (mapv #(select-keys (columns %) [:name :physical-type :nullable?])
-                                        (sort used-columns))
-                        :key {:columns key-columns :constraint-source (:constraint-source entity)}}
-          _ (doseq [column (:columns requirements)]
-              (require! (and (map? (:physical-type column)) (boolean? (:nullable? column)))))
-          schema-fingerprint (fp/fingerprint :schema requirements)
-          logical-mapping {:source (:source mapping) :from (:from mapping)
-                           :entity (select-keys entity [:domain :identity-domain-id :identity-epoch
-                                                        :key :identity-attribute])
-                           :attributes logical-attributes}
-          dependencies (assoc dependencies :source-instance-id source-id)
-          fingerprint (fp/fingerprint :definition
-                                      {:definition-kind :relation :mapping logical-mapping
-                                       :schema-fingerprint schema-fingerprint
-                                       :pattern-contract pattern-contract :dependencies dependencies})
-          descriptor {:spi-versions #{1} :features #{} :required-features #{}
-                      :source-instance-id source-id :compute-context-id compute-context-id
-                      :definition-id relation-id :definition-fingerprint fingerprint
-                      :pattern-contract pattern-contract}]
-      (source/validate-source-info! descriptor)
-      {:definition (assoc mapping :schema-fingerprint schema-fingerprint
-                          :definition-fingerprint fingerprint :dependencies dependencies
-                          :fingerprint-scheme :federation/v1)
-       :source-info descriptor})))
-
-;; Pure preparation for the coordinated runtime switch. These functions never
-;; emit a descriptor or advertise an SPI revision. The active compiler above
-;; remains unchanged until the revised runtime and adapters land together.
 
 (defn- accepted-fields! [m required optional]
   (require! (and (value/plain-map? m)
@@ -426,3 +326,23 @@
                     (do (require! (value/matches-type? (:type body) x)) (value/owned-copy x)))]
             (.add facts [entity a x])))))
     (vec facts)))
+
+(defn compile-relation
+  "Compile accepted provider metadata and emit a complete v2 EAV descriptor.
+  No discovery, installation or provider execution occurs."
+  [schema relation-id {:keys [compute-context-id] :as context}]
+  (require! (some? compute-context-id))
+  (let [mapping (definition schema relation-id :relation)
+        compiled (normalize-provider-mapping
+                   (fn [declared captured]
+                     (normalize-column-mapping declared relation-id captured)) schema context)
+        accepted (:accepted compiled)
+        descriptor (merge (select-keys compiled [:pattern-contract :logical-schema :definition-fingerprint])
+                          (select-keys accepted [:source-instance-id :scope :completion])
+                          {:spi-versions #{2} :features #{} :required-features #{}
+                           :compute-context-id compute-context-id :definition-id relation-id
+                           :read-capabilities #{:snapshot :statement :best-effort}})]
+    (source/validate-source-info! descriptor)
+    {:definition (merge mapping (select-keys compiled [:schema-fingerprint :definition-fingerprint :fingerprint-scheme])
+                        {:dependencies (:dependencies accepted)})
+     :source-info descriptor}))

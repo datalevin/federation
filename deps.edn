@@ -21,4 +21,5 @@
                    :main-opts ["-m" "datalevin.federation.test-runner"
                                "datalevin.federation.local-test"
                                "datalevin.federation.local-batch-test"
-                               "datalevin.federation.local-conformance-test"]}}}
+                               "datalevin.federation.local-conformance-test"
+                               "datalevin.federation.local-transport-test"]}}}

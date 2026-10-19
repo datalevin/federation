@@ -9,28 +9,19 @@
   (throw (ex-info "Local query source failed" {:error error :phase phase})))
 
 (defn- pattern-columns [descriptor clause]
-  (let [contract (:pattern-contract descriptor)]
-    (if (= :tuple (:kind contract)) (:columns contract)
-        (let [types (get (:attributes contract) (second (second (:terms clause))))]
-          (when-not types (fail! :query-source/unsupported :clauses))
-          [{:type (:entity-type types) :nullable? false}
-           {:type :keyword :nullable? false}
-           {:type (:value-type types) :nullable? false}]))))
+  (let [types (get-in descriptor [:pattern-contract :attributes (second (second (:terms clause)))])]
+    (when-not types (fail! :query-source/unsupported :clauses))
+    [{:type (:entity-type types) :nullable? false}
+     {:type :keyword :nullable? false}
+     {:type (:value-type types) :nullable? false}]))
 
-(defn- accepted-rows [descriptor rows]
-  (when-not (vector? rows) (fail! :query-source/unsupported :local-input))
-  (let [eav? (= :eav (get-in descriptor [:pattern-contract :kind]))]
-    (doseq [row rows]
-      (when-not (vector? row) (fail! :query-source/invalid :local-input))
-      (let [columns (if eav?
-                      (pattern-columns descriptor
-                                                {:terms [[:ignore] [:const (get row 1)] [:ignore]]})
-                      (get-in descriptor [:pattern-contract :columns]))]
-        ;; SQL-null/missing EAV attributes contribute no fact, including `_`.
-        (when (and eav? (not= 3 (count row))) (fail! :query-source/invalid :local-input))
-        (when-not (and eav? (or (nil? (get row 0)) (nil? (get row 2))))
-          (value/rows! columns [row]))))
-    (value/owned-copy rows)))
+(defn- accepted-rows [descriptor facts]
+  (when-not (vector? facts) (fail! :query-source/invalid :local-input))
+  (doseq [fact facts]
+    (when-not (and (vector? fact) (= 3 (count fact))) (fail! :query-source/invalid :local-input))
+    (let [columns (pattern-columns descriptor {:terms [[:ignore] [:const (nth fact 1)] [:ignore]]})]
+      (when (and (some? (first fact)) (some? (nth fact 2))) (value/rows! columns [fact]))))
+  (value/owned-copy facts))
 
 (defn- active! [state control]
   (when (:closed? @state)
@@ -78,49 +69,109 @@
                                  (QueryKey/equiv (bound sym) x)) bound)
                          (assoc bound sym x)))))) bindings (map vector terms row)))
 
+(defn- unknown-estimate [dependent?]
+  (merge (zipmap (if dependent?
+                  [:startup-ns :per-binding-ns :rows-per-binding :row-bytes :requests-per-open
+                   :requests-per-binding :transfer-bytes-per-binding :peak-retained-bytes]
+                  [:startup-ns :run-ns :rows :row-bytes :requests-per-open :transfer-bytes :peak-retained-bytes])
+                (repeat nil))
+         {:confidence :unknown :provenance {:kind :unknown :id nil :observed-at-ms nil :valid-for-ms nil}}))
+
+(defn- columns [info clause]
+  (reduce (fn [out [term column]]
+            (if (and (= :var (first term)) (not-any? #(= (second term) (:variable %)) out))
+              (conj out (assoc column :variable (second term))) out))
+          [] (map vector (:terms clause) (pattern-columns info clause))))
+
+(defn- choices [info request config]
+  (mapcat
+    (fn [clause]
+      (let [available (into {} (map (juxt :variable identity)) (:available-inputs request))
+            cols (columns info clause)
+            make (fn [kind position]
+                   (let [[tag x] (when position (nth (:terms clause) position))
+                         column (some #(when (= x (:variable %)) %) cols)
+                         requires (if (and position (= :var tag) (not (contains? (:bindings request) x)))
+                                    [column] [])]
+                     (when (or (nil? position) (= :const tag) (contains? (:bindings request) x)
+                               (and column (= column (available x))))
+                       {:id (keyword (name kind) (str (:id clause))) :clause clause :columns cols
+                        :requires requires :kind kind})))
+            modes (case (get config :mode :both)
+                    :scan [[:attribute-enumeration nil]]
+                    :lookup [[:entity-lookup 0]]
+                    :value [[:value-lookup 2]]
+                    :both [[:attribute-enumeration nil] [:value-lookup 2] [:entity-lookup 0]])]
+        (keep (fn [[kind position]] (make kind position)) modes)))
+    (filter #(= :pattern (:kind %)) (:clauses request))))
+
 (def ^:private empty-vector-charge (value/value-charge []))
 (def ^:private batch-full (ex-info "Local batch boundary" {}))
+(def ^:private constraints {:max-binding-rows 256 :max-binding-bytes 262144 :max-request-binding-rows 256})
 
-(defn- batch-window [rows start columns project check! max-rows max-bytes]
-  ;; Keep only one projected row at a time. Its values are borrowed from the
-  ;; already charged snapshot/bindings; cursor scratch covers its containers.
-  (loop [index (long start), n 0, bytes 0]
-    (if (or (= index (count rows)) (= n max-rows))
-      {:end index :row-count n :byte-count bytes}
-      (if-let [row (project (nth rows index))]
-        (let [candidate
-              (try
-                (bounded-charge check! (if (zero? n) 0 (- bytes empty-vector-charge))
-                                1 max-bytes
-                                (fn [attempted]
-                                  (if (zero? n)
-                                    (limit! :batch-bytes max-bytes attempted)
-                                    (throw batch-full)))
-                                (if (zero? n)
-                                  #(value/batch-charge-bytes columns [row] %)
-                                  ;; Derive each append's charge from the shared
-                                  ;; helper, without allocating a row buffer.
-                                  #(value/value-charge [row] %)))
-                (catch Throwable e
-                  (when-not (identical? e batch-full) (throw e))
-                  nil))]
-          (if candidate
-            (recur (inc index) (inc n) (long candidate))
-            ;; The oversized row remains for the next fetch; no partial size
-            ;; or copy from it is retained in the returned batch.
-            {:end index :row-count n :byte-count bytes}))
-        (recur (inc index) n bytes)))))
+(defn- next-match [plan facts inputs position check! metrics]
+  (let [dependent? (boolean (seq (:requires plan)))
+        input-count (if dependent? (count inputs) 1)]
+    (loop [b (if dependent? (first position) 0), f (if dependent? (second position) position)]
+      (check!)
+      (cond
+        (= b input-count) nil
+        (= f (count facts)) (when dependent? (recur (inc b) 0))
+        :else
+        (let [fact (nth facts f) input (when dependent? (nth inputs b))
+              bindings (if dependent?
+                         (merge (:bindings plan) (zipmap (map :variable (:requires plan)) (:values input)))
+                         (:bindings plan))
+              match (when (and (some? (first fact)) (some? (nth fact 2)))
+                      (match-row bindings (:terms (:clause plan)) fact))]
+          (swap! metrics update :read-rows inc)
+          (if match
+            {:position (if dependent? [b (inc f)] (inc f))
+             :row (mapv match (map :variable (:columns plan))) :id (:binding-id input)}
+            (recur b (inc f))))))))
 
-(defn- copy-window [rows start end project check!]
-  (loop [index (long start), owned (transient [])]
-    (if (= index end)
-      (persistent! owned)
-      (recur (inc index)
-             (if-let [row (project (nth rows index))]
-               (conj! owned (value/owned-copy row check!))
-               owned)))))
+(defn- at-end? [facts inputs dependent? position]
+  (if dependent?
+    (or (= (first position) (count inputs))
+        (and (= (first position) (dec (count inputs))) (= (second position) (count facts))))
+    (= position (count facts))))
 
-(defrecord Cursor [snapshot plan descriptor request position state session-state metrics reservation]
+(defn- batch-window [plan facts inputs start check! metrics max-rows max-bytes]
+  ;; The sizing pass borrows one projected row at a time from the pinned view.
+  ;; No unadmitted result buffer is built, including for dependent bindings.
+  (let [dependent? (boolean (seq (:requires plan))) columns (:columns plan)]
+    (loop [p start, n 0, bytes 0]
+      (if (or (= n max-rows) (at-end? facts inputs dependent? p))
+        {:end p :row-count n :byte-count bytes :exhausted? (at-end? facts inputs dependent? p)}
+        (if-let [{:keys [position row id]} (next-match plan facts inputs p check! metrics)]
+          (let [candidate
+                (try
+                  (bounded-charge check!
+                    (if (zero? n) 0 (- bytes (* (if dependent? 2 1) empty-vector-charge)))
+                    1 max-bytes
+                    (fn [attempted] (if (zero? n) (limit! :batch-bytes max-bytes attempted) (throw batch-full)))
+                    (fn [observe!]
+                      (if (zero? n)
+                        (if dependent? (value/dependent-batch-charge-bytes columns [row] [id] observe!)
+                            (value/batch-charge-bytes columns [row] observe!))
+                        (do (value/value-charge [row] observe!)
+                            (when dependent? (value/value-charge [id] observe!))))))
+                  (catch Throwable e (when-not (identical? e batch-full) (throw e)) nil))]
+            (if candidate (recur position (inc n) (long candidate))
+                {:end p :row-count n :byte-count bytes :exhausted? false}))
+          {:end (if dependent? [(count inputs) 0] (count facts)) :row-count n
+           :byte-count bytes :exhausted? true})))))
+
+(defn- copy-window [plan facts inputs start n check! metrics]
+  (loop [p start, remaining n, rows (transient []), ids (when (seq (:requires plan)) (transient []))]
+    (if (zero? remaining)
+      {:rows (persistent! rows) :ids (when ids (persistent! ids))}
+      (let [{:keys [position row id]} (next-match plan facts inputs p check! metrics)]
+        (when-not row (fail! :query-source/invalid :batch))
+        (recur position (dec remaining) (conj! rows (value/owned-copy row check!))
+               (when ids (conj! ids id)))))))
+
+(defrecord Cursor [snapshot plan bindings request position state session-state metrics reservation]
   spi/IQuerySourceCursor
   (-next-batch! [_ {:keys [control max-rows max-bytes]}]
     (active! state control)
@@ -129,155 +180,153 @@
                   (integer? max-rows) (<= 1 max-rows Long/MAX_VALUE)
                   (integer? max-bytes) (<= 1 max-bytes Long/MAX_VALUE))
       (fail! :query-source/invalid :fetch))
-    (let [started (System/nanoTime)
-          rows @snapshot
-          columns (:columns plan)
-          variables (mapv :variable columns)
-          eav? (= :eav (get-in descriptor [:pattern-contract :kind]))
-          check! #(active! session-state control)
-          read-rows (volatile! 0)
-          project (fn [row]
-                    (active! session-state control)
-                    (vswap! read-rows inc)
-                    (when-let [binding (when-not (and eav? (or (nil? (get row 0)) (nil? (get row 2))))
-                                         (match-row (:bindings plan) (:terms (:clause plan)) row))]
-                      (mapv binding variables)))
+    (let [started (System/nanoTime) facts @snapshot inputs (when bindings @bindings)
+          dependent? (boolean (seq (:requires plan))) columns (:columns plan)
+          check! #(do (active! state control) (active! session-state control))
           start @position]
       (try
-        (let [{:keys [end row-count byte-count]}
-              (batch-window rows start columns project check! (long max-rows) (long max-bytes))
-              ;; Reserve once, before allocating the output vector or copying
-              ;; mutable leaves. No row buffer is retained by the sizing pass.
-              token (when (pos? row-count)
+        (let [{:keys [end row-count byte-count exhausted?]}
+              (batch-window plan facts inputs start check! metrics (long max-rows) (long max-bytes))
+              ;; A dependent empty final batch still owns its ID vector.
+              empty-bytes (when (and dependent? (zero? row-count))
+                            (bounded-charge check! 0 1 max-bytes #(limit! :batch-bytes max-bytes %)
+                              #(value/dependent-batch-charge-bytes columns [] [] %)))
+              byte-count (or empty-bytes byte-count)
+              token (when (pos? byte-count)
                       (spi/reserve! control {:retained-bytes byte-count :in-flight-batches 1}))]
           (try
-            (let [owned (if token (copy-window rows start end project check!) [])
-                  bytes (bounded-charge check! 0 1 byte-count
-                                        #(limit! :batch-bytes byte-count %)
-                                        #(value/batch-charge-bytes columns owned %))]
-              ;; Report the exact output charge. The preflight reservation must
-              ;; cover the owned copy, including its preserved metadata.
-              (when-not (and (= row-count (count owned))
-                             (value/at-most? bytes (long byte-count)))
-                (fail! :query-source/invalid :batch))
-              (spi/check-active! control)
+            (let [{:keys [rows ids]} (copy-window plan facts inputs start row-count check! metrics)
+                  bytes (bounded-charge check! 0 1 byte-count #(limit! :batch-bytes byte-count %)
+                          (fn [observe!]
+                            (if dependent? (value/dependent-batch-charge-bytes columns rows ids observe!)
+                                (value/batch-charge-bytes columns rows observe!))))]
+              (when-not (= bytes byte-count) (fail! :query-source/invalid :batch))
+              (check!)
               (reset! position end)
-              (swap! metrics #(-> % (update :batches inc) (update :rows + row-count)
-                                  (update :charged-bytes + bytes)))
-              {:columns columns :rows owned :row-count row-count :byte-count bytes
-               :reservation token :exhausted? (= end (count rows))})
+              (swap! metrics #(-> % (update :batches inc) (update :rows + row-count) (update :charged-bytes + bytes)))
+              (cond-> {:columns columns :rows rows :row-count row-count :byte-count bytes
+                       :reservation token :exhausted? exhausted?}
+                dependent? (assoc :binding-ids ids)))
             (catch Throwable e (when token (spi/release! token)) (throw e))))
-        (finally
-          (swap! metrics #(-> % (update :read-rows + @read-rows)
-                              (update :elapsed-ns + (- (System/nanoTime) started))))))))
+        (finally (swap! metrics update :elapsed-ns + (- (System/nanoTime) started))))))
   (-cursor-metrics [_] @metrics)
   (-close-cursor! [_]
-    (swap! state assoc :closed? true)
-    (reset! snapshot nil)
-    (spi/release! reservation)
+    (when-not (:closed? @state)
+      (swap! state assoc :closed? true)
+      (reset! snapshot nil)
+      (when bindings (reset! bindings nil))
+      (spi/release! reservation))
     nil))
 
-(defrecord Session [owner descriptor snapshot request info state plans cursors reservation plan-reservations]
+(defrecord Session [owner descriptor snapshot request info state plans cursors reservations]
   spi/IQuerySourceSession
   (-session-info [_] info)
-  (-open-cursor [_ cursor-request]
+  (-open-cursor [_ open]
     (active! state (:control request))
-    (when-not (= (:definition-fingerprint descriptor) (:definition-fingerprint cursor-request))
+    (when-not (= (:definition-fingerprint descriptor) (:definition-fingerprint open))
       (fail! :query-source/stale-definition :open))
-    (let [plan (get @plans (:plan cursor-request))]
-      (when-not (and plan (= (:id plan) (:alternative-id cursor-request))
-                     (= (:source-symbol plan) (:source-symbol cursor-request)))
+    (let [plan (get @plans (:plan open)) dependent? (boolean (seq (:requires plan)))
+          common [:control :query-id :spi-version :features :authorization :consistency :limits]
+          ctl (:control request) check! #(active! state ctl)]
+      (when-not (and plan (= (:id plan) (:alternative-id open)) (= (:source-symbol plan) (:source-symbol open))
+                    (= (:scope-id plan) (:scope-id open)) (= (:region-id plan) (:region-id open))
+                    (= (select-keys request common) (select-keys open common)))
         (fail! :query-source/invalid :open))
-      (let [scratch (retained-charge request #(active! state (:control request)) 1024 2
-                                      [(:terms (:clause plan)) (:columns plan)])
-            reservation (spi/reserve! (:control request) {:retained-bytes scratch})
-            cursor (->Cursor (atom @snapshot) plan descriptor request (atom 0) (atom {}) state
-                             (atom {:batches 0 :rows 0 :charged-bytes 0 :read-rows 0
-                                    :read-bytes nil :external-requests 0 :elapsed-ns 0}) reservation)]
-        (swap! cursors conj cursor)
-        cursor)))
+      (if dependent?
+        (let [maximum (min (get-in request [:limits :binding-bytes]) (:max-binding-bytes constraints))]
+          (when-not (and (vector? (:bindings open))
+                         (<= 1 (count (:bindings open))
+                             (min (get-in request [:limits :binding-rows]) (:max-binding-rows constraints))))
+            (fail! :query-source/invalid :open))
+          (bounded-charge check! 0 1 maximum #(limit! :binding-bytes maximum %)
+                          #(value/binding-charge-bytes (:requires plan) (:bindings open) %)))
+        (when (contains? open :bindings) (fail! :query-source/invalid :open)))
+      (let [scratch (retained-charge request check! 1024 2
+                                    [(:terms (:clause plan)) (:columns plan) (:bindings plan) (:bindings open)])
+            token (spi/reserve! ctl {:retained-bytes scratch})]
+        (try
+          (let [cursor (->Cursor (atom @snapshot) plan
+                                 (when dependent? (atom (value/owned-copy (:bindings open) check!))) request
+                                 (atom (if dependent? [0 0] 0)) (atom {}) state
+                                 (atom {:batches 0 :rows 0 :charged-bytes 0 :read-rows 0 :read-bytes nil
+                                        :external-requests 0 :elapsed-ns 0}) token)]
+            (swap! cursors conj cursor)
+            cursor)
+          (catch Throwable e (spi/release! token) (throw e))))))
   (-cancel-session! [_ _] (swap! state assoc :cancelled? true) nil)
   (-close-session! [_]
     (when-not (:closed? @state)
       (swap! state assoc :closed? true)
       (run! spi/-close-cursor! @cursors)
-      (reset! cursors [])
-      (reset! plans {})
-      (run! spi/release! @plan-reservations)
-      (reset! plan-reservations [])
-      (reset! snapshot nil)
-      (spi/release! reservation))
+      (reset! cursors []) (reset! plans {}) (reset! snapshot nil)
+      (run! spi/release! @reservations) (reset! reservations []))
     nil))
 
-(defrecord LocalSource [descriptor data]
+(defrecord LocalSource [descriptor data options]
   spi/IQuerySource
   (-source-info [_] descriptor)
-  (-open-session [_ request]
+  (-open-session [this request]
     (spi/check-active! (:control request))
-    (when-not (= :snapshot (:consistency request)) (fail! :query-source/unsupported :acquisition))
-    (when-not (every? #(= descriptor %) (:source-descriptors request))
-      (fail! :query-source/unsupported :acquisition))
-    (let [rows @data
-          ;; Charge the pinned version, including old versions kept alive by
-          ;; replace-rows!, rather than treating retained snapshot data as free.
-          ;; Include outer vector metadata, even for an empty row version.
-          bytes (retained-charge request #(spi/check-active! (:control request))
-                                 2048 1 rows)
-          reservation (spi/reserve! (:control request) {:retained-bytes bytes})]
+    (when-not (and (= 2 (:spi-version request))
+                   (#{:snapshot :statement :best-effort} (:consistency request))
+                   (= (:features descriptor) (:features request))
+                   (vector? (:source-descriptors request)) (seq (:source-descriptors request))
+                   (every? #(= descriptor %) (:source-descriptors request)))
+      (fail! :query-source/invalid :acquisition))
+    (let [{:keys [facts version]} @data
+          bytes (retained-charge request #(spi/check-active! (:control request)) 2048 1 facts)
+          token (spi/reserve! (:control request) {:retained-bytes bytes})]
       (try
-        (->Session data descriptor (atom rows) request
-                   (merge (select-keys descriptor [:source-instance-id :compute-context-id])
-                          (select-keys request [:spi-version :features :consistency])
-                          {:session-id (UUID/randomUUID) :authorization-token :local-caller
-                           :acquired-at-ms (System/currentTimeMillis) :data-version nil})
-                   (atom {}) (atom {}) (atom []) reservation (atom []))
-        (catch Throwable e (spi/release! reservation) (throw e)))))
-  (-plan-source [_ session request]
-    (active! (:state session) (:control request))
-    (when-not (identical? data (:owner session)) (fail! :query-source/unsupported :planning))
-    (when-not (= descriptor (:source-descriptor request))
-      (fail! :query-source/stale-definition :planning))
-    {:alternatives
-     (mapv (fn [clause]
-             (let [columns (->> (map vector (:terms clause) (pattern-columns descriptor clause))
-                                (keep (fn [[term column]]
-                                        (when (= :var (first term)) (assoc column :variable (second term)))))
-                                (reduce (fn [m {:keys [variable] :as column}]
-                                          ;; A repeated variable must satisfy every
-                                          ;; occurrence, regardless of column order.
-                                          (assoc m variable
-                                                 (update column :nullable?
-                                                         #(and % (get-in m [variable :nullable?] true)))))
-                                        {}) vals vec)
-                   bytes (retained-charge request #(active! (:state session) (:control request))
-                                          1024 2 [columns clause (:bindings request)])
-                   reservation (spi/reserve! (:control request) {:retained-bytes bytes})
-                   _ (swap! (:plan-reservations session) conj reservation)
-                   handle (Object.)
-                   plan {:id (:id clause) :clause clause :columns columns
-                         :bindings (:bindings request) :source-symbol (:source-symbol request)}]
-               (swap! (:plans session) assoc handle plan)
-               {:id (:id clause) :plan handle :covers #{(:id clause)} :prefilters #{} :requires []
-                :columns columns :properties {:replay :reopen :ordering [] :blocking-state :none}
-                :estimate {:rows nil :row-bytes nil :startup-ms nil :per-row-ns nil
-                           :requests nil :confidence :unknown}
-                :explain {:label "Local declared-schema scan"}}))
-           (filter #(= :pattern (:kind %)) (:clauses request)))}))
+        (->Session this descriptor (atom facts) request
+          (merge (select-keys descriptor [:source-instance-id :compute-context-id])
+                 {:spi-version 2 :features #{} :consistency :snapshot :session-id (UUID/randomUUID)
+                  :authorization-token :local-caller :acquired-at-ms (System/currentTimeMillis) :data-version version
+                  :consumption {:opens :many :max-open-cursors 1}
+                  :request-constraints {:max-concurrent-requests 1 :rate-limit nil}})
+          (atom {}) (atom {}) (atom []) (atom [token]))
+        (catch Throwable e (spi/release! token) (throw e)))))
+  (-plan-source [this session request]
+    (let [ctl (:control request) check! #(active! (:state session) ctl)]
+      (check!)
+      (when-not (and (identical? this (:owner session))
+                    (= descriptor (:source-descriptor request)) (= 2 (:spi-version request))
+                    (identical? ctl (get-in session [:request :control]))
+                    (= (:query-id request) (get-in session [:request :query-id]))
+                    (= (:scope-id request) (get-in descriptor [:scope :id])))
+        (fail! :query-source/invalid :planning))
+      {:alternatives
+       (mapv (fn [{:keys [id clause columns requires kind] :as candidate}]
+               (let [plan (merge candidate (select-keys request [:source-symbol :region-id :scope-id :bindings]))
+                     bytes (retained-charge request check! 1024 2 plan)
+                     token (spi/reserve! ctl {:retained-bytes bytes})]
+                 (try
+                   (let [handle (Object.) plan (value/owned-copy plan check!)]
+                     (swap! (:reservations session) conj token)
+                     (swap! (:plans session) assoc handle plan)
+                     {:id id :plan handle :covers #{(:id clause)} :prefilters #{} :requires requires :columns columns
+                      :scope-id (:scope-id request) :completion :all-bindings
+                      :access {:kind kind :anchor-clause (:id clause)}
+                      :properties {:replay :identical :ordering [] :blocking-state :none}
+                      :constraints constraints :estimate (unknown-estimate (boolean (seq requires)))
+                      :explain {:label "Local declared-schema access"}})
+                   (catch Throwable e (spi/release! token) (throw e)))))
+             (choices descriptor request options))})))
 
 (defn source
-  "Create a caller-owned local source from a validated descriptor and vector of
-  rows. Copies mutable leaves. The caller grants read access by passing the
-  source to d/q; this adapter has no remote authorization or schema discovery."
-  [descriptor rows]
-  (spi/validate-source-info! descriptor)
-  (when-not (and (= #{1} (:spi-versions descriptor))
-                 (empty? (:features descriptor)) (empty? (:required-features descriptor)))
-    (fail! :query-source/unsupported :descriptor))
-  (->LocalSource descriptor (atom (accepted-rows descriptor rows))))
+  "Create a caller-owned finite EAV view. Mutable leaves and metadata are owned.
+  :mode selects offered accesses (:both, :scan, :lookup or :value). Open sessions
+  pin their own immutable version; absence emits no fact."
+  ([descriptor facts] (source descriptor facts {}))
+  ([descriptor facts options]
+   (spi/validate-source-info! descriptor)
+   (when-not (and (empty? (:features descriptor)) (empty? (:required-features descriptor))
+                  (#{:both :scan :lookup :value} (get options :mode :both))
+                  (every? #{:mode} (keys options)))
+     (fail! :query-source/unsupported :descriptor))
+   (->LocalSource descriptor (atom {:facts (accepted-rows descriptor facts) :version (UUID/randomUUID)}) options)))
 
 (defn replace-rows!
-  "Atomically publish an owned row version. Open sessions retain their old view.
-  The accepted descriptor and its definition fingerprint remain unchanged."
-  [^LocalSource source rows]
-  (reset! (:data source) (accepted-rows (:descriptor source) rows))
+  "Atomically publish an owned EAV fact version without changing its definition."
+  [^LocalSource source facts]
+  (reset! (:data source) {:facts (accepted-rows (:descriptor source) facts) :version (UUID/randomUUID)})
   nil)

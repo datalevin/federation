@@ -17,7 +17,7 @@ federation.
 
 This project owns every production external query-source adapter, including
 local relations, APIs, files/exports, PostgreSQL, and optional
-dataset/Parquet/DataFusion integrations. The common SPI is being revised around
+dataset/Parquet/DataFusion integrations. The common SPI uses v2 across
 four source shapes: native Datalevin, SQL, files/exports, and APIs. Native
 Datalevin remains built into core with its existing native query path. The
 federation planner bridge activates for mixed queries; native-only performance
@@ -50,7 +50,7 @@ F0 includes an accepted-metadata [mapping compiler](core/src/datalevin/federatio
 delivers runtime `EntityRef` identity, its codec, and scalar/reference
 cardinality-many mappings, including explicitly snapshot-scoped row keys for
 keyless exports; F1 uses them in bounded provider execution and native joins.
-Pure preparation for that foundation is implemented in
+That mapping/identity foundation is implemented in
 [`compile-logical-mapping`](core/src/datalevin/federation/mapping.clj) and
 [`entity-ref`](core/src/datalevin/federation/entity_ref.clj). The common accepted
 representation includes explicit extraction, scalar/reference `:many`, complete
@@ -60,17 +60,18 @@ normalizers return the same accepted representation. `project-facts` projects
 already converted records without provider I/O. The reference codec has bounded
 JVM tests, native custom-type storage/reconnect coverage, and independently
 verified JVM/Rust [golden fixtures](core/test/fixtures/README.md).
-These helpers do not emit SPI descriptors. The active `compile-relation`
-compiler still accepts only `:one`, and adapters keep the prototype contract
-until the coordinated runtime switch. Provider I/O and schema installation
-follow the roadmap's later production-provider gates.
-Build, dependencies, tests, and releases remain separate from Datalevin proper.
-The [four-shape revision](federation.md#11-common-relation-and-access-contracts)
-is planned work: the current executable baseline remains scan-oriented and has
-not yet gained parameterized access, per-source consistency requirements, or
-scoped one-shot consumption. This SPI is unreleased exploration: migrate core,
-adapters, and fixtures together, replacing prototype envelopes without a v1
-compatibility path. F1 sign-off requires the revised contract gates.
+The active `compile-relation` now uses that normalization boundary and emits
+complete v2 EAV descriptors and definition fingerprints. The local adapter and
+shared fixtures use the same v2 contract as public Datalevin `q`/`explain`.
+Scoped dependent entity/value access, input-free scans, grouped consistency and
+independent consumption/replay declarations are covered by shared tests.
+The default suite also runs deterministic SQLite, exported-file and paginated
+HTTP fixtures through this adapter and the shared engine. They check request and
+retry charges, scan/dependent semantics, native joins, actual read guarantees,
+cancellation and incomplete acquisition. These bounded session-export fixtures
+do not certify production SQL/file/API adapters. Native performance evidence and
+the retained-resource audit live in the matching core checkout. No v1
+compatibility mode exists.
 
 ## Subprojects and releases
 
@@ -86,12 +87,10 @@ installs it locally, and `lein deploy clojars` publishes that artifact using
 `CLOJARS_USERNAME` and `CLOJARS_PASSWORD`. Change only that subproject's version
 when preparing its release. There is no aggregate release artifact.
 
-Consumers add the artifacts they need. The earlier v1 local adapter accepts SPI
-descriptors directly, so it currently uses only Clojure and Datalevin.
-Applications using the mapping compiler also add `datalevin-federation-core`.
-The revised local adapter, like every revised federation adapter, will use
-accepted EAV mappings and declare a compatible `core` dependency. Existing
-`datalevin.federation.*` namespaces are unchanged.
+Consumers add the artifacts they need. `local/source` accepts a complete v2
+EAV descriptor and already mapped facts, so it uses Clojure and Datalevin.
+Applications compiling accepted mappings also add `datalevin-federation-core`.
+Existing `datalevin.federation.*` namespaces are unchanged.
 Datalevin has Maven `provided` scope: the application explicitly supplies a
 compatible Datalevin runtime rather than receiving one transitively from each
 adapter.
@@ -103,11 +102,19 @@ These subprojects are planned. Provider drivers and engine dependencies belong
 only in the subproject that uses them. Adapters depend on an explicit compatible
 version of `core` when they use its mapping APIs; `core` never depends on adapters.
 
+
+Final v2 cleanup validation: **71 tests / 22,818 assertions** pass in this
+repository; the local alias passes **41 / 18,231**, including the transport
+matrix. Core/sibling regression results and the completed native routing gate
+are recorded in the [validation report](../datalevin/doc/measurements/query-source-native-2026-10-19.md).
+
 ## Development
 
 The root `deps.edn` is a development workspace using the matching Datalevin
 checkout at `../datalevin`; release POMs declare Maven dependencies instead.
-Run all tests or select one subproject with an isolated source/test classpath:
+Run all tests or select one subproject with an isolated source/test classpath.
+The transport matrix requires `sqlite3` on PATH and permission to bind a temporary
+loopback HTTP port; it uses no external service or persistent database:
 
 ```sh
 clojure -M:test
@@ -147,28 +154,29 @@ which requires a released version with the SPI.
 
 ## Local adapter
 
-The current v1 `local/source` accepts an SPI descriptor and a vector of
-declared-schema rows, including the earlier tuple-source contract. Revised
-federation requires mapped entities and attributes; the local adapter's v2 work
-must consume the compiler's EAV descriptor. Applications supplying arbitrary
-tuples can use existing Datalog inputs directly.
+`local/source` accepts a validated v2 EAV descriptor and a vector of
+`[entity attribute value]` facts. Missing entities/values emit no fact.
+Applications supplying arbitrary tuples can use ordinary Datalog inputs.
 
-The current adapter copies mutable leaves on construction; `local/replace-rows!`
-atomically publishes a new version without changing accepted metadata. Open sessions pin
-and charge their complete row version, so replacement cannot change an active
-query's view. Passing this caller-owned object grants local read access.
-The adapter plans one scan per pattern and leaves predicates to core. It sizes
-multi-row batches against the requested row and byte limits, reserves memory
-once per batch, then copies owned values from the pinned snapshot. Physical
-rows examined include both the sizing and copy passes, plus byte-boundary
-lookahead; rows returned are reported separately. Early stop may read ahead
-within the current batch. It advertises no optional features and performs no
-discovery.
+Construction owns mutable leaves and metadata; `local/replace-rows!` atomically
+publishes a new fact version without changing its definition. Each session pins
+and charges its immutable view and reports a distinct data version. It supports
+snapshot reads, including requests for weaker minimum guarantees. Passing the
+caller-owned object grants local read access.
+
+The adapter offers single-pattern attribute enumeration and typed entity/value
+lookups (`:mode` can restrict the offered paths). Core schedules dependent
+bindings and joins every outer witness. Input-free opens omit bindings and IDs;
+dependent batches echo the IDs supplied for that open, including empty final
+completion. Predicates stay in core. Both paths size one borrowed row at a time,
+reserve the output charge, then copy owned batches. Physical read metrics count
+the sizing/copy passes and byte-boundary lookahead. Complete access exhaustion
+precedes terminal result windows. The adapter performs no discovery or external
+backend requests.
 
 The [execution tests](local/test/datalevin/federation/local_test.clj) compare eager
 results, native joins, aliases under writes, decimal key/predicate behavior,
-nominal reference-valued EAV facts, and resource limits. F1 remains in progress;
-the core [supported subset and remaining cases](../datalevin/doc/query-source-spi.md#9-source-conformance)
+nominal reference-valued EAV facts, and resource limits. The core [supported subset and remaining cases](../datalevin/doc/query-source-spi.md#9-source-conformance)
 apply to this adapter too.
 
 The [shared conformance tests](local/test/datalevin/federation/local_conformance_test.clj)
@@ -187,23 +195,27 @@ interrupts owned copying between values and releases any output reservation.
 These checks cover acquisition, planning, cursor scratch, and batch handoff.
 The adapter still reserves once per output batch.
 
+The [transport matrix](local/test/datalevin/federation/local_transport_test.clj)
+uses the shared test harness with actual SQLite SELECTs, an immutable JSON export
+and paginated HTTP responses. Its completed observations are explicitly owned
+under the query budget during acquisition, then executed by the local adapter.
+Materializing an HTTP observation preserves best-effort consistency and omits a
+data version. Page/retry requests consume separate permits; cancellation or a
+known page cap returns no partial result. Every live charge is released on exit.
+
 ## Shared mapping contracts
 
 `compile-relation` accepts the main-schema definition map, a relation ID, and a
 context containing a compute-context ID and recorded semantic dependencies.
-It currently returns the accepted relation body with digests and a validated
-v1 SPI source descriptor. Its v2 work must also project the accepted logical
-schema and include it in the definition fingerprint, under the
+It returns the accepted relation body with v2 digests and a validated complete
+v2 EAV source descriptor under the
 [mapping-to-SPI contract](federation.md#43-compilation-to-the-spi).
-The existing fixtures include the plan's normalized mapping, composite keys,
-and resolved reference targets; v2 adds guarantee projection and invalidation
-checks. The early revision also specifies unordered scalar/reference collections,
-their absence and duplicate-element rules, and
-[snapshot-scoped export identities](federation.md#snapshot-scoped-row-identity)
-that never imply continuity across exports. Ordered occurrences and nested
-objects need additional mapping rules. Concise mapping normalization and
-physical-type conversion remain adapter work; the compiler consumes accepted
-logical types.
+Mappings explicitly declare identity scope, extraction/conversion rules, finite
+scope and completion. Scalar/reference `:one` and `:many` guarantees and
+reference domains participate in the logical schema and definition digest.
+Provider normalization consumes captured physical metadata without row I/O;
+`project-facts` handles converted values and no-fact absence. Ordered occurrences
+and nested-object identity still need additional mapping rules.
 
 Canonical v1 uses `tag + decimal UTF-8 payload byte length + ':' + payload`.
 Tags are `n` nil, `b` boolean (`0`/`1`), `l` long, `i` bigint, `d` decimal

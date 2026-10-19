@@ -2,8 +2,9 @@
   (:require [clojure.test :refer [deftest is testing]]
             [datalevin.core :as d]
             [datalevin.federation.local :as local]
-            [datalevin.federation.local-test :refer [descriptor category]]
+            [datalevin.federation.local-test :refer [descriptor category row-facts]]
             [datalevin.query.source :as spi]
+            [datalevin.query.source.fake :as fake]
             [datalevin.query.source.contract :as contract]
             [datalevin.query.source.control :as control]
             [datalevin.query.source.value :as value])
@@ -11,11 +12,11 @@
 
 (defn- with-session [info rows limits f]
   (let [ctl (control/create {:limits limits})
-        s (local/source info rows)
+        s (local/source info (if (get-in info [:pattern-contract :attributes :row/value]) (row-facts rows) rows) {:mode :scan})
         common {:control ctl :limits (control/limits ctl)
                 :query-id (random-uuid) :authorization {:principal-id :test}
-                :spi-version 1 :features #{} :consistency :snapshot
-                :source-descriptors [info]}
+                :spi-version 2 :features #{} :consistency :snapshot
+                :source-descriptors [info] :region-id 0 :scope-id (get-in info [:scope :id])}
         session (spi/-open-session s common)]
     (try (f {:control ctl :source s :session session :request common})
       (finally
@@ -26,7 +27,7 @@
 (defn- plan! [{:keys [source session request]} info terms bindings]
   (first (:alternatives
            (spi/-plan-source source session
-             (merge request {:source-descriptor info :source-symbol '$s :bindings bindings
+             (merge request {:source-descriptor info :source-symbol '$s :bindings bindings :available-inputs []
                              :clauses [{:id 0 :kind :pattern :terms terms}]})))))
 
 (defn- open-cursor! [{:keys [session request]} info alternative]
@@ -51,7 +52,7 @@
 (defn- release! [batch]
   (when-let [token (:reservation batch)] (spi/release! token)))
 
-(def terms [[:var '?id] [:var '?v]])
+(def terms [[:var '?id] [:const :row/value] [:var '?v]])
 (defn- rows [n] (mapv #(vector % "x") (range n)))
 
 (deftest local-cursor-fills-row-and-byte-limits
@@ -85,8 +86,7 @@
           (is (= (+ 22 (if (= 64 max-rows) (dec (count expected)) 0)) (:read-rows metrics))))))))
 
 (deftest local-batches-skip-nonmatches-and-missing-eav-values
-  (let [info (assoc descriptor :pattern-contract
-                    {:kind :eav :attributes {:value {:entity-type :long :value-type :string}}})
+  (let [info (fake/info {:value {:entity-type :long :value-type :string}})
         input [[0 :value nil] [1 :value "x"] [2 :value nil] [3 :value "x"] [4 :value nil]]]
     (with-cursor info input [[:var '?id] [:const :value] [:ignore]] {} {}
       (fn [{:keys [control] :as fixture}]
@@ -100,7 +100,7 @@
             (is (nil? (:reservation last-batch)))
             (is (zero? (:in-flight-batches (control/usage control)))))))))
   (with-cursor descriptor [[0 "skip"] [1 "x"] [2 "skip"] [3 "x"] [4 "skip"]]
-    [[:var '?id] [:const "x"]] {} {}
+    [[:var '?id] [:const :row/value] [:const "x"]] {} {}
     (fn [fixture]
       (let [batch (fetch! fixture 3 10000)]
         (is (= [[1] [3]] (:rows batch)))
@@ -109,7 +109,7 @@
 
 (deftest local-batches-own-mutable-leaves-after-close
   (let [bytes (byte-array [1 2]) date (Date. 1000)
-        info (assoc-in descriptor [:pattern-contract :columns 1] {:type :data :nullable? false})
+        info (fake/row-info :data)
         input (mapv #(vector % {:bytes bytes :date date}) (range 5))]
     (with-cursor info input terms {} {}
       (fn [{:keys [control cursor session] :as fixture}]
@@ -175,7 +175,7 @@
         (spi/-cancel-session! session {:error :query-source/cancelled :phase :fetch})
         (is (= :query-source/cancelled (category #(fetch! fixture 4 10000))))
         (is (= baseline (control/usage control))))))
-  (let [info (assoc-in descriptor [:pattern-contract :columns 1] {:type :data :nullable? false})
+  (let [info (fake/row-info :data)
         bound (with-meta [:x] {:extra (.repeat "metadata" 100)})]
     (with-cursor info [[1 [:x]] [2 [:x]]] terms {'?v bound} {}
       (fn [{:keys [control] :as fixture}]
@@ -191,7 +191,7 @@
   (doseq [bound? [false true]]
     (let [bytes (byte-array [1 2]) date (Date. 1000)
           x (with-meta [(with-meta 'leaf {:date date})] {:bytes bytes})
-          info (assoc-in descriptor [:pattern-contract :columns 1] {:type :data :nullable? false})
+          info (fake/row-info :data)
           input (mapv #(vector % x) (range 4))]
       (with-cursor info input terms (if bound? {'?v x} {}) {}
         (fn [{:keys [cursor session] :as fixture}]
@@ -218,7 +218,7 @@
                       (fn [date] (sorted-set date (Date. 2000)))]]
     (let [date (Date. 1000)
           x (with-meta (make-value date) {:stamp date})
-          info (assoc-in descriptor [:pattern-contract :columns 1] {:type :data :nullable? false})
+          info (fake/row-info :data)
           collected (atom [])]
       (with-cursor info (mapv #(vector % x) (range 5)) terms {} {}
         (fn [{:keys [cursor session] :as fixture}]
@@ -239,7 +239,7 @@
         (is (= 1000 (.getTime ^Date (:stamp (meta v)))))))))
 
 (def ^:private data-descriptor
-  (assoc-in descriptor [:pattern-contract :columns 1] {:type :data :nullable? false}))
+  (fake/row-info :data))
 
 (deftype MeasuredLeaf [id bytes on-size on-compare]
   value/IQuerySourceValue
@@ -261,10 +261,10 @@
 
 (deftest pinned-snapshot-includes-outer-metadata
   (doseq [rows [[] [[1 "x"]]]]
-    (let [input (with-meta rows {:payload (byte-array 32768)})
-          source (local/source descriptor input)
-          q '{:find [?id] :in [$s] :where [[$s ?id _]]
-              :query-source {:limits {:retained-bytes 16384}}}
+    (let [input (with-meta rows {:payload (byte-array 524288)})
+          source (local/source descriptor (row-facts input))
+          q '{:find [?id] :in [$s] :where [[$s ?id :row/value _]]
+              :query-source {:limits {:retained-bytes 262144}}}
           error (error-data #(d/q q source))]
       (is (= :query-source/limit (:error error)))
       (is (= :acquisition (:phase error)))
@@ -284,12 +284,12 @@
       (let [first-action (atom nil) later-action (atom nil) visited (atom 0)
             rows [[1 [(leaf 1 (if (= mode :overflow) Long/MAX_VALUE 65536) first-action)
                       (leaf 2 64 later-action)]]]
-            source (local/source data-descriptor rows)
+            source (local/source data-descriptor (row-facts rows))
             ctl (control/create {:limits {:retained-bytes (case mode
                                                            :limit 16384
                                                            :cancel 1048576
                                                            :overflow Long/MAX_VALUE)}})
-            request {:control ctl :limits (control/limits ctl) :spi-version 1
+            request {:control ctl :limits (control/limits ctl) :spi-version 2
                      :features #{} :consistency :snapshot :source-descriptors [data-descriptor]}]
         (try
           (reset! later-action #(swap! visited inc))
@@ -308,7 +308,7 @@
             x [(leaf 1 64 first-action) (leaf 2 64 later-action)]]
         (with-session data-descriptor [] {}
           (fn [{:keys [control] :as fixture}]
-            (let [constant-terms [[:var '?id] [:const x]]
+            (let [constant-terms [[:var '?id] [:const :row/value] [:const x]]
                   alternative (when (= phase :open)
                                 (plan! fixture data-descriptor constant-terms {}))
                   baseline (control/usage control)]
@@ -373,3 +373,74 @@
           (is (= 1 (count (set @comparisons))))
           (is (zero? (:rows (spi/-cursor-metrics cursor))))
           (is (= baseline (control/usage control))))))))
+
+(defn- with-dependent [f]
+  (let [ctl (control/create)
+        provider (local/source descriptor (row-facts [[1 "one"] [2 "two"]]) {:mode :lookup})
+        request {:control ctl :limits (control/limits ctl) :query-id (random-uuid)
+                 :authorization {} :spi-version 2 :features #{} :consistency :snapshot
+                 :source-descriptors [descriptor] :region-id 0 :scope-id (get-in descriptor [:scope :id])}
+        session (spi/-open-session provider request)]
+    (try
+      (let [alternative (first (:alternatives
+                                 (spi/-plan-source provider session
+                                   (merge request {:source-descriptor descriptor :source-symbol '$s :bindings {}
+                                                   :available-inputs [{:variable '?id :type :long :nullable? false}]
+                                                   :clauses [{:id 0 :kind :pattern :terms terms}]}))))
+            open (contract/cursor-request request '$s (:definition-fingerprint descriptor) alternative)]
+        (f ctl session open alternative))
+      (finally (spi/-close-session! session) (control/close! ctl)
+               (is (every? zero? (vals (control/usage ctl))))))))
+
+(deftest dependent-local-opens-check-identities-and-complete-binding-keys
+  (with-dependent
+    (fn [ctl session open _]
+      (doseq [bindings [[{:binding-id 1 :values [1]} {:binding-id 1 :values [2]}]
+                        [{:binding-id 1 :values [1]} {:binding-id 2 :values [1]}]
+                        [{:binding-id 1 :values ["wrong"]}]
+                        [{:binding-id 1 :values []}]]]
+        (is (= :query-source/invalid
+               (category #(spi/-open-cursor session (assoc open :bindings bindings))))))
+      (doseq [[field x] [[:region-id 99] [:scope-id "foreign"] [:query-id (random-uuid)]]]
+        (is (= :query-source/invalid
+               (category #(spi/-open-cursor session
+                            (assoc open field x :bindings [{:binding-id 7 :values [1]}]))))))
+      (is (= :query-source/stale-definition
+             (category #(spi/-open-cursor session
+                          (assoc open :definition-fingerprint "stale" :bindings [{:binding-id 7 :values [1]}])))))
+      (is (zero? (:in-flight-batches (control/usage ctl)))))))
+
+(deftest dependent-local-batches-own-values-and-complete-zero-match-ids
+  (with-dependent
+    (fn [ctl session open alternative]
+      (let [bindings [{:binding-id 11 :values [2]} {:binding-id 12 :values [99]} {:binding-id 13 :values [1]}]
+            cursor (spi/-open-cursor session (assoc open :bindings bindings))
+            fetch {:control ctl :max-rows 1 :max-bytes 10000}
+            baseline (control/usage ctl)]
+        (is (= :query-source/limit
+               (category #(spi/-next-batch! cursor (assoc fetch :max-bytes 1)))))
+        (is (= baseline (control/usage ctl)))
+        (let [batches (loop [out []]
+                        (let [batch (spi/-next-batch! cursor fetch)]
+                          (is (= (:byte-count batch)
+                                 (spi/batch-charge-bytes (:columns alternative) (:rows batch) (:binding-ids batch))))
+                          (control/accept! ctl (:reservation batch) (:byte-count batch))
+                          (spi/release! (:reservation batch))
+                          (is (= baseline (control/usage ctl)))
+                          (if (:exhausted? batch) (conj out batch) (recur (conj out batch)))))]
+          (is (= [[2 "two"] [1 "one"]] (vec (mapcat :rows batches))))
+          (is (= [11 13] (vec (mapcat :binding-ids batches))))
+          (is (true? (:exhausted? (last batches)))))))))
+
+(deftest dependent-open-preflight-stops-before-later-binding-metadata
+  (with-dependent
+    (fn [ctl session open _]
+      (let [first-action (atom nil) later-action (atom nil) visited (atom 0)
+            bindings (with-meta [{:binding-id 7 :values [1]}]
+                       {:payload [(leaf 1 524288 first-action) (leaf 2 64 later-action)]})
+            baseline (control/usage ctl)]
+        (reset! later-action #(swap! visited inc))
+        (is (= :query-source/limit
+               (category #(spi/-open-cursor session (assoc open :bindings bindings)))))
+        (is (zero? @visited))
+        (is (= baseline (control/usage ctl)))))))

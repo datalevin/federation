@@ -16,10 +16,12 @@
    :sales/orders
    {:datalevin/definition-kind :relation
     :datalevin.federation/definition
-    {:version 1 :source :sales/source :from ["public" "orders"]
+    {:version 2 :source :sales/source :from ["public" "orders"]
+     :scope {:id "sales:full" :kind :full :parameters {}}
+     :completion {:domain :finite :extent :all-matches}
      :entity {:domain :order :identity-epoch 0 :key [{:column "id" :type :long}]
-              :identity-attribute :order/id :constraint-source :provider}
-     :attributes {:order/amount {:expression [:column "amount"] :type :bigdec
+              :identity-attribute :order/id :constraint-source :provider :identity-scope :durable}
+     :attributes {:order/amount {:extraction {:shape :value :expression [:column "amount"]} :conversion {:version 1} :type :bigdec
                                  :cardinality :one :null :absent}}
      :physical-schema {:columns [{:name "id" :physical-type {:kind :int64} :nullable? false}
                                   {:name "amount" :physical-type {:kind :decimal :precision 19 :scale 4}
@@ -72,13 +74,18 @@
         attributes (get-in source-info [:pattern-contract :attributes])
         entity-type (get-in attributes [:order/id :entity-type])]
     (is (= source-info (source/validate-source-info! source-info)))
+    (is (= #{2} (:spi-versions source-info)))
+    (is (= :federation/v2 (:fingerprint-scheme definition)))
+    (is (= :one (get-in source-info [:logical-schema :attributes :order/amount :cardinality])))
+    (is (= (:scope (get-in schema relation-path)) (:scope source-info)))
     (is (= #{:order/id :order/amount} (set (keys attributes))))
     (is (= :long (get-in attributes [:order/id :value-type])))
     (is (= :bigdec (get-in attributes [:order/amount :value-type])))
     (is (= entity-type (get-in attributes [:order/amount :entity-type])))
     (is (= {:identity-domain-id [source-id :order 0] :key-types [:long]} (:parameters entity-type)))
     (is (= (:definition-fingerprint definition) (:definition-fingerprint source-info)))
-    (is (= (assoc (:dependencies context) :source-instance-id source-id) (:dependencies definition)))
+    (is (= (assoc (:dependencies context) :source-instance-id source-id
+                      :locator ["public" "orders"] :source :sales/source) (:dependencies definition)))
     (is (= #{} (:features source-info)))
     (is (= #{} (:required-features source-info)))))
 
@@ -91,7 +98,7 @@
                          {:name "tenant" :physical-type {:kind :text} :nullable? false}
                          {:name "customer_id" :physical-type {:kind :int64} :nullable? true})
               (assoc-in (conj relation-path :attributes :order/customer)
-                        {:expression [:tuple [:column "tenant"] [:column "customer_id"]]
+                        {:extraction {:shape :value :expression [:tuple [:column "tenant"] [:column "customer_id"]]} :conversion {:version 1}
                          :reference {:identity-domain-id [source-id :customer 0]
                                      :key-types [:string :long]}
                          :cardinality :one :null :absent}))
@@ -106,7 +113,7 @@
               (update-in (conj relation-path :physical-schema :columns) conj
                          {:name "customer_id" :physical-type {:kind :int64} :nullable? true})
               (assoc-in (conj relation-path :attributes :order/customer)
-                        {:expression [:column "customer_id"]
+                        {:extraction {:shape :value :expression [:column "customer_id"]} :conversion {:version 1}
                          :reference {:identity-domain-id [source-id :customer 0] :key-types [:long]}
                          :cardinality :one :null :absent}))]
     (is (= [:long] (get-in (compile-schema s)
@@ -147,8 +154,7 @@
   (doseq [s [(assoc-in schema (conj relation-path :entity :constraint-source) :untrusted)
              (assoc-in schema (conj relation-path :entity :key) [])
              (assoc-in schema (conj relation-path :physical-schema :columns 0 :nullable?) true)
-             (assoc-in schema (conj relation-path :attributes :order/amount :cardinality) :many)
-             (assoc-in schema (conj relation-path :attributes :order/amount :expression) [:column "missing"])
+             (assoc-in schema (conj relation-path :attributes :order/amount :extraction :expression) [:column "missing"])
              (update-in schema (conj relation-path :attributes :order/amount)
                         #(-> % (dissoc :type) (assoc :reference :customer)))
              (assoc-in schema [:sales/source :datalevin/definition-kind] :relation)]]
@@ -159,7 +165,7 @@
               (update-in (conj relation-path :physical-schema :columns) conj
                          {:name "parent_id" :physical-type {:kind :int64} :nullable? true})
               (assoc-in (conj relation-path :attributes :order/parent)
-                        {:expression [:column "parent_id"]
+                        {:extraction {:shape :value :expression [:column "parent_id"]} :conversion {:version 1}
                          :reference {:identity-domain-id [source-id :order 0] :key-types [:long]}
                          :cardinality :one :null :absent}))
         contract (get-in context [:dependencies :entity-ref-type])
@@ -193,3 +199,13 @@
                      (assoc contract :version 0)
                      (assoc contract :fingerprint "")]]
       (is (thrown? clojure.lang.ExceptionInfo (compile-type invalid))))))
+
+(deftest active-compiler-retains-many-valued-logical-guarantees
+  (let [accepted (-> schema
+                     (assoc-in (conj relation-path :attributes :order/amount :cardinality) :many)
+                     (assoc-in (conj relation-path :attributes :order/amount :extraction :shape) :elements))
+        compiled (compile-schema accepted)]
+    (is (= :many (get-in compiled [:source-info :logical-schema :attributes :order/amount :cardinality])))
+    (is (= :no-fact (get-in compiled [:source-info :logical-schema :attributes :order/amount :absence])))
+    (is (not= (get-in (compile-schema schema) [:source-info :definition-fingerprint])
+              (get-in compiled [:source-info :definition-fingerprint])))))

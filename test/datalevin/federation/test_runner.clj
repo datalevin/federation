@@ -10,7 +10,8 @@
                        datalevin.federation.mapping-v2-test
                        datalevin.federation.local-test
                        datalevin.federation.local-batch-test
-                       datalevin.federation.local-conformance-test])
+                       datalevin.federation.local-conformance-test
+                       datalevin.federation.local-transport-test])
         _ (run! require namespaces)
         {:keys [fail error]} (apply test/run-tests namespaces)]
     (System/exit (if (zero? (+ fail error)) 0 1))))
