@@ -5,6 +5,7 @@
             [datalevin.federation.local-test :refer [descriptor category row-facts]]
             [datalevin.query.source :as spi]
             [datalevin.query.source.fake :as fake]
+            [datalevin.query.source.batch :as batch]
             [datalevin.query.source.contract :as contract]
             [datalevin.query.source.control :as control]
             [datalevin.query.source.value :as value])
@@ -41,10 +42,10 @@
             cursor (open-cursor! fixture info alternative)]
         (f (assoc fixture :cursor cursor :columns (:columns alternative)))))))
 
-(defn- fetch! [{:keys [control cursor columns]} max-rows max-bytes]
+(defn- fetch! [{:keys [control cursor columns dependent?]} max-rows max-bytes]
   (let [request {:control control :max-rows max-rows :max-bytes max-bytes}
         batch (spi/-next-batch! cursor request)]
-    (try (contract/batch! columns request batch)
+    (try (batch/accept! {:control control} columns (boolean dependent?) request batch identity)
          (catch Throwable e
            (when-let [token (:reservation batch)] (spi/release! token))
            (throw e)))))
@@ -136,7 +137,8 @@
               (is (zero? (:retained-bytes (control/usage control)))))))))))
 
 (deftest local-batch-reservation-failure-does-not-consume-rows
-  (let [needed (atom nil) input (rows 4)]
+  ;; The smaller retry must also leave room for consumer validation.
+  (let [needed (atom nil) input (rows 16)]
     (with-cursor descriptor input terms {} {}
       (fn [{:keys [control columns]}]
         (reset! needed (+ (long (:retained-bytes (control/usage control)))
@@ -144,7 +146,7 @@
     (with-cursor descriptor input terms {} {:retained-bytes (dec (long @needed))}
       (fn [{:keys [control] :as fixture}]
         (let [baseline (control/usage control)]
-          (is (= :query-source/limit (category #(fetch! fixture 4 Long/MAX_VALUE))))
+          (is (= :query-source/limit (category #(fetch! fixture (count input) Long/MAX_VALUE))))
           (is (= baseline (control/usage control)))
           (let [batch (fetch! fixture 1 Long/MAX_VALUE)]
             (is (= [[0 "x"]] (:rows batch)))
@@ -421,10 +423,11 @@
                (category #(spi/-next-batch! cursor (assoc fetch :max-bytes 1)))))
         (is (= baseline (control/usage ctl)))
         (let [batches (loop [out []]
-                        (let [batch (spi/-next-batch! cursor fetch)]
+                        (let [batch (fetch! {:control ctl :cursor cursor
+                                             :columns (:columns alternative) :dependent? true}
+                                            (:max-rows fetch) (:max-bytes fetch))]
                           (is (= (:byte-count batch)
                                  (spi/batch-charge-bytes (:columns alternative) (:rows batch) (:binding-ids batch))))
-                          (control/accept! ctl (:reservation batch) (:byte-count batch))
                           (spi/release! (:reservation batch))
                           (is (= baseline (control/usage ctl)))
                           (if (:exhausted? batch) (conj out batch) (recur (conj out batch)))))]
