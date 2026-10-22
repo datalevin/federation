@@ -29,6 +29,19 @@
    :requirements {:fields ["id" "amount" "tags" "customer-id" "assignees"]}
    :dependencies {:provider {:name :api :version 1} :conversion-version 1}})
 
+(deftest prepared-projection-validates-contracts-and-bounds-selected-attributes
+  (let [compiled (mapping/compile-logical-mapping accepted)
+        project (mapping/fact-projector compiled)
+        values {:order/amount 2M :order/tag ["red" "red" "blue"]}
+        selected (project [7] {:order/tag (:order/tag values)} #{:order/tag})]
+    (is (= (set (mapping/project-facts compiled [7] values)) (set (project [7] values))))
+    (is (= #{:order/id :order/tag} (set (map second selected))))
+    (is (= 3 (count selected)))
+    (is (thrown? clojure.lang.ExceptionInfo (project [7] values #{:order/tag})))
+    (is (thrown? clojure.lang.ExceptionInfo (project [7] {} #{:unknown/attribute})))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (mapping/fact-projector (assoc compiled :definition-fingerprint "stale"))))))
+
 (deftest complete-logical-schema-without-provider-execution
   (let [compiled (mapping/compile-logical-mapping accepted)
         schema (:logical-schema compiled)]

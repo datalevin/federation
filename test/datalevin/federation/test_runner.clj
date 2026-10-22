@@ -10,6 +10,8 @@
                        datalevin.federation.mapping-v2-test
                        datalevin.federation.install-test
                        datalevin.federation.persistence-integration-test
+                       datalevin.federation.file-test
+                       datalevin.federation.github-test
                        datalevin.federation.local-test
                        datalevin.federation.local-batch-test
                        datalevin.federation.local-conformance-test

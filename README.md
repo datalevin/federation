@@ -79,6 +79,8 @@ compatibility mode exists.
 | --- | --- | --- |
 | [`core`](core/project.clj) | `org.clojars.huahaiy/datalevin-federation-core` | Mapping compiler, canonical fingerprints, and persisted definition installer. |
 | [`local`](local/project.clj) | `org.clojars.huahaiy/datalevin-federation-local` | Declared-schema local relation adapter. |
+| [`github`](github/project.clj) | `org.clojars.huahaiy/datalevin-federation-github` | Bounded live GitHub work-item key lookups and native triage joins. |
+| [`file`](file/project.clj) | `org.clojars.huahaiy/datalevin-federation-file` | Verified, bounded EDN Lines exports with snapshot-scoped identities. |
 
 Each subproject owns its version, dependencies, source, tests, and Leiningen
 release configuration. The initial development version is `0.1.0-SNAPSHOT`.
@@ -95,7 +97,7 @@ Datalevin has Maven `provided` scope: the application explicitly supplies a
 compatible Datalevin runtime rather than receiving one transitively from each
 adapter.
 
-Future API, file/export, `postgres`, `dataset`, `parquet`, and `datafusion`
+Future API integrations, `postgres`, `dataset`, `parquet`, and `datafusion`
 adapters follow the same layout, with artifacts named
 `org.clojars.huahaiy/datalevin-federation-<adapter>`.
 These subprojects are planned. Provider drivers and engine dependencies belong
@@ -120,6 +122,7 @@ loopback HTTP port; it uses no external service or persistent database:
 clojure -M:test
 clojure -M:test:core
 clojure -M:test:local
+clojure -M:test:file
 ```
 
 The `:core` suite runs the pure mapping/identity gate without provider execution.
@@ -244,11 +247,14 @@ normalizers must keep credentials out of accepted mapping metadata as well.
 memberships without discovery or new identities. Corrupt or unsupported metadata
 requires explicit replacement/revalidation. The integration tests cover reopen,
 text/binary dump restore, embedded native joins, and remote metadata refresh.
-Production API and file/export adapters remain F2 work.
+The [file/export adapter](file/README.md) now reads pinned EDN Lines exports
+through these saved mappings. The [GitHub adapter](github/README.md) also reopens
+saved API definitions for live work-item lookups.
 
-Validation (2026-10-21): the full companion suite passes **88 tests / 22,960
-assertions**, including **17 / 142** persistence checks. Companion lint reports
-zero errors and warnings.
+Validation (2026-10-21): the full companion suite passes **105 tests / 23,120
+assertions**, including **17 / 142** persistence checks and **16 / 154** file
+adapter checks. The standalone file artifact passes the same tests with
+Leiningen and builds its JAR. Companion lint reports zero errors and warnings.
 
 ## Local adapter
 
@@ -325,3 +331,21 @@ encoded children; maps concatenate key/value pairs sorted by unsigned encoded ke
 and sets sort unsigned encoded values. Scalar distinctions and sequence order
 are retained. The byte/digest fixtures were independently checked with Python's
 standard SHA-256 implementation.
+
+## GitHub work-item API
+
+The optional [GitHub adapter](github/README.md) implements the first production
+API lookup slice (2026-10-22). Explicit repository/deployment identities and
+persisted mappings reopen without discovery; repository acquisition verifies the
+numeric ID. Entity/key/number accesses use bounded per-key GETs with best-effort
+consistency. Scalar/reference many fields join native triage records and pass
+shared lookup conformance. HTTP/body timeouts, cancellation, rate/auth errors,
+response/parser quotas and cleanup are exercised with real loopback HTTP.
+`clojure -M:github-live` checks a native join against public GitHub data; it is
+separate from deterministic tests. Scans, pagination and automatic retries are
+not advertised. The integrated F3 workflow/measurement gate remains open.
+
+Validation (2026-10-22): the complete companion suite passes **116 tests /
+23,271 assertions**, including **11 / 151** GitHub checks. Standalone GitHub
+`lein test`, `lein jar`, companion lint, and shared-helper lint pass. The
+read-only public GitHub/native check passed separately.

@@ -295,14 +295,7 @@
      :definition-fingerprint (fp/accepted-fingerprint :definition payload)
      :fingerprint-scheme :federation/v2}))
 
-(defn project-facts
-  "Project one provider-normalized record to distinct, non-null EAV facts.
-  extracted maps logical attribute names to their explicitly extracted values.
-  Conversions precede this boundary and must already be exact. A composite
-  reference is one key tuple; :elements supplies a collection of such keys.
-  This pure helper does no provider I/O or implicit collection flattening."
-  [{:keys [accepted] :as compiled} entity-key extracted]
-  (require! (= compiled (compile-logical-mapping accepted)))
+(defn- project-record [accepted entity-key extracted]
   (require! (value/plain-map? extracted))
   (require! (every? #(contains? (:attributes accepted) %) (keys extracted)))
   (let [entity-type (get-in accepted [:identity :type])
@@ -326,6 +319,29 @@
                     (do (require! (value/matches-type? (:type body) x)) (value/owned-copy x)))]
             (.add facts [entity a x])))))
     (vec facts)))
+
+(defn fact-projector
+  "Validate immutable compiled metadata once and return a record projector.
+  Calls take [entity-key extracted] or [entity-key extracted attributes]. The
+  latter projects only the selected declared attributes, plus identity, allowing
+  streaming adapters to bound workspace to one attribute of one record.
+  Extracted values must already have exact accepted types; no I/O occurs."
+  [{:keys [accepted] :as compiled}]
+  (require! (= compiled (compile-logical-mapping accepted)))
+  (fn
+    ([entity-key extracted] (project-record accepted entity-key extracted))
+    ([entity-key extracted attributes]
+     (require! (and (set? attributes) (every? #(contains? (:attributes accepted) %) attributes)))
+     (project-record (update accepted :attributes select-keys attributes) entity-key extracted))))
+
+(defn project-facts
+  "Project one provider-normalized record to distinct, non-null EAV facts.
+  extracted maps logical attribute names to their explicitly extracted values.
+  Conversions precede this boundary and must already be exact. A composite
+  reference is one key tuple; :elements supplies a collection of such keys.
+  Repeated production reads should prepare fact-projector once."
+  [compiled entity-key extracted]
+  ((fact-projector compiled) entity-key extracted))
 
 (defn- compiled-source-info [compiled compute-context-id]
   (require! (some? compute-context-id))
