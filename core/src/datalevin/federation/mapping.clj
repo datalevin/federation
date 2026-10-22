@@ -327,22 +327,35 @@
             (.add facts [entity a x])))))
     (vec facts)))
 
+(defn- compiled-source-info [compiled compute-context-id]
+  (require! (some? compute-context-id))
+  (let [accepted (:accepted compiled)
+        descriptor (merge (select-keys compiled [:pattern-contract :logical-schema :definition-fingerprint])
+                          (select-keys accepted [:source-instance-id :scope :completion])
+                          {:spi-versions #{2} :features #{} :required-features #{}
+                           :compute-context-id compute-context-id :definition-id (:relation-id accepted)
+                           :read-capabilities #{:snapshot :statement :best-effort}})]
+    (source/validate-source-info! descriptor)
+    descriptor))
+
+(defn source-info
+  "Compile accepted representation 2 into the common v2 EAV descriptor. Use
+  persisted :accepted metadata after load-definitions, supplying a runtime
+  compute-context ID. Adapters narrow advertised read capabilities to their
+  actual guarantees. This function performs no discovery or provider I/O."
+  [accepted compute-context-id]
+  (compiled-source-info (compile-logical-mapping accepted) compute-context-id))
+
 (defn compile-relation
   "Compile accepted provider metadata and emit a complete v2 EAV descriptor.
   No discovery, installation or provider execution occurs."
   [schema relation-id {:keys [compute-context-id] :as context}]
-  (require! (some? compute-context-id))
   (let [mapping (definition schema relation-id :relation)
         compiled (normalize-provider-mapping
                    (fn [declared captured]
                      (normalize-column-mapping declared relation-id captured)) schema context)
         accepted (:accepted compiled)
-        descriptor (merge (select-keys compiled [:pattern-contract :logical-schema :definition-fingerprint])
-                          (select-keys accepted [:source-instance-id :scope :completion])
-                          {:spi-versions #{2} :features #{} :required-features #{}
-                           :compute-context-id compute-context-id :definition-id relation-id
-                           :read-capabilities #{:snapshot :statement :best-effort}})]
-    (source/validate-source-info! descriptor)
+        descriptor (compiled-source-info compiled compute-context-id)]
     {:definition (merge mapping (select-keys compiled [:schema-fingerprint :definition-fingerprint :fingerprint-scheme])
                         {:dependencies (:dependencies accepted)})
      :source-info descriptor}))

@@ -77,7 +77,7 @@ compatibility mode exists.
 
 | Directory | Artifact | Contents |
 | --- | --- | --- |
-| [`core`](core/project.clj) | `org.clojars.huahaiy/datalevin-federation-core` | Mapping compiler and canonical fingerprints. |
+| [`core`](core/project.clj) | `org.clojars.huahaiy/datalevin-federation-core` | Mapping compiler, canonical fingerprints, and persisted definition installer. |
 | [`local`](local/project.clj) | `org.clojars.huahaiy/datalevin-federation-local` | Declared-schema local relation adapter. |
 
 Each subproject owns its version, dependencies, source, tests, and Leiningen
@@ -103,8 +103,8 @@ only in the subproject that uses them. Adapters depend on an explicit compatible
 version of `core` when they use its mapping APIs; `core` never depends on adapters.
 
 
-Final v2 cleanup validation: **71 tests / 22,818 assertions** pass in this
-repository; the local alias passes **41 / 18,231**, including the transport
+The v2 cleanup baseline passed **71 tests / 22,818 assertions** in this
+repository; the local alias passed **41 / 18,231**, including the transport
 matrix. Core/sibling regression results and the completed native routing gate
 are recorded in the [validation report](../datalevin/doc/measurements/query-source-native-2026-10-19.md).
 
@@ -124,6 +124,13 @@ clojure -M:test:local
 
 The `:core` suite runs the pure mapping/identity gate without provider execution.
 The complete suite also verifies native custom-type storage and reconnects.
+It includes definition installation, concurrent refresh, dependency invalidation,
+native schema edits, remote metadata access, and text/binary dump round trips.
+Run the persistence checks alone with:
+
+```sh
+clojure -M:test datalevin.federation.install-test datalevin.federation.persistence-integration-test
+```
 To independently verify the experimental identity fixtures with Rust:
 
 ```sh
@@ -151,6 +158,97 @@ or `lein javac` inside `../datalevin`) so its Java classes exist under
 `target/classes`; the checkout exposes `src`, `test-src`, resources, and those
 compiled classes. Remove the link to fall back to the declared Maven dependency,
 which requires a released version with the SPI.
+
+## Persisted definitions
+
+F2's [installer](core/src/datalevin/federation/install.clj) uses Datalevin's
+schema snapshot and conditional-update APIs. It stores format **1** owner
+envelopes containing accepted mapping representation **2**. These are separate
+from each definition's increasing `:version` and its semantic fingerprint.
+Provider normalizers produce accepted mappings before installation; column
+declarations can use `mapping/normalize-column-mapping`.
+
+```clojure
+(require '[datalevin.federation.install :as install]
+         '[datalevin.federation.mapping :as mapping])
+
+;; conn is a Datalog connection; accepted is provider-normalized representation 2.
+(def saved
+  (install/install!
+    conn
+    {:sales
+     {:datalevin/definition-kind :source
+      :datalevin.federation/definition
+      {:format-version 1
+       :source-instance-id (:source-instance-id accepted)
+       :provider (get-in accepted [:dependencies :provider :name])
+       :profile :profiles/sales-readonly}}
+     :sales/orders
+     {:datalevin/definition-kind :relation
+      :datalevin.federation/definition
+      {:format-version 1 :source :sales :accepted accepted :depends-on #{}}}}
+    {:expected-versions {:sales nil :sales/orders nil}}))
+
+(def loaded (install/load-definitions conn))
+(def descriptor
+  (mapping/source-info (get-in loaded [:compiled :sales/orders :accepted])
+                       :my-app/sales-runtime))
+
+;; Remove both definitions together; native attributes and their data remain.
+(install/remove! conn {:sales 1 :sales/orders 1})
+```
+
+Every submitted or removed ID needs an expected version: `nil` asserts absence,
+and a positive integer asserts the current version. Stale definition versions
+reject without overwriting a newer definition. Unrelated database revision
+conflicts retry from a fresh snapshot, with bounded attempts and a deadline.
+The returned `:schema`, `:revision`, and `:compiled` describe the committed
+candidate. Source artifacts hold a fingerprint; relation artifacts also contain
+accepted metadata, logical schema, pattern contract, and physical-schema digest.
+Adapters supply runtime handles and their actual read capabilities separately.
+
+The installer computes counters, dependency manifests, and fingerprints rather
+than trusting submitted values. A replacement advances its definition version;
+`:documentation` edits leave its semantic fingerprint unchanged. Semantic
+source/relation changes recompile transitive dependents and advance their
+versions when their fingerprints change. Relations record dependency IDs and
+digests under `:accepted :dependencies :definition-contracts`; `:depends-on`
+adds dependencies beyond the required source. Missing dependencies, cycles,
+source identity mismatches, and incompatible domain/attribute contracts reject
+the whole candidate. Source UUIDs are explicit, and changing identity requires
+explicit compatible mapping updates.
+
+Attribute memberships are derived and committed with definitions. New scalar
+attributes receive compatible native types/cardinality; nominal/custom values
+use opaque native backing, preserving the complete logical type in the accepted
+mapping. Existing native types and cardinalities must agree. Include ordinary
+property patches in `:schema-update` for a coordinated native schema change;
+the installer does not silently overwrite them. Removing the final membership
+retains the native attribute and data. Foreign owner metadata is preserved.
+
+For discovery or refresh, optional `:prepare` takes
+`{:schema schema :revision revision :definitions submitted}` and
+`{:check-active! check-fn :remaining-ms remaining-fn}`, returning replacements
+for exactly the submitted IDs. It runs outside the writer and runs again after
+a revision conflict; it must tolerate repeated calls and bound its I/O using
+the supplied control. Options `:max-attempts` (default 8), `:timeout-ms`
+(default 5000, at most one day), and `:cancelled?` bound cooperative preparation
+and retries. Remote calls share that deadline with the caller's request budget.
+Installation inside an explicit write transaction rejects before preparation.
+
+Persist only portable accepted metadata and qualified keyword profile
+references. Source bodies reject inline credentials or runtime handles; profile
+resolution and credential storage belong to the application/provider. Provider
+normalizers must keep credentials out of accepted mapping metadata as well.
+`load-definitions` verifies recorded formats, schemes, digests, dependencies, and
+memberships without discovery or new identities. Corrupt or unsupported metadata
+requires explicit replacement/revalidation. The integration tests cover reopen,
+text/binary dump restore, embedded native joins, and remote metadata refresh.
+Production API and file/export adapters remain F2 work.
+
+Validation (2026-10-21): the full companion suite passes **88 tests / 22,960
+assertions**, including **17 / 142** persistence checks. Companion lint reports
+zero errors and warnings.
 
 ## Local adapter
 
