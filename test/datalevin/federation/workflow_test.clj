@@ -19,15 +19,6 @@
 (defn- execute [q fixture sources windows & [rules]]
   (apply d/q q @(:conn fixture) (:github sources) (:release sources)
          (concat (when rules [rules]) [42 9 windows])))
-(defn- logical-rules [rules]
-  ;; Required heads constrain execution, not logical answers for already bound
-  ;; calls. The ordinary eager path currently mishandles those annotations;
-  ;; retain exactly the same bodies/argument order without the binding hints.
-  (mapv (fn [branch]
-          (let [[rule-name required & free] (first branch)]
-            (if (vector? required)
-              (assoc branch 0 (apply list rule-name (concat required free))) branch))) rules))
-
 (defn- verify-clean [fixture observed]
   (is (fixture/clean? fixture))
   (is (zero? (:live-sessions (github/statistics (get-in fixture [:sources :github])))))
@@ -79,7 +70,7 @@
       (let [windows [["now" :a] ["now" :b]] eager (fixture/eager fixture)
             observed (observer/recorder) sources (observer/sources (:sources fixture) observed)]
         (is (= (execute triage/query fixture eager windows)
-               (execute (dissoc triage/rule-query :query-source) fixture eager windows (logical-rules triage/rules))
+               (execute (dissoc triage/rule-query :query-source) fixture eager windows triage/rules)
                (execute triage/rule-query fixture sources windows triage/rules)))
         (verify-clean fixture observed)))))
 
@@ -133,9 +124,9 @@
         (is (nil? (versions '$github)))
         (is (= (export/export-token (get-in fixture [:accepted :release :dependencies :export])) (versions '$release)))
         (is (= 1 (:result-rows explanation)))
-        ;; Structural selection can use export entity seeds ahead of the native
-        ;; scalar value lookup. Keep the observed over-read visible in this gate.
-        (is (= (set (range 1 9)) (:numbers @(:requests (:api fixture)))))
+        ;; Captured native thresholds narrow the keys before API lookups.
+        (is (= #{1} (:numbers @(:requests (:api fixture)))))
+        (is (= 2 (:issues @(:requests (:api fixture)))))
         (is (= 1 (get-in @(:requests (:api fixture)) [:repository])))
         (is (= (get @(:requests (:api fixture)) :issues)
                (reduce + (map #(get-in % [:metrics :external-requests]) (metrics '$github)))))
@@ -218,10 +209,10 @@
             windows [["now" :a] ["now" :b]]]
         ;; The release-owner rule projects away export-row identity before
         ;; counting, so its duplicate owner-7 witness contributes one head.
-        (is (= 8 (execute (dissoc q :query-source) fixture (fixture/eager fixture) windows (logical-rules rules))
+        (is (= 8 (execute (dissoc q :query-source) fixture (fixture/eager fixture) windows rules)
                (execute q fixture sources windows rules)))
         (let [relation-query (-> q (assoc :find (:find triage/query)) (dissoc :with))]
-          (is (= (execute (dissoc relation-query :query-source) fixture (fixture/eager fixture) windows (logical-rules rules))
+          (is (= (execute (dissoc relation-query :query-source) fixture (fixture/eager fixture) windows rules)
                  (execute relation-query fixture sources windows rules))))
         (is (= 12 (execute triage/summary-query fixture (:sources fixture) windows)))
         (verify-clean fixture observed)))))
