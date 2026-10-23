@@ -2,7 +2,7 @@
 {:paths ["core/src" "local/src" "file/src" "github/src"]
  :deps {org.clojure/clojure {:mvn/version "1.12.6"}
         datalevin/datalevin {:local/root "../datalevin"}}
- :aliases {:test {:extra-paths ["test" "core/test" "local/test" "file/test" "github/test" "../datalevin/test-src"]
+ :aliases {:test {:extra-paths ["examples/src" "dev/src" "test" "core/test" "local/test" "file/test" "github/test" "../datalevin/test-src"]
                   :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
                              "--add-opens=java.base/java.nio=ALL-UNNAMED"
                              "--add-opens=java.base/java.util=ALL-UNNAMED"
@@ -23,6 +23,26 @@
                                "datalevin.federation.local-batch-test"
                                "datalevin.federation.local-conformance-test"
                                "datalevin.federation.local-transport-test"]}
+           :workflow {:replace-paths ["core/src" "file/src" "github/src" "examples/src" "dev/src"]
+                      :extra-paths ["test"]
+                      :main-opts ["-m" "datalevin.federation.test-runner"
+                                  "datalevin.federation.workflow-test"]}
+           :workflow-live {:replace-paths ["core/src" "file/src" "github/src" "examples/src"]
+                           :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
+                             "--add-opens=java.base/java.nio=ALL-UNNAMED"
+                             "--add-opens=java.base/java.util=ALL-UNNAMED"
+                             "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+                             "--enable-native-access=ALL-UNNAMED"
+                             "-Dclojure.compiler.direct-linking=true"]
+                           :main-opts ["-m" "datalevin.federation.release-triage-live"]}
+           :workflow-measure {:replace-paths ["core/src" "file/src" "github/src" "examples/src" "dev/src"]
+                              :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
+                             "--add-opens=java.base/java.nio=ALL-UNNAMED"
+                             "--add-opens=java.base/java.util=ALL-UNNAMED"
+                             "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+                             "--enable-native-access=ALL-UNNAMED"
+                             "-Dclojure.compiler.direct-linking=true" "-Xms512m" "-Xmx512m"]
+                              :main-opts ["-m" "datalevin.federation.workflow-measure"]}
            :github-live {:replace-paths ["core/src" "github/src"]
                          :extra-paths ["github/test"]
                          :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"

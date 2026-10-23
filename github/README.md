@@ -180,8 +180,9 @@ facts and the shared `mapped-lookup-semantics!` gate. It checks scalar/reference
 many fields, native selection, persisted identity/reopen, separate repositories,
 repeated witnesses, binding IDs, exact narrow/wide batches, changing live replay,
 quotas, rate/authentication errors, redirects, malformed bodies, partial setup,
-blocked-body timeouts, cancellation and cleanup. The integrated F3 API/export/
-native workflow and comparative measurements remain open. Scoped listing and
+blocked-body timeouts, cancellation and cleanup. The initial F3 API/export/
+native workflow and bounded baseline are implemented; same-syntax required-head
+parity remains open. See the [workflow](../examples/README.md). Scoped listing and
 pagination require a separate advertised-path gate if added later.
 
 Validation (2026-10-22): the complete companion suite passes **116 tests /
