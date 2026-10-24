@@ -81,11 +81,10 @@ The integration gate also uses a native required-argument rule alongside both
 mapped rules. Rule heads deduplicate complete head tuples before the caller's
 aggregate: duplicate assignment rows supporting the same owner do not create
 extra rule answers. These are ordinary queries through the existing compiler,
-planner and rule engine. The ordinary eager rule path currently mishandles
-required-head annotations; the oracle erases only those execution hints while
-preserving bodies and argument order, and compares full rows as well as counts.
-The [same-syntax parity gap](../doc/measurements/release-triage-required-heads-2026-10-22.md)
-remains open; this slice does not claim the complete F3 parity gate passed.
+planner and rule engine. The ordinary eager and composed paths use identical
+required-head rules and compare full rows as well as counts. The
+[required-head defect](../doc/measurements/release-triage-required-heads-2026-10-22.md)
+is fixed; missing inputs are still rejected, including nested and recursive calls.
 
 The invocation permits best-effort API reads and observes a pinned file snapshot.
 Per-source overrides can require snapshot consistency for file aliases while
@@ -95,11 +94,11 @@ cross-source atomic snapshot or API snapshot token. Controlled fixture
 observations stay fixed during oracle comparisons; the public GitHub check
 makes no equality claim across separate mutable API reads.
 
-The current structural planner can request more API keys than the final result
-contains. The baseline isolates the runtime-threshold predicate from literal
-threshold controls. Request counts, file scans and input batch boundaries remain
-visible in raw measurements. There are no fused accesses or calibrated costs;
-known quota exhaustion and incomplete reads fail the complete query.
+Captured scalar native thresholds now narrow API keys before lookups. The
+[follow-up](../doc/measurements/release-triage-2026-10-22-followup.md) reruns the
+baseline's runtime/literal controls: they request the same selected keys. File
+scans and input batch boundaries remain visible in raw measurements. There are
+no fused accesses or calibrated costs; known quota exhaustion and incomplete reads fail the complete query.
 
 ## Validation and measurements
 
@@ -132,8 +131,16 @@ query work; eager capture/materialization and plan-only acquisition costs are
 explicit. Existing native entrypoint parity evidence remains in the main
 [2026-10-19 report](../../datalevin/doc/measurements/query-source-native-2026-10-19.md).
 
-Validation (2026-10-22): the full companion suite passes **126 tests / 23,379
-assertions**, including **10 / 108** integrated workflow checks. Companion,
-example and tooling lint reports zero errors/warnings. The public three-source
-workflow and 14-JVM bounded baseline passed; 378 source files match the current
-checkout and archived hashes. Same-syntax required-head parity remains open.
+Validation (2026-10-22): the full companion suite passes **126 tests / 23,380
+assertions**, including **10 / 109** integrated workflow checks. The public
+three-source workflow passed previously. The historical 14-JVM baseline and its
+378-file snapshot remain unchanged; the follow-up retains fresh source hashes,
+request counts, complete result digests and native performance checks.
+
+The initial F0–F3 workflow is signed off (2026-10-24) for the advertised
+GitHub keyed lookup and EDN Lines scan contracts. The
+[final report](../../datalevin/doc/measurements/federation-signoff-2026-10-24.md)
+records the completed native-performance follow-ups, full source regressions, packaging checks and scope limits. The
+[earlier follow-up](../doc/measurements/release-triage-2026-10-22-followup.md)
+remains historical evidence; its timing concerns are reconciled by that final
+report. Development snapshots still require the matching Datalevin checkout.

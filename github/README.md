@@ -181,9 +181,10 @@ many fields, native selection, persisted identity/reopen, separate repositories,
 repeated witnesses, binding IDs, exact narrow/wide batches, changing live replay,
 quotas, rate/authentication errors, redirects, malformed bodies, partial setup,
 blocked-body timeouts, cancellation and cleanup. The initial F3 API/export/
-native workflow and bounded baseline are implemented; same-syntax required-head
-parity remains open. See the [workflow](../examples/README.md). Scoped listing and
-pagination require a separate advertised-path gate if added later.
+native workflow, same-syntax required-head parity and native performance gates
+are signed off (2026-10-24). See the [workflow](../examples/README.md) and
+[final report](../../datalevin/doc/measurements/federation-signoff-2026-10-24.md).
+Scoped listing and pagination require a separate advertised-path gate if added later.
 
 Validation (2026-10-22): the complete companion suite passes **116 tests /
 23,271 assertions**, including **11 / 151** GitHub checks. Standalone GitHub

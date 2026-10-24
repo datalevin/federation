@@ -343,7 +343,9 @@ shared lookup conformance. HTTP/body timeouts, cancellation, rate/auth errors,
 response/parser quotas and cleanup are exercised with real loopback HTTP.
 `clojure -M:github-live` checks a native join against public GitHub data; it is
 separate from deterministic tests. Scans, pagination and automatic retries are
-not advertised. The initial F3 workflow/baseline is implemented; same-syntax required-head parity remains open.
+not advertised. The initial F0–F3 workflow, same-syntax rule parity and native
+performance gates are signed off for the advertised lookup/export contracts
+(2026-10-24); see the [signoff report](../datalevin/doc/measurements/federation-signoff-2026-10-24.md).
 
 Validation (2026-10-22): the complete companion suite passes **116 tests /
 23,271 assertions**, including **11 / 151** GitHub checks. Standalone GitHub
@@ -364,13 +366,23 @@ fresh JVMs, seven scenarios, exact query/input contracts, source snapshots,
 complete result digests and actual request/byte/memory observations. It separates
 literal/runtime priority thresholds, file scans, eager-local and native controls.
 The unqualified large-input quota failure is retained separately from the accepted
-explicit-window baseline. An existing ordinary eager rule required-head parity
-gap remains open; logical oracle heads erase execution hints only. The complete
-F3 parity gate is not yet signed off. No core production query/storage code
-changed in this slice.
+explicit-window baseline. The
+[follow-up](doc/measurements/release-triage-2026-10-22-followup.md) fixes ordinary
+required-head rules and uses captured scalar thresholds before native scans feed
+API accesses. Eager and composed queries now use identical rule syntax, comparing
+full rows and witness-sensitive counts. The fresh workflow runs retain the same
+complete answers with fewer API requests.
 
-Validation (2026-10-22): the full companion suite passes **126 tests / 23,379
-assertions**, including **10 / 108** integrated workflow checks. Companion,
-example and tooling lint reports zero errors/warnings. The public three-source
-workflow and 14-JVM bounded baseline passed; 378 source files match the current
-checkout and archived hashes. Same-syntax required-head parity remains open.
+Validation (2026-10-22): the full companion suite passes **126 tests / 23,380
+assertions**, including **10 / 109** integrated workflow checks. The public
+three-source workflow passed previously. The historical 14-JVM baseline and its
+378-file snapshot remain unchanged; the follow-up retains fresh source hashes,
+request counts, complete result digests and native performance checks.
+
+F0–F3 implementation signoff is complete (2026-10-24) for GitHub keyed lookups,
+EDN Lines export scans, persisted mappings and native/ordinary-input joins.
+The [final report](../datalevin/doc/measurements/federation-signoff-2026-10-24.md)
+reconciles the functional, resource, packaging and native-performance evidence, including the later cache-binding
+and rule-allocation fixes. Artifacts remain development snapshots requiring a
+matching Datalevin build. Fusion, cost ranking, additional providers and views
+retain their separate roadmap gates.
