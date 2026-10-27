@@ -1,35 +1,50 @@
 # datalevin-federation
 
-Query external data alongside your Datalevin database with ordinary Datalog.
+Datalevin's entity–attribute–value triple data model is a natural fit for data
+federation: it gives data from different systems a common shape that can be
+queried and joined with Datalog. Its sophisticated query optimizer handles
+complex analytical queries with ease. This project brings those capabilities
+to the wider world of data.
+
+The vision is to query across four types of data sources—other databases
+through SQL, files, APIs, and Datalevin databases—using ordinary Datalog.
 Federation adapters expose external records as entities and attributes, so you
-can join GitHub issues, file exports, and application-owned data with native
-Datalevin facts using `d/q`.
+can join them with native Datalevin facts using `d/q` without first importing
+all the data.
 
-For example, a release-triage query can combine priorities stored in Datalevin,
-release assignments from an export, and live issue titles from GitHub.
+**Status:** federation adapters are development snapshots (`0.1.0-SNAPSHOT`).
+Datalevin **1.2.8 is released** and includes the query-source SPI used by this
+project.
 
-**Status:** development snapshots (`0.1.0-SNAPSHOT`). The adapters currently
-require a matching Datalevin checkout with the v2 query-source SPI. The
-Datalevin `1.2.5` dependency declared in the subprojects does not include that
-SPI and cannot run these adapters on its own.
+## Data sources
 
-## Supported sources
-
-| Source | What you can query | Read behavior |
+| Source type | Role | Current support |
 | --- | --- | --- |
-| [GitHub](github/README.md) | Issues and pull requests by entity, repository/issue key, or issue number; titles, labels, assignees, and other fields. | Live, best-effort lookups. No listings, search, or pagination. |
-| [EDN Lines files](file/README.md) | UTF-8 exports containing one EDN map per line, with scalar and collection attributes. | Verified snapshot scans. File contents must match the accepted export. |
-| [Local relations](local/src/datalevin/federation/local.clj) | Application-owned `[entity attribute value]` facts with a declared schema. | Snapshot scans and entity/value lookups. |
-| Native Datalevin | Your existing database. | Supplied directly to `d/q`; no adapter needed. |
+| Other databases (SQL) | Query relational tables alongside other sources. | Planned, starting with PostgreSQL. |
+| Files | Query exports and file-based datasets. | [EDN Lines](file/README.md) exports with scalar and collection attributes; verified snapshot scans. |
+| APIs | Query data exposed by external services. | [GitHub](github/README.md) issue and pull-request lookups by entity, repository/issue key, or issue number; live, best-effort reads. |
+| Datalevin databases | Query native entities and attributes alongside external data. | Supplied directly to `d/q`; no adapter needed. |
+
+GitHub is one example of an API source. Its current adapter supports fields
+such as titles, labels, and assignees, but not listings, search, or pagination.
+The repository also includes a [local relation adapter](local/src/datalevin/federation/local.clj)
+for application-owned `[entity attribute value]` facts with a declared schema,
+supporting snapshot scans and entity/value lookups.
 
 PostgreSQL, Parquet, dataset, and DataFusion adapters are planned and are not
-available in this repository.
+yet available in this repository. Contribution is welcome.
+
+For a working example, a release-triage query combines priorities stored in
+Datalevin, release assignments from a file export, and live issue titles from
+GitHub.
 
 ## Getting started
 
-Use the Clojure CLI and matching checkouts of this repository and Datalevin,
-with Datalevin at `../datalevin`. The root `deps.edn` loads that checkout and
-all adapter sources.
+Use Datalevin **1.2.8** as your application's runtime; the query-source SPI is
+included in that release. This repository's development workspace uses the
+Clojure CLI and a sibling Datalevin checkout at `../datalevin`. The commands
+below use that layout: the root `deps.edn` loads the checkout and all adapter
+sources.
 
 From this repository's root, compile Datalevin's Java classes:
 
@@ -202,8 +217,10 @@ Each module has its own artifact at version `0.1.0-SNAPSHOT`:
 
 Use the modules your application needs. The local adapter takes a complete
 source descriptor and mapped facts; add core if you also need mapping APIs.
-Datalevin has Maven `provided` scope, so your application must supply a
-compatible runtime. For now, use the matching checkouts described above.
+Datalevin has Maven `provided` scope, so your application must supply the
+runtime. Explicitly depend on Datalevin **1.2.8**, which includes the query-source
+SPI. The subproject manifests still declare `1.2.5` as a provided dependency;
+that older release does not include the SPI.
 
 ## Development and further reading
 
