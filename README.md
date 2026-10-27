@@ -240,10 +240,10 @@ loopback port.
 
 - [Release-triage example](examples/README.md): combine native data, an export,
   and GitHub.
-- [Adapter development guide](doc/adapter-development.md): build a new source
-  adapter, including mapping, execution, and packaging.
-- [Design and roadmap](federation.md): architecture and planned capabilities.
-- [Datalevin query-source SPI](../datalevin/doc/query-source-spi.md): detailed
-  query-source contracts; this link assumes the sibling checkout.
+- [GitHub adapter guide](github/README.md): mapping, supported attributes, and
+  API read limits.
+- [File adapter guide](file/README.md): accepting and querying EDN Lines exports.
+- [Datalevin query-source SPI](https://github.com/datalevin/datalevin/blob/master/doc/query-source-spi.md):
+  detailed query-source contracts and adapter requirements.
 
 Licensed under [EPL-2.0](LICENSE).

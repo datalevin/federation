@@ -183,7 +183,7 @@ quotas, rate/authentication errors, redirects, malformed bodies, partial setup,
 blocked-body timeouts, cancellation and cleanup. The initial F3 API/export/
 native workflow, same-syntax required-head parity and native performance gates
 are signed off (2026-10-24). See the [workflow](../examples/README.md) and
-[final report](../../datalevin/doc/measurements/federation-signoff-2026-10-24.md).
+[read guarantees and limits](../README.md#read-guarantees-and-limits).
 Scoped listing and pagination require a separate advertised-path gate if added later.
 
 Validation (2026-10-22): the complete companion suite passes **116 tests /

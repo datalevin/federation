@@ -82,9 +82,8 @@ mapped rules. Rule heads deduplicate complete head tuples before the caller's
 aggregate: duplicate assignment rows supporting the same owner do not create
 extra rule answers. These are ordinary queries through the existing compiler,
 planner and rule engine. The ordinary eager and composed paths use identical
-required-head rules and compare full rows as well as counts. The
-[required-head defect](../doc/measurements/release-triage-required-heads-2026-10-22.md)
-is fixed; missing inputs are still rejected, including nested and recursive calls.
+required-head rules and compare full rows as well as counts. Missing inputs are
+rejected, including nested and recursive calls.
 
 The invocation permits best-effort API reads and observes a pinned file snapshot.
 Per-source overrides can require snapshot consistency for file aliases while
@@ -94,53 +93,36 @@ cross-source atomic snapshot or API snapshot token. Controlled fixture
 observations stay fixed during oracle comparisons; the public GitHub check
 makes no equality claim across separate mutable API reads.
 
-Captured scalar native thresholds now narrow API keys before lookups. The
-[follow-up](../doc/measurements/release-triage-2026-10-22-followup.md) reruns the
-baseline's runtime/literal controls: they request the same selected keys. File
-scans and input batch boundaries remain visible in raw measurements. There are
-no fused accesses or calibrated costs; known quota exhaustion and incomplete reads fail the complete query.
+Captured scalar native thresholds narrow API keys before lookups, as checked
+by the [workflow tests](../test/datalevin/federation/workflow_test.clj). There
+are no fused accesses or calibrated costs; known quota exhaustion and incomplete
+reads fail the complete query.
 
 ## Validation and measurements
 
-The integration gate compares direct conjunctions, aggregates and rules against
+The [integration gate](../test/datalevin/federation/workflow_test.clj)
+compares direct conjunctions, aggregates and rules against
 complete eager EAV observations using the same accepted nominal identities.
 It exercises one-row and larger batches, repeated input witnesses, missing and
 many-valued attributes, repository separation, saved catalog reopen/refresh,
 shared aliases, source-specific guarantees, request quotas, malformed HTTP,
 export drift, blocked-body deadlines and release of every view/reservation.
 
-The [baseline report](../doc/measurements/release-triage-2026-10-22.md) records
-sequential fresh-JVM measurements and links raw samples and source snapshots.
-To create a new archive without overwriting an existing one:
+Run the integration gate from the repository root:
 
 ```sh
-python3 dev/measure_workflow.py /tmp/release-triage-repeat \
-  --forks 2 --samples 3 --warmups 1
+clojure -M:test:workflow
 ```
 
-The harness fails on wrong/incomplete results, leaked views, mismatched request
-accounting, source changes during the run, crashed JVMs or timeout. It includes
-small/large native sides, small/large exports, one/many keys, split bindings,
-controlled request latency and a large ordinary input relation with one result.
-The accepted measurement query explicitly requests window `now`. An initial
-unqualified 1,024-row input case exceeded the retained-state quota; its failure
-and original snapshot remain archived separately. The scoped 1,024-row case
-returns one complete result, and the regression also passes under a 64 MiB cap.
-Native-only and eager-local controls are recorded separately from composed
-query work; eager capture/materialization and plan-only acquisition costs are
-explicit. Existing native entrypoint parity evidence remains in the main
-[2026-10-19 report](../../datalevin/doc/measurements/query-source-native-2026-10-19.md).
+The suite also checks a 1,024-row ordinary input relation with an explicit
+window predicate, which returns one complete result under a 64 MiB cap.
 
 Validation (2026-10-22): the full companion suite passes **126 tests / 23,380
 assertions**, including **10 / 109** integrated workflow checks. The public
-three-source workflow passed previously. The historical 14-JVM baseline and its
-378-file snapshot remain unchanged; the follow-up retains fresh source hashes,
-request counts, complete result digests and native performance checks.
+three-source workflow passed previously.
 
 The initial F0–F3 workflow is signed off (2026-10-24) for the advertised
-GitHub keyed lookup and EDN Lines scan contracts. The
-[final report](../../datalevin/doc/measurements/federation-signoff-2026-10-24.md)
-records the completed native-performance follow-ups, full source regressions, packaging checks and scope limits. The
-[earlier follow-up](../doc/measurements/release-triage-2026-10-22-followup.md)
-remains historical evidence; its timing concerns are reconciled by that final
-report. Development snapshots still require the matching Datalevin checkout.
+GitHub keyed lookup and EDN Lines scan contracts. See the
+[read guarantees and limits](../README.md#read-guarantees-and-limits) for the
+supported scope and [getting started](../README.md#getting-started) for runtime
+and development setup.
