@@ -1,8 +1,9 @@
 ;; Development workspace only. Each subproject's project.clj owns its release.
-{:paths ["core/src" "local/src" "file/src" "github/src"]
+{:paths ["core/src" "local/src" "file/src" "github/src" "postgres/src"]
  :deps {org.clojure/clojure {:mvn/version "1.12.6"}
+        org.postgresql/postgresql {:mvn/version "42.7.13"}
         datalevin/datalevin {:local/root "../datalevin"}}
- :aliases {:test {:extra-paths ["examples/src" "dev/src" "test" "core/test" "local/test" "file/test" "github/test" "../datalevin/test-src"]
+ :aliases {:test {:extra-paths ["examples/src" "dev/src" "test" "core/test" "local/test" "file/test" "github/test" "postgres/test" "../datalevin/test-src"]
                   :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
                              "--add-opens=java.base/java.nio=ALL-UNNAMED"
                              "--add-opens=java.base/java.util=ALL-UNNAMED"
@@ -56,6 +57,11 @@
                     :extra-paths ["test" "github/test"]
                     :main-opts ["-m" "datalevin.federation.test-runner"
                                 "datalevin.federation.github-test"]}
+           :postgres {:replace-paths ["core/src" "postgres/src"]
+                      :extra-paths ["test" "postgres/test"]
+                      :main-opts ["-m" "datalevin.federation.test-runner"
+                                  "datalevin.federation.postgres-test"
+                                  "datalevin.federation.postgres-integration-test"]}
            :file {:replace-paths ["core/src" "file/src"]
                   :extra-paths ["test" "file/test"]
                   :main-opts ["-m" "datalevin.federation.test-runner"

@@ -20,18 +20,20 @@ Federated queries use bindings and filters to constrain external lookups. For
 example, a local priority filter can narrow the issue numbers sent to GitHub,
 reducing API requests and the data carried through later joins. The planner
 selects among each adapter's supported scans and lookups using the available
-bindings; cost-based ranking of external accesses is planned. You can inspect
-the plan and execution metrics with `d/explain`.
+bindings. Same-entity fusion can combine several PostgreSQL attribute patterns
+into one table access; cost-based ranking of external accesses is planned. You
+can inspect the plan and execution metrics with `d/explain`.
 
 **Status:** federation adapters are development snapshots (`0.1.0-SNAPSHOT`).
 Datalevin **1.2.8 is released** and includes the query-source SPI used by this
-project.
+project. The PostgreSQL snapshot requires the current sibling checkout with
+same-entity fusion support.
 
 ## Data sources
 
 | Source type | Role | Current support |
 | --- | --- | --- |
-| Other databases (SQL) | Query relational tables alongside other sources. | Planned, starting with PostgreSQL. |
+| Other databases (SQL) | Query relational tables alongside other sources. | [PostgreSQL](postgres/README.md) table scans, key/value lookups, and scalar same-entity fusion in a read-only snapshot. |
 | Files | Query exports and file-based datasets. | [EDN Lines](file/README.md) exports with scalar and collection attributes; verified snapshot scans. |
 | APIs | Query data exposed by external services. | [GitHub](github/README.md) issue and pull-request lookups by entity, repository/issue key, or issue number; live, best-effort reads. |
 | Datalevin databases | Query native entities and attributes alongside external data. | Supplied directly to `d/q`; no adapter needed. |
@@ -42,7 +44,7 @@ The repository also includes a [local relation adapter](local/src/datalevin/fede
 for application-owned `[entity attribute value]` facts with a declared schema,
 supporting snapshot scans and entity/value lookups.
 
-PostgreSQL, Parquet, dataset, and DataFusion adapters are planned and are not
+Parquet, dataset, and DataFusion adapters are planned and are not
 yet available in this repository. Contribution is welcome.
 
 For a working example, a release-triage query combines priorities stored in
@@ -225,13 +227,15 @@ Each module has its own artifact at version `0.1.0-SNAPSHOT`:
 | [Local](local/project.clj) | `org.clojars.huahaiy/datalevin-federation-local` | Application-owned fact sources. |
 | [GitHub](github/project.clj) | `org.clojars.huahaiy/datalevin-federation-github` | GitHub work-item lookups; includes core. |
 | [File](file/project.clj) | `org.clojars.huahaiy/datalevin-federation-file` | EDN Lines exports; includes core. |
+| [PostgreSQL](postgres/project.clj) | `org.clojars.huahaiy/datalevin-federation-postgres` | Snapshot table access and scalar fusion; includes core and the JDBC driver. |
 
 Use the modules your application needs. The local adapter takes a complete
 source descriptor and mapped facts; add core if you also need mapping APIs.
 Datalevin has Maven `provided` scope, so your application must supply the
 runtime. Explicitly depend on Datalevin **1.2.8**, which includes the query-source
-SPI. The subproject manifests still declare `1.2.5` as a provided dependency;
-that older release does not include the SPI.
+SPI. The core, local, file, and GitHub manifests still declare `1.2.5` as a
+provided dependency; that older release does not include the SPI. PostgreSQL
+development uses the sibling checkout's current fusion implementation.
 
 ## Development and further reading
 
@@ -249,11 +253,17 @@ Tests use local fixtures and require no external service. The full and local
 suites need `sqlite3` on `PATH`; HTTP fixtures need permission to bind a temporary
 loopback port.
 
+PostgreSQL's real-driver tests are separate: set `POSTGRES_TEST_URL` for a
+disposable database and run `clojure -M:test:postgres`. See the
+[PostgreSQL guide](postgres/README.md#save-mappings-and-test) for setup and scope.
+
 - [Release-triage example](examples/README.md): combine native data, an export,
   and GitHub.
 - [GitHub adapter guide](github/README.md): mapping, supported attributes, and
   API read limits.
 - [File adapter guide](file/README.md): accepting and querying EDN Lines exports.
+- [PostgreSQL adapter guide](postgres/README.md): discovery, snapshots, fusion,
+  and supported SQL types.
 - [Datalevin query-source SPI](https://github.com/datalevin/datalevin/blob/master/doc/query-source-spi.md):
   detailed query-source contracts and adapter requirements.
 
