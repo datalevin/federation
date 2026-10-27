@@ -2,8 +2,7 @@
 
 Datalevin's entity–attribute–value triple data model is a natural fit for data
 federation: it gives data from different systems a common shape that can be
-queried and joined with Datalog. Its sophisticated query optimizer handles
-complex analytical queries with ease. This project brings those capabilities
+queried and joined with Datalog. This project brings Datalevin's query engine
 to the wider world of data.
 
 The vision is to query across four types of data sources—other databases
@@ -11,6 +10,18 @@ through SQL, files, APIs, and Datalevin databases—using ordinary Datalog.
 Federation adapters expose external records as entities and attributes, so you
 can join them with native Datalevin facts using `d/q` without first importing
 all the data.
+
+For native data, Datalevin's cost-based optimizer uses index counts and
+query-specific sampling to choose join orders and access paths. It pushes
+eligible filters into index scans and reduces intermediate results, so complex
+analytical joins can be expressed declaratively without hand-tuning clause order.
+
+Federated queries use bindings and filters to constrain external lookups. For
+example, a local priority filter can narrow the issue numbers sent to GitHub,
+reducing API requests and the data carried through later joins. The planner
+selects among each adapter's supported scans and lookups using the available
+bindings; cost-based ranking of external accesses is planned. You can inspect
+the plan and execution metrics with `d/explain`.
 
 **Status:** federation adapters are development snapshots (`0.1.0-SNAPSHOT`).
 Datalevin **1.2.8 is released** and includes the query-source SPI used by this
