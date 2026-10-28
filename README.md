@@ -25,15 +25,14 @@ into one table access; cost-based ranking of external accesses is planned. You
 can inspect the plan and execution metrics with `d/explain`.
 
 **Status:** federation adapters are development snapshots (`0.1.0-SNAPSHOT`).
-Datalevin **1.2.8 is released** and includes the query-source SPI used by this
-project. The PostgreSQL snapshot requires the current sibling checkout with
-same-entity fusion support.
+Datalevin **1.2.8** introduced the query-source SPI. Use **1.2.9** for the
+PostgreSQL adapter's same-entity fusion and the current workspace.
 
 ## Data sources
 
 | Source type | Role | Current support |
 | --- | --- | --- |
-| Other databases (SQL) | Query relational tables alongside other sources. | [PostgreSQL](postgres/README.md) table scans, key/value lookups, and scalar same-entity fusion in a read-only snapshot. |
+| Other databases (SQL) | Query relational tables alongside other sources. | [PostgreSQL](postgres/README.md) ordinary primary-key tables, scalar scans/lookups, and same-entity fusion in a read-only snapshot; see [workload limits](postgres/README.md#workload-fit-and-current-gaps). |
 | Files | Query exports and file-based datasets. | [EDN Lines](file/README.md) exports with scalar and collection attributes; verified snapshot scans. |
 | APIs | Query data exposed by external services. | [GitHub](github/README.md) issue and pull-request lookups by entity, repository/issue key, or issue number; live, best-effort reads. |
 | Datalevin databases | Query native entities and attributes alongside external data. | Supplied directly to `d/q`; no adapter needed. |
@@ -44,6 +43,17 @@ The repository also includes a [local relation adapter](local/src/datalevin/fede
 for application-owned `[entity attribute value]` facts with a declared schema,
 supporting snapshot scans and entity/value lookups.
 
+PostgreSQL's current fit is selective enrichment: use native records or another
+source to identify a small set of rows, then retrieve their scalar attributes.
+Cross-table joins work in Datalevin. Broader reporting workloads still face
+significant gaps: lookups issue SQL for each key, date/decimal filtering has
+limited pushdown, and views, partitioned parents, RLS-protected tables, and
+several common column types are unsupported. Large scans can exhaust the
+default request budget. Wide queries can also hit a
+[known planning limit](postgres/README.md#known-planning-limit-and-follow-up-priorities).
+Fusion reduces repeated reads of one entity; it does not delegate a whole
+relational query to PostgreSQL.
+
 Parquet, dataset, and DataFusion adapters are planned and are not
 yet available in this repository. Contribution is welcome.
 
@@ -53,8 +63,8 @@ GitHub.
 
 ## Getting started
 
-Use Datalevin **1.2.8** as your application's runtime; the query-source SPI is
-included in that release. This repository's development workspace uses the
+Use Datalevin **1.2.9** as your application's runtime for the current adapters,
+including PostgreSQL fusion. This repository's development workspace uses the
 Clojure CLI and a sibling Datalevin checkout at `../datalevin`. The commands
 below use that layout: the root `deps.edn` loads the checkout and all adapter
 sources.
@@ -203,8 +213,13 @@ uses the saved identities and mappings without discovering a new schema.
 ## Read guarantees and limits
 
 - GitHub reads are best-effort: separate requests may observe different updates.
-  Local relations and accepted file exports provide snapshots. There is no
-  atomic snapshot across independent sources.
+  Local relations and accepted file exports provide snapshots. PostgreSQL
+  mappings sharing a source/profile use one read-only, repeatable-read
+  transaction. There is no atomic snapshot across independent sources.
+- PostgreSQL currently reads one key per SQL cursor and fetches 32 rows per
+  request by default. SQL joins across entities, aggregates, and ordering are
+  not delegated. Check request and memory budgets for larger workloads; see
+  [bounds and lifecycle](postgres/README.md#bounds-and-lifecycle).
 - GitHub queries need an entity, key, or issue number to start a lookup. A query
   that only asks for every title or label cannot run against this adapter.
 - File queries copy and validate the entire accepted export before scanning it.
@@ -232,10 +247,10 @@ Each module has its own artifact at version `0.1.0-SNAPSHOT`:
 Use the modules your application needs. The local adapter takes a complete
 source descriptor and mapped facts; add core if you also need mapping APIs.
 Datalevin has Maven `provided` scope, so your application must supply the
-runtime. Explicitly depend on Datalevin **1.2.8**, which includes the query-source
-SPI. The core, local, file, and GitHub manifests still declare `1.2.5` as a
-provided dependency; that older release does not include the SPI. PostgreSQL
-development uses the sibling checkout's current fusion implementation.
+runtime. Explicitly depend on Datalevin **1.2.9** for PostgreSQL fusion. The
+provided versions in the manifests lag this requirement: core, local, file,
+and GitHub declare `1.2.5`, and PostgreSQL declares `1.2.8`. Those declarations
+do not supply the required runtime; the workspace uses the sibling checkout.
 
 ## Development and further reading
 

@@ -5,9 +5,76 @@ through ordinary `d/q` and `d/explain`, alongside native Datalevin data and othe
 adapters. It supports table scans, entity and value lookups, and same-entity
 fusion: several scalar attributes of one entity can be read by one SQL cursor.
 
-This is a development snapshot. Use the sibling Datalevin checkout with the
-current SPI v2 fusion implementation. The module's provided `1.2.8` dependency
-does not by itself establish compatibility with later SPI changes.
+This is a development snapshot requiring **Datalevin 1.2.9** for same-entity
+fusion. The module still declares `1.2.8` as a provided dependency; applications
+must explicitly supply `1.2.9`. The development workspace uses the sibling
+checkout. Both versions use SPI revision 2, so the revision number alone does
+not establish fusion compatibility.
+
+## Workload fit and current gaps
+
+The current fit is selective enrichment of a small set of keys from ordinary
+primary-key tables, including joins with native data and other adapters.
+Same-entity fusion avoids reading each scalar attribute separately. Ordinary
+joins between mapped PostgreSQL tables also work, with Datalevin performing
+the join and each mapping supplying its own accesses.
+
+The following gaps matter when moving from that workflow to a typical
+application schema or a larger reporting query:
+
+| Use case | Current gap | Effect on the workload |
+| --- | --- | --- |
+| Enrich hundreds or thousands of keys | One SQL cursor per distinct input key; no bulk `VALUES`, `IN`, or array binding | At least a declaration and a fetch per key, plus cleanup. Network latency and the request budget can dominate even indexed lookups. |
+| Filter orders by amount or events by time | Only eligible `Long` comparisons are pushed down; decimal and temporal ranges stay in Datalevin | A selective final result can still require fetching a large PostgreSQL population. Pattern equality has broader pushdown support, but `timestamptz` equality currently also stays local. |
+| Read an existing application schema | No `date`, `timestamp without time zone`, `time`, `interval`, enums, domains, `char`, `citext`, arrays, or JSON/JSONB mapping | These fields cannot be exposed, although supported columns of the same table can still be selected. Collection-valued attributes are not implemented. |
+| Read reporting views, partitioned datasets, or tenant tables with RLS | Only ordinary tables with validated nondeferrable primary keys are accepted; queries use `ONLY` | Views, materialized views, partitioned parents, and RLS-enabled tables are rejected. Inheritance children are excluded. A unique index or a user-supplied key assertion cannot substitute for the primary key. |
+| Aggregate, sort, or join large PostgreSQL relations | Cross-entity joins, aggregates, ordering, and SQL `LIMIT` are not delegated | Datalevin must consume the rows needed for those operations. A small final result does not imply small transfer or bounded backend work. Access choice is structural, with no index discovery or comparable cost estimates. |
+| Read large text or binary fields | The default selected-row cap is 16 KiB, measured using SQL text representations | Oversized values fail the query. Referenced fields are fetched even when their value is `_` or not projected, so an existence-only query can hit this limit too. |
+| Discover relationships or restrict a saved mapping to a tenant | Discovery covers one named relation's columns and primary key; foreign keys and restricted-scope mappings are absent | Define references manually and put ordinary filters in the query. Query filters are not an authorization boundary. |
+
+Supported columns do not require mapping every physical field. Omitting a
+JSONB or unsupported temporal column is useful when the query does not need
+it; it does not make that column queryable. Likewise, a value-lookup alternative
+does not guarantee a PostgreSQL index exists for that column.
+
+`timestamptz` is exposed as `java.time.Instant` under logical type `:data` to
+preserve microseconds. Native Datalevin `:db.type/instant` uses `java.util.Date`.
+Joining those representations needs an explicit conversion and a decision
+about precision; they are not interchangeable query keys.
+
+## Known planning limit and follow-up priorities
+
+The [adapter planner](src/datalevin/federation/postgres/plan.clj) currently takes
+the first `:max-alternatives` candidates, default `32`, without preserving
+coverage of every pattern. A review probe with eleven attributes on one bound
+entity and a second entity clause generated 32 candidates, all omitting the
+second clause. Such a request has no complete plan even though the adapter
+could execute it. This is a planning defect, not an unsupported SQL type or
+an empty result.
+
+Using `{:query-source {:planning {:max-alternatives 64}}}` restored coverage
+in that probe. It is a workaround for that request, not a general guarantee:
+candidate pruning must preserve a complete set of accesses. Disabling fusion
+can also change candidate pressure but is not a general fix.
+
+The highest-value follow-ups for ordinary federation are:
+
+1. Preserve complete coverage when bounding alternatives and avoid redundant
+   fused candidates. Wide queries should not fail because earlier candidates
+   consumed the response budget.
+2. Batch dependent keys into SQL requests, and measure scans and lookups with
+   realistic network latency and default query budgets.
+3. Add explicit temporal conversions and safe decimal/temporal predicate
+   pushdown, followed by common enum/domain mappings.
+4. Extend relation support with proven keys and read guarantees for partitioned
+   tables and views; define authorization behavior before supporting RLS.
+5. Add foreign-key discovery, prune unneeded payload columns while retaining
+   existence checks, and then evaluate further SQL delegation with the core SPI.
+
+These are follow-up work, not current capabilities. The existing integration
+suite checks correctness and failure handling on small fixtures; it does not
+establish production throughput, large-data behavior, or a multi-version
+PostgreSQL compatibility matrix.
 
 ## Discover, accept, and query
 
@@ -105,6 +172,9 @@ remain visible in discovery but cannot be mapped. Numeric and timestamp
 infinities that lack an exact mapped representation fail execution. Each
 mapped attribute is scalar (`:one`); SQL null contributes no fact, including
 when a query uses `_` or omits that value from its results.
+An ordinary conjunction over a nullable attribute therefore excludes rows
+where that attribute is null; it does not produce SQL outer-join rows with a
+null placeholder.
 
 A reference attribute may use `{:columns ["tenant" "customer_id"] :reference
 {:domain customer-domain :type customer-entity-type}}` instead of a column
@@ -124,8 +194,10 @@ Acquisition takes access-share locks and rechecks the accepted table, key, and
 used column metadata. Changes to used types or constraints fail as stale
 definitions; unrelated added columns do not invalidate a mapping. Locks remain
 until rollback at session close. Concurrent data writes remain permitted, and
-subsequent cursor opens continue to observe the original snapshot. A lost
-connection fails the query; there is no reconnect or automatic retry.
+subsequent cursor opens continue to observe the original snapshot. Long queries
+hold the snapshot and locks until completion, which matters for vacuum and
+schema changes. A lost connection fails the query; there is no reconnect or
+automatic retry.
 
 SQL uses quoted identifiers and bound parameters. Equality lookups use SQL as
 a superset filter and recheck Datalevin equality, including decimal scale and
@@ -151,7 +223,7 @@ bounded, and a connection arriving after cancellation is closed.
 | `:connect-timeout-ms` | `10000` | Maximum connection/checkout wait |
 | `:statement-timeout-ms` | `10000` | PostgreSQL statement timeout |
 | `:fetch-size` | `32` | Rows per explicit server-cursor fetch; maximum 256 |
-| `:max-row-bytes` | `16384` | Maximum combined UTF-8 SQL text size of selected physical values |
+| `:max-row-bytes` | `16384` | Maximum combined byte size of selected physical values rendered as SQL text |
 | `:fusion?` | `true` | Set false to compare separate EAV accesses |
 
 Oversized rows produce an error marker before their values cross the network;
@@ -159,6 +231,22 @@ they are never silently truncated or omitted. Reserved workspace includes the
 fetch page, decoding, and pending row; returned batches have separate charges.
 The query's `:timeout` and `:query-source :limits` apply across all accesses.
 Cancellation aborts blocked database I/O and releases owned resources.
+
+The default query budget allows 1,024 external requests. At 32 rows per fetch,
+a scan returning 100,000 rows needs at least 3,125 fetch requests before counting
+setup and cursor declaration, so it cannot complete under that budget. Likewise,
+1,000 distinct lookup keys need at least 2,000 declaration/fetch requests. These
+are request-count calculations, not measured throughput limits. More accesses,
+aliases, or other sources share the same query budget.
+
+For larger workloads, inspect executed `d/explain` metrics and adjust both the
+profile's `:fetch-size` and the query's `:query-source :limits` deliberately.
+Larger fetches reserve more memory. Increasing `:max-row-bytes` also increases
+the reserved fetch workspace: a 1 MiB row cap with the default fetch size alone
+requires over 512 MiB of cursor workspace, exceeding the default 64 MiB query
+retention budget. Lower the fetch size or provide an appropriate memory budget
+when accepting larger fields. These settings do not add bulk lookup or broader
+predicate pushdown.
 
 Each dependent input is executed with bound parameters; this initial version
 does not combine multiple keys into one SQL request. Connection setup, catalog
