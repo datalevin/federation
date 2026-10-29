@@ -164,3 +164,18 @@
     (is (.contains (:sql q) "?::int8"))
     (is (not (.contains (:sql q) "?::int2")))
     (is (= [40000 1] (:params q)))))
+
+(deftest comparison-prefilters-preserve-decimal-and-temporal-precision
+  (is (= ["x > ?::numeric" [10.2500M]] (plan/comparison-filter "numeric" "x" :> 10.2500M)))
+  (is (nil? (plan/comparison-filter "numeric" "x" :> 10.25)))
+  (is (nil? (plan/comparison-filter "numeric" "x" :> (bigdec "1E+200000"))))
+  (doseq [stamp ["2026-01-01T00:00:00.000000999Z" "1969-12-31T23:59:59.999999999Z"]
+          :let [instant (java.time.Instant/parse stamp)
+                floor (str (.truncatedTo instant java.time.temporal.ChronoUnit/MICROS))]]
+    (doseq [[operator sql] [[:> ">"] [:>= ">"] [:< "<="] [:<= "<="]]]
+      (is (= [(str "x " sql " ?::timestamptz") [floor]]
+             (plan/comparison-filter "timestamptz" "x" operator instant))))
+    (is (= ["FALSE" []] (plan/comparison-filter "timestamptz" "x" := instant)))
+    (is (= ["TRUE" []] (plan/comparison-filter "timestamptz" "x" :not= instant))))
+  (doseq [bound [java.time.Instant/MIN java.time.Instant/MAX (java.util.Date.)]]
+    (is (nil? (plan/comparison-filter "timestamptz" "x" :>= bound)))))

@@ -5,7 +5,7 @@
   :dependencies [[org.clojure/clojure "1.12.6"]
                  [org.postgresql/postgresql "42.7.13"]
                  [org.clojars.huahaiy/datalevin-federation-core "0.1.0-SNAPSHOT"]
-                 [datalevin "1.2.8" :scope "provided"]]
+                 [datalevin "1.2.10" :scope "provided"]]
   :filespecs [{:type :path :path "../LICENSE"}]
   :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
              "--add-opens=java.base/java.nio=ALL-UNNAMED"

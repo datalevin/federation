@@ -4,6 +4,7 @@
             [datalevin.federation.postgres.jdbc :as jdbc :refer [ensure! fail!]]
             [datalevin.federation.postgres.mapping :as pm]
             [datalevin.federation.postgres.plan :as plan]
+            [datalevin.federation.postgres.relational :as relational]
             [datalevin.query.source :as spi]
             [datalevin.query.source.value :as value])
   (:import [java.sql Connection ResultSet SQLException]
@@ -45,7 +46,10 @@
 (defn- reserve-cursor! [ctl accepted candidate bindings profile]
   (let [fixed (* 4 (value/value-charge [candidate bindings]))]
     (loop [n (:fetch-size profile)]
-      (let [bytes (+ fixed (plan/fetch-charge accepted candidate n (:max-row-bytes profile)))
+      (let [bytes (+ fixed (if (:relational? candidate)
+                            (+ 131072 (* n (+ (* 16 (:max-row-bytes profile))
+                                              (* 1024 (get-in candidate [:query :physical-columns])) 2048)))
+                            (plan/fetch-charge accepted candidate n (:max-row-bytes profile))))
             result (try
                      (spi/reserve! ctl {:retained-bytes bytes})
                      (catch clojure.lang.ExceptionInfo e
@@ -70,7 +74,7 @@
               bindings (merge (:bindings candidate)
                               (zipmap (map :variable (:requires candidate)) (:values input)))]
           (swap! state assoc :remaining (next remaining))
-          (if-let [result (plan/match-row accepted candidate bindings row)]
+          (if-let [result (if (:relational? candidate) row (plan/match-row accepted candidate bindings row))]
             (let [pending {:row result :id (:binding-id input)}]
               (swap! state assoc :pending pending) pending)
             (recur)))
@@ -79,7 +83,8 @@
               rows (jdbc/query! context :fetch (str "FETCH FORWARD " n " FROM " portal) []
                                 (fn [^ResultSet rs]
                                   [(if inputs (.getInt rs 1) 0)
-                                   (plan/read-row accepted columns rs (if inputs 1 0))]))]
+                                   (if (:relational? candidate) (relational/read-row (:query candidate) rs)
+                                       (plan/read-row accepted columns rs (if inputs 1 0)))]))]
           (swap! metrics update :read-rows + (count rows))
           (swap! state assoc :remaining (seq rows) :more? (= n (count rows)))
           (recur))
@@ -87,9 +92,9 @@
         (< input-index (if inputs (count inputs) 1))
         (let [end (if inputs (min (count inputs) (+ input-index (:max-request-binding-rows plan/constraints))) 1)
               max-row-bytes (get-in context [:profile :max-row-bytes])
-              query (if inputs
-                      (plan/batch-sql accepted candidate (subvec inputs input-index end) max-row-bytes)
-                      (plan/sql accepted candidate (:bindings candidate) max-row-bytes))
+              query (cond (:relational? candidate) (:query candidate)
+                          inputs (plan/batch-sql accepted candidate (subvec inputs input-index end) max-row-bytes)
+                          :else (plan/sql accepted candidate (:bindings candidate) max-row-bytes))
               portal (str "dtlv_" (.replace (str (UUID/randomUUID)) "-" ""))]
           (jdbc/execute! context :open (str "DECLARE " portal " NO SCROLL CURSOR FOR " (:sql query)) (:params query))
           (swap! state assoc :portal portal :columns (:columns query) :more? true
@@ -145,6 +150,30 @@
         (swap! session-state update :cursors disj this)))
     nil))
 
+(defn- cursor! [session accepted candidate bindings]
+  (let [{:keys [context state request]} session
+        [token fetch-size] (reserve-cursor! (:control request) accepted candidate bindings (:profile context))]
+    (try
+      (let [metrics (atom {:batches 0 :rows 0 :charged-bytes 0 :read-rows 0 :read-bytes nil
+                           :external-requests 0 :elapsed-ns 0})
+            cursor (->Cursor accepted candidate (atom (when bindings (value/owned-copy bindings)))
+                             (-> context (assoc :metrics metrics) (assoc-in [:profile :fetch-size] fetch-size))
+                             (atom {:input-index 0}) metrics token state)]
+        (swap! state update :cursors conj cursor)
+        cursor)
+      (catch Throwable e (spi/release! token) (throw e)))))
+
+(defn- compile-relational! [ctl views request max-row-bytes decline-on-limit?]
+  (let [n (count (filter #(= :pattern (:kind %)) (:clauses request)))]
+    (when (<= 1 n 32)
+      (let [token (try (spi/reserve! ctl {:retained-bytes (+ 1048576 (* 32768 n n))})
+                       (catch clojure.lang.ExceptionInfo e
+                         (when-not (and decline-on-limit? (= :query-source/limit (:error (ex-data e)))
+                                        (= :retained-bytes (:category (ex-data e)))) (throw e))))]
+        (when token
+          (try (relational/compile-query views request max-row-bytes)
+               (finally (spi/release! token))))))))
+
 (defrecord Session [views request context info state reservations registration stats]
   spi/IQuerySourceSession
   (-session-info [_] info)
@@ -153,8 +182,7 @@
       (active! this)
       (let [candidate (get-in @state [:plans (:plan open)])
             view (get views (:definition-fingerprint open))
-            dependent? (boolean (seq (:requires candidate)))
-            ctl (:control request)]
+            dependent? (boolean (seq (:requires candidate)))]
         (when-not view (fail! :query-source/stale-definition :open))
         (ensure! (and candidate (= (:definition-fingerprint candidate) (:definition-fingerprint open))
                       (= (:id candidate) (:alternative-id open))
@@ -170,18 +198,7 @@
                        (min 262144 (get-in request [:limits :binding-bytes])))
                 (fail! :query-source/limit :open)))
           (ensure! (not (contains? open :bindings)) :open))
-        (let [profile (:profile context)
-              [token fetch-size] (reserve-cursor! ctl (:accepted view) candidate (:bindings open) profile)]
-          (try
-            (let [metrics (atom {:batches 0 :rows 0 :charged-bytes 0 :read-rows 0 :read-bytes nil
-                                 :external-requests 0 :elapsed-ns 0})
-                  cursor (->Cursor (:accepted view) candidate
-                                   (atom (when dependent? (value/owned-copy (:bindings open))))
-                                   (-> context (assoc :metrics metrics) (assoc-in [:profile :fetch-size] fetch-size))
-                                   (atom {:input-index 0}) metrics token state)]
-              (swap! state update :cursors conj cursor)
-              cursor)
-            (catch Throwable e (spi/release! token) (throw e)))))))
+        (cursor! this (:accepted view) candidate (when dependent? (:bindings open))))))
   (-cancel-session! [_ _]
     (reset! (:cancelled context) true)
     (jdbc/abort! (:connection context))
@@ -198,7 +215,29 @@
         (reset! reservations [])
         (reset! state {:closed? true})
         (swap! stats update :live-sessions dec)))
-    nil))
+    nil)
+  spi/IRelationalQuerySession
+  (-open-relational-cursor [this open]
+    (locking state
+      (active! this)
+      (ensure! (and (= (select-keys request common) (select-keys open common))
+                    (empty? (:cursors @state)) (= "relational" (:alternative-id open))
+                    (not (contains? open :bindings))) :open)
+      (let [plan (:plan open)
+            sources (:sources plan)
+            accepted (into {} (map (fn [{:keys [symbol definition-fingerprint]}]
+                                     (let [view (views definition-fingerprint)]
+                                       (ensure! view :open)
+                                       [symbol (:accepted view)]))) sources)
+            descriptor (get-in views [(:definition-fingerprint open) :descriptor])
+            query (assoc (:query plan) :sources sources)
+            compiled (compile-relational! (:control request) accepted query (get-in context [:profile :max-row-bytes]) false)]
+        (ensure! (and descriptor (= (:source-symbol open) (:symbol (first sources)))
+                      (= (:definition-fingerprint open) (:definition-fingerprint (first sources)))
+                      (= (:scope-id open) (get-in descriptor [:scope :id])) (= 0 (:region-id open))
+                      compiled (= (:columns open) (:columns compiled))) :open)
+        (cursor! this (accepted (:symbol (first sources)))
+                 {:relational? true :query compiled :columns (:columns compiled) :requires [] :bindings {}} nil)))))
 
 (defn- descriptor [accepted profile]
   (assoc (mapping/source-info accepted (:compute-context-id profile))
@@ -267,6 +306,17 @@
           (throw e))))))
 
 (defrecord PostgresSource [descriptor accepted profile stats]
+  spi/IRelationalQuerySource
+  (-plan-relational [_ request]
+    (when (:relational? profile)
+      (let [sources (:sources request)
+            views (into {} (map (fn [{:keys [symbol descriptor]}] [symbol (::accepted descriptor)])) sources)]
+        (when (and (= descriptor (:descriptor (first sources))) (every? some? (vals views))
+                   (compile-relational! (:control request) views request (:max-row-bytes profile) true))
+          {:columns (:columns request)
+           :plan {:sources (mapv (fn [{:keys [symbol descriptor]}]
+                                  {:symbol symbol :definition-fingerprint (:definition-fingerprint descriptor)}) sources)
+                  :query (select-keys request [:mode :semantics-version :clauses :bindings :find :with :columns])}}))))
   spi/IQuerySource
   (-source-info [_] descriptor)
   (-open-session [this request] (acquire this request))
@@ -303,7 +353,8 @@
   "Reopen accepted metadata without I/O. Runtime profiles require a public
   :compute-context-id and either :jdbc-url (with optional string :properties)
   or :data-source. Tables sharing a database/profile share one read transaction.
-  Optional :fusion? false offers separate EAV accesses for conformance checks."
+  Optional :fusion? false offers separate EAV accesses for conformance checks.
+  Set :relational? false to keep joins and aggregation in the core engine."
   [accepted profile]
   (pm/compiled! accepted)
   (ensure! (some? (:compute-context-id profile)) :profile)

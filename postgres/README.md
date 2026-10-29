@@ -6,20 +6,23 @@ adapters. It supports table scans, entity and value lookups, and same-entity
 fusion: several scalar attributes of one entity can be read by one SQL cursor.
 Dependent lookups combine up to 256 input keys in a parameterized `VALUES`
 join, with results associated with their original binding IDs.
+Eligible decimal/time filters and complete same-snapshot relational queries
+can execute in PostgreSQL, including joins between accepted mappings and
+supported aggregates.
 
-This is a development snapshot requiring **Datalevin 1.2.9** for same-entity
-fusion. The module still declares `1.2.8` as a provided dependency; applications
-must explicitly supply `1.2.9`. The development workspace uses the sibling
-checkout. Both versions use SPI revision 2, so the revision number alone does
-not establish fusion compatibility.
+This development snapshot requires the matching **Datalevin 1.2.10** build
+with the optional relational SPI extension. The module declares `1.2.10` as a
+provided dependency; the development workspace uses the sibling checkout.
+SPI revision 2 alone does not establish availability of the new protocols.
 
 ## Workload fit and current gaps
 
 The current fit is selective enrichment of a small set of keys from ordinary
 primary-key tables, including joins with native data and other adapters.
-Same-entity fusion avoids reading each scalar attribute separately. Ordinary
-joins between mapped PostgreSQL tables also work, with Datalevin performing
-the join and each mapping supplying its own accesses.
+Same-entity fusion avoids reading each scalar attribute separately. Flat joins
+and supported aggregates within one database snapshot can be delegated as a
+single relational access. Queries involving other adapters, native sources,
+or unsupported expressions use ordinary fact accesses and core joins.
 
 The following gaps matter when moving from that workflow to a typical
 application schema or a larger reporting query:
@@ -27,10 +30,10 @@ application schema or a larger reporting query:
 | Use case | Current gap | Effect on the workload |
 | --- | --- | --- |
 | Enrich large key sets | Batches accept at most 256 keys and 256 KiB of bindings; matches arrive in bounded fetch pages | Request and memory budgets apply across all batches. Network latency and nonunique value matches can still dominate. |
-| Filter orders by amount or events by time | Only eligible `Long` comparisons are pushed down; decimal and temporal ranges stay in Datalevin | A selective final result can still require fetching a large PostgreSQL population. Pattern equality has broader pushdown support, but `timestamptz` equality currently also stays local. |
+| Filter orders by amount or events by time | Matching integral, `BigDecimal`, and `Instant` comparisons are pushed down; mixed representations and arbitrary functions stay local | Eligible ranges and equality reduce transfer. Bounds outside the supported timestamp parameter range and unsupported comparisons can still require a broad read. |
 | Read an existing application schema | No `date`, `timestamp without time zone`, `time`, `interval`, enums, domains, `char`, `citext`, arrays, or JSON/JSONB mapping | These fields cannot be exposed, although supported columns of the same table can still be selected. Collection-valued attributes are not implemented. |
 | Read reporting views, partitioned datasets, or tenant tables with RLS | Only ordinary tables with validated nondeferrable primary keys are accepted; queries use `ONLY` | Views, materialized views, partitioned parents, and RLS-enabled tables are rejected. Inheritance children are excluded. A unique index or a user-supplied key assertion cannot substitute for the primary key. |
-| Aggregate, sort, or join large PostgreSQL relations | Cross-entity joins, aggregates, ordering, and SQL `LIMIT` are not delegated | Datalevin must consume the rows needed for those operations. A small final result does not imply small transfer or bounded backend work. Access choice is structural, with no index discovery or comparable cost estimates. |
+| Aggregate, sort, or join large PostgreSQL relations | Relational delegation covers flat single-snapshot conjunctions and selected aggregates; SQL ordering/limit, arbitrary aggregates, and scoped programs are not delegated | Eligible counts transfer one row per group. Unsupported shapes retain core execution. Backend work remains subject to statement/query timeouts; there is no index discovery or cost-based access choice. |
 | Read large text or binary fields | The default selected-row cap is 16 KiB, measured using SQL text representations | Oversized values fail the query. Referenced fields are fetched even when their value is `_` or not projected, so an existence-only query can hit this limit too. |
 | Discover relationships or restrict a saved mapping to a tenant | Discovery covers one named relation's columns and primary key; foreign keys and restricted-scope mappings are absent | Define references manually and put ordinary filters in the query. Query filters are not an authorization boundary. |
 
@@ -64,8 +67,7 @@ The highest-value follow-ups for ordinary federation are:
 
 1. Measure batched lookups and scans with realistic network latency and
    default query budgets.
-2. Add explicit temporal conversions and safe decimal/temporal predicate
-   pushdown, followed by common enum/domain mappings.
+2. Add further temporal conversions and common enum/domain mappings.
 3. Extend relation support with proven keys and read guarantees for partitioned
    tables and views; define authorization behavior before supporting RLS.
 4. Add foreign-key discovery, prune unneeded payload columns while retaining
@@ -201,14 +203,51 @@ automatic retry.
 
 SQL uses quoted identifiers and bound parameters. Equality lookups use SQL as
 a superset filter and recheck Datalevin equality, including decimal scale and
-byte content. Eligible long comparisons can be pushed down. Other predicates,
-cross-entity joins, rules, and aggregates run in Datalevin. Fusion preserves
+byte content. Eligible integral, decimal, and temporal comparisons can be
+pushed down. Unsupported predicates and scoped programs run in Datalevin. Fusion preserves
 existence guards, repeated variables, and the identities needed by `:with`.
 
 This first adapter reads `ONLY` the accepted table, excluding inheritance
 children. Views, partitioned parents, row-level security, arrays, JSON mapping,
-arbitrary SQL, collection expansion, and cross-entity SQL join delegation are
+arbitrary SQL and collection expansion are
 outside its supported scope.
+
+## Filter and relational delegation
+
+Ordinary binary `=`, `not=`, `<`, `<=`, `>`, and `>=` predicates are exported by
+core only within their conjunction and source-variable scope. Captured scalar
+`:in` bounds may become constants; potential outputs from another operator do
+not become constants. The adapter accepts matching integral/decimal bounds
+and `Instant` bounds from years 0001 through 9999. Other representations remain
+residual predicates. Temporal cutoffs retain nanosecond comparisons against
+PostgreSQL's microsecond values by adjusting the bound and strictness before
+binding. No rounding through `java.util.Date` occurs. Pattern and batched-key
+equality also support eligible `Instant` values.
+
+The optional relational path delegates a complete flat conjunction when every
+source belongs to one acquired PostgreSQL session and all expressions have
+proven SQL semantics. It supports self joins, cross-table joins, and typed
+references. SQL uses binary text equality and preserves decimal scale where
+query-key equality requires it. Unsupported types and expressions decline
+delegation before acquisition and use the existing fact-access path.
+
+Supported aggregates are `count`, `count-distinct`, decimal `sum`, integral
+`sum` with an explicit nonnegative range predicate, and eligible scalar
+`min`/`max`. Decimal min/max require a fixed column scale; floating-point
+aggregation, unrestricted integral sums, and other reducers remain in core.
+The SQL projection establishes distinct `:find`/`:with` input tuples before
+grouping. Empty inputs yield no groups, matching ordinary query behavior.
+Input conversion and row-size guards still apply even when aggregation would
+return a small value.
+
+The initial relational contract accepts up to 32 patterns and 128 physical
+output components. Rules, unions, negation, functions, `:having`, collection
+inputs, and queries spanning independent sessions retain core execution.
+Public result shaping, ordering, offset, and limit use the shared result
+processor; ordering combined with return maps currently retains core execution.
+Set `:relational? false` on participating runtime profiles to compare the
+fact-access path. `d/explain` identifies selected relational plans with
+`:policy :relational-v1`; raw SQL and parameters remain private.
 
 ## Bounds and lifecycle
 
@@ -225,6 +264,7 @@ bounded, and a connection arriving after cancellation is closed.
 | `:fetch-size` | `128` | Maximum rows per explicit server-cursor fetch; up to 256, reduced when needed to admit cursor workspace |
 | `:max-row-bytes` | `16384` | Maximum combined byte size of selected physical values rendered as SQL text |
 | `:fusion?` | `true` | Set false to compare separate EAV accesses |
+| `:relational?` | `true` | Allow eligible whole-conjunction joins and aggregation |
 
 Oversized rows produce an error marker before their values cross the network;
 they are never silently truncated or omitted. Reserved workspace includes the
@@ -257,8 +297,8 @@ Dependent inputs use bound parameters and a generated ordinal to correlate
 each match with its binding ID. Composite keys and typed references retain
 their key components; every match rechecks Datalevin equality. When a key has
 no safe SQL equality filter, its batch uses local matching and can still scan
-the underlying table. Batching reduces round trips without adding predicate
-pushdown or delegating joins between mapped entities.
+the underlying table. Key batching and whole-conjunction relational delegation
+have separate eligibility checks.
 
 Connection setup, catalog reads, cursor declarations, and fetches consume the
 shared request budget. Resource cleanup (`CLOSE`, rollback, connection close)

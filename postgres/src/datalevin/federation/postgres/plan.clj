@@ -7,7 +7,9 @@
             [datalevin.query.source.value :as value])
   (:import [datalevin.utl QueryKey]
            [java.sql ResultSet]
-           [java.time OffsetDateTime]))
+           [java.math BigDecimal]
+           [java.time Instant OffsetDateTime]
+           [java.time.temporal ChronoUnit]))
 
 (def constraints {:max-binding-rows 256 :max-binding-bytes 262144 :max-request-binding-rows 256})
 
@@ -84,6 +86,35 @@
 
 (defn- column-sql [column] (str "r." (jdbc/identifier column)))
 
+(def operators {:= "=" :not= "<>" :< "<" :<= "<=" :> ">" :>= ">="})
+(def reverse-operator {:= := :not= :not= :< :> :<= :>= :> :< :>= :<=})
+
+(defn comparison-filter
+  "Compile a comparison with matching scalar representations. Timestamp
+  cutoffs are reduced to exact microsecond comparisons before binding; the
+  original predicate remains a core residual. Unproved cases return nil."
+  [type column operator x]
+  (when (operators operator)
+    (cond
+      (and (#{"int2" "int4" "int8"} type) (int? x))
+      [(str column " " (operators operator) " ?::int8") [x]]
+
+      (and (= type "numeric") (instance? BigDecimal x)
+           (<= (- (.precision ^BigDecimal x) (.scale ^BigDecimal x)) 131072)
+           (<= (.scale ^BigDecimal x) 16383))
+      [(str column " " (operators operator) " ?::numeric") [x]]
+
+      (and (= type "timestamptz") (instance? Instant x)
+           (not (.isBefore ^Instant x (Instant/parse "0001-01-01T00:00:00Z")))
+           (.isBefore ^Instant x (Instant/parse "+10000-01-01T00:00:00Z")))
+      (let [floor (.truncatedTo ^Instant x ChronoUnit/MICROS)
+            aligned? (= x floor)
+            op (if aligned? operator (case operator :>= :> :< :<= operator))]
+        (cond
+          (and (not aligned?) (= operator :=)) ["FALSE" []]
+          (and (not aligned?) (= operator :not=)) ["TRUE" []]
+          :else [(str column " " (operators op) " ?::timestamptz") [(str floor)]])))))
+
 (defn- equality-filter [accepted columns x]
   ;; SQL equality is used only as a superset. The shared query equality is
   ;; always rechecked, including numeric scale, signed zero, and collation.
@@ -91,8 +122,15 @@
     (when (and (sequential? xs) (= (count columns) (count xs))
                 (every? true? (map (fn [column v]
                                     (let [type (pm/types (get-in accepted [:requirements :columns column :type]))]
-                                      (and (not= :data type) (value/matches-type? type v)))) columns xs)))
-      [(str/join " AND " (map #(str (column-sql %) " = ?") columns)) (vec xs)])))
+                                      (or (and (not= :data type) (value/matches-type? type v))
+                                          (some? (comparison-filter
+                                                   (get-in accepted [:requirements :columns column :type])
+                                                   (column-sql column) := v))))) columns xs)))
+      (let [filters (mapv (fn [column v]
+                            (or (comparison-filter (get-in accepted [:requirements :columns column :type])
+                                                   (column-sql column) := v)
+                                [(str (column-sql column) " = ?") [v]])) columns xs)]
+        [(str/join " AND " (map first filters)) (vec (mapcat second filters))]))))
 
 (defn- pattern-filters [accepted clauses bindings]
   (mapcat
@@ -115,20 +153,23 @@
                 (keep identity [entity-filter (when vbound? (equality-filter accepted columns v))])))) clauses))
 
 (defn predicates
-  "Only integral comparisons with a matching Long constant are pushed down.
-  All other predicates remain core residuals."
+  "Push matching integral, decimal, and Instant comparisons as prefilters.
+  Unsupported types and comparisons remain core residuals."
   [accepted candidate request]
   (let [vars (into {} (keep (fn [clause]
                               (let [[_ [_ a] [tag v]] (:terms clause)
                                     cs (pm/attribute-columns accepted a)]
-                                (when (and (= :var tag) (= 1 (count cs))
-                                            (= :long (pm/types (get-in accepted [:requirements :columns (first cs) :type]))))
+                                (when (and (= :var tag) (= 1 (count cs)))
                                   [v (first cs)]))) (:clauses candidate)))]
     (vec (keep (fn [{:keys [kind operator args] :as predicate}]
-                 (when (and (= kind :predicate) (#{:= :not= :< :<= :> :>=} operator))
-                   (let [[[tag v] [ctag x]] args]
-                     (when (and (= :var tag) (vars v) (= :const ctag) (instance? Long x))
-                       (assoc predicate :column (vars v)))))) (:clauses request)))))
+                 (when (and (= kind :predicate) (= 2 (count args)))
+                   (let [[a b] args
+                         [a b op] (if (= :const (first a)) [b a (reverse-operator operator)] [a b operator])
+                         [tag v] a [ctag x] b column (vars v)]
+                     (when (and (= :var tag) column (= :const ctag))
+                       (when-let [filter (comparison-filter (get-in accepted [:requirements :columns column :type])
+                                                           (column-sql column) op x)]
+                         (assoc predicate :column column :filter filter)))))) (:clauses request)))))
 
 (defn- selected-columns [accepted plan]
   (vec (distinct (concat (pm/key-columns accepted)
@@ -150,10 +191,7 @@
         size (str/join " + " (map #(str "COALESCE(octet_length(" (column-sql %) "::text)::bigint,0)") columns))
         bounded (str "(" size ") <= " (long max-row-bytes))
         filters (concat (pattern-filters accepted (:clauses plan) bindings)
-                        (map (fn [{:keys [column operator args]}]
-                               [(str (column-sql column) " "
-                                     ({:= "=" :not= "<>" :< "<" :<= "<=" :> ">" :>= ">="} operator) " ?")
-                                [(second (second args))]]) (:predicates plan)))]
+                        (map :filter (:predicates plan)))]
     {:columns columns
      :sql (str "SELECT " ordinal "NOT (" bounded "), "
                (str/join ", " (map #(str "CASE WHEN " bounded " THEN " (column-sql %) " END") columns))
@@ -181,7 +219,9 @@
                                            (value/matches-type? (get-in accepted [:identity :type]) x)))
                            x (if (ref/entity-ref? x)
                                (let [key (ref/key-tuple x)] (if (= 1 (count key)) (first key) key)) x)]
-                       (when valid? (second (equality-filter accepted columns x))))) inputs)
+                       (when valid?
+                         (let [params (second (equality-filter accepted columns x))]
+                           (when (= (count columns) (count params)) params))))) inputs)
         pushdown? (every? some? keys)
         ;; Widen integral inputs: casting an out-of-range lookup key to int2
         ;; or int4 would fail instead of correctly finding no matching row.
@@ -198,8 +238,8 @@
     (query-sql accepted plan (:bindings plan) max-row-bytes join-sql "b.i, "
                (when pushdown? (mapcat identity keys)))))
 
-(defn decode [accepted column ^ResultSet rs i]
-  (let [x (case (get-in accepted [:requirements :columns column :type])
+(defn decode-value [type ^ResultSet rs i]
+  (let [x (case type
             ("int2" "int4" "int8") (.getLong rs (int i))
             "bool" (.getBoolean rs (int i))
             ("text" "varchar") (.getString rs (int i))
@@ -213,6 +253,9 @@
                               (jdbc/fail! :query-source/invalid :values))
                             (some-> x .toInstant)))]
     (when-not (.wasNull rs) x)))
+
+(defn decode [accepted column rs i]
+  (decode-value (get-in accepted [:requirements :columns column :type]) rs i))
 
 (defn read-row
   ([accepted columns rs] (read-row accepted columns rs 0))

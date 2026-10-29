@@ -79,6 +79,141 @@
   {:find find :in '[$p] :where where :timeout 10000
    :query-source {:limits {:batch-rows 1 :binding-rows 1}}})
 
+(defn read-rows [explanation]
+  (reduce + (map #(get-in % [:metrics :read-rows]) (:cursors explanation))))
+(defn relational-plan? [explanation]
+  (some #(= :relational-v1 (:policy %)) (:regions explanation)))
+
+(deftest decimal-and-temporal-filters-reduce-transfer-in-ordinary-queries
+  (sql! (str "CREATE TABLE " (table "filtered") " (id bigint PRIMARY KEY, amount numeric(18,4), stamp timestamptz)"))
+  (sql! (str "INSERT INTO " (table "filtered")
+             " SELECT i,i::numeric/10,timestamptz '2026-01-01 00:00:00+00' + i * interval '1 microsecond'"
+             " FROM generate_series(1,1000) i"))
+  (let [accepted (pg/accept-mapping (pg/discover *profile* [*schema* "filtered"])
+                   {:source-instance-id unit/source-id :relation-id :test/filtered :identity-attribute :row/id
+                    :attributes {:row/amount "amount" :row/stamp "stamp"}})
+        compiled (mapping/compile-logical-mapping accepted)
+        base (Instant/parse "2026-01-01T00:00:00Z")
+        facts (vec (mapcat #(mapping/project-facts compiled [%]
+                             {:row/amount (.setScale (.divide (bigdec %) 10M) 4)
+                              :row/stamp (.plusNanos base (* 1000 %))}) (range 1 1001)))
+        provider (pg/source accepted (dissoc *profile* :fetch-size))
+        upper (.plusNanos base 10500) lower (.plusNanos base 990500)
+        cases [[:row/id :> 990 10] [:row/amount :> 99M 10]
+               [:row/stamp :> lower 10] [:row/stamp :>= lower 10]
+               [:row/stamp :< upper 10] [:row/stamp :<= upper 10]
+               [:row/stamp := upper 0]]]
+    (doseq [[attribute operator cutoff n] cases
+            reverse? [false true]]
+      (let [symbol ({:> '> :>= '>= :< '< :<= '<= := '=} operator)
+            predicate (if reverse? (list ({'> '< '>= '<= '< '> '<= '>= '= '=} symbol) cutoff '?value)
+                          (list symbol '?value cutoff))
+            q {:find '[?id] :in '[$p] :timeout 30000
+               :where [['$p '?e :row/id '?id] ['$p '?e attribute '?value] [predicate]]}
+            explained (d/explain {:run? true} q provider)]
+        (is (= (set (d/q q facts)) (set (d/q q provider))) (pr-str [attribute operator reverse?]))
+        (is (= n (:result-rows explained)))
+        (is (= n (read-rows explained)))
+        (is (some #(seq (:prefilters %)) (mapcat :steps (:regions explained))))))
+    (let [q {:find '[?id] :in '[$p ?cutoff] :timeout 30000
+             :where '[[$p ?e :row/id ?id] [$p ?e :row/amount ?amount] [(> ?amount ?cutoff)]]}]
+      (is (= (set (d/q q facts 99M)) (set (d/q q provider 99M)))))
+    (let [q {:find '[?id] :in '[$p] :timeout 30000
+             :where '[[$p ?e :row/id ?id] [$p ?e :row/amount ?amount] [(> ?amount 99.0)]]}
+          explained (d/explain {:run? true} q provider)]
+      (is (= (set (d/q q facts)) (set (d/q q provider))))
+      (is (= 1000 (read-rows explained))))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
+(deftest delegated-aggregates-preserve-find-with-and-empty-input-semantics
+  (let [queries
+        ['[:find (count ?status) :in $p :where [$p ?e :order/status ?status]]
+         '[:find (count ?status) :with ?e :in $p :where [$p ?e :order/status ?status]]
+         '[:find (count-distinct ?status) :with ?e :in $p :where [$p ?e :order/status ?status]]
+         '[:find ?status (count ?e) :in $p :where [$p ?e :order/status ?status]]
+         '[:find (sum ?amount) :in $p :where [$p ?e :order/amount ?amount]]
+         '[:find (sum ?amount) :with ?e :in $p :where [$p ?e :order/amount ?amount]]
+         '[:find (min ?amount) (max ?amount) :in $p :where [$p ?e :order/amount ?amount]]
+         '[:find (sum ?id) :in $p :where [$p ?e :order/id ?id] [(>= ?id 0)]]
+         '[:find (count ?e) :in $p :where [$p ?e :order/id ?id] [(> ?id 99)]]
+         '[:find (count ?e) . :in $p :where [$p ?e :order/id ?id]]
+         '[:find [(count ?status) ...] :in $p :where [$p ?e :order/status ?status]]
+         '[:find [(count ?e) (sum ?amount)] :in $p :where [$p ?e :order/amount ?amount]]
+         {:find '[?status (count ?e)] :in '[$p] :order-by '[1 :desc ?status :asc] :limit 1
+          :where '[[$p ?e :order/status ?status]]}
+         {:find '[?status (count ?e)] :keys '[status total] :in '[$p]
+          :where '[[$p ?e :order/status ?status]]}]]
+    (doseq [q queries]
+      (let [provider (source) explained (d/explain {:run? true} q provider)
+            actual (d/q q provider) expected (d/q q (eager))]
+        (is (if (or (set? expected) (seq? expected))
+              (and (= (count expected) (count actual))
+                   (every? (fn [row] (some #(QueryKey/equals row %) actual)) expected))
+              (QueryKey/equals expected actual)) (pr-str [q expected actual]))
+        (is (relational-plan? explained) (pr-str q))
+        (is (<= (read-rows explained) 2))
+        (is (zero? (:live-sessions (pg/statistics provider))))))))
+
+(deftest relational-distinctness-preserves-decimal-scale-and-repeated-variables
+  (sql! (str "CREATE TABLE " (table "decimal_keys") " (id bigint PRIMARY KEY, a numeric, b numeric)"))
+  (sql! (str "INSERT INTO " (table "decimal_keys") " VALUES (1,1.0,1.00),(2,1.00,1.0),(3,2.0,2.0)"))
+  (let [accepted (pg/accept-mapping (pg/discover *profile* [*schema* "decimal_keys"])
+                   {:source-instance-id unit/source-id :relation-id :test/decimal-keys :identity-attribute :row/id
+                    :attributes {:row/a "a" :row/b "b"}})
+        compiled (mapping/compile-logical-mapping accepted)
+        facts (vec (mapcat (fn [[id a b]] (mapping/project-facts compiled [id] {:row/a a :row/b b}))
+                           [[1 1.0M 1.00M] [2 1.00M 1.0M] [3 2.0M 2.0M]]))
+        queries ['[:find ?a (count ?e) :in $p :where [$p ?e :row/a ?a]]
+                 '[:find (count ?a) (count-distinct ?a) (sum ?a) :in $p :where [$p ?e :row/a ?a]]
+                 '[:find ?a ?x ?y :in $p :where [$p ?x :row/a ?a] [$p ?y :row/b ?a]]
+                 '[:find ?a ?b :in $p :where [$p ?x :row/a ?a] [$p ?y :row/b ?b] [(= ?a ?b)]]]]
+    (doseq [q queries]
+      (let [provider (pg/source accepted *profile*) expected (d/q q facts) actual (d/q q provider)]
+        (is (= (count expected) (count actual)))
+        (is (every? (fn [row] (some #(QueryKey/equals row %) actual)) expected))
+        (is (relational-plan? (d/explain {:run? false} q provider)))))
+    (let [q '[:find (min ?a) :in $p :where [$p ?e :row/a ?a]]]
+      (is (not (relational-plan? (d/explain {:run? false} q (pg/source accepted *profile*))))))))
+
+(deftest delegated-aggregates-enforce-input-row-and-conversion-limits
+  (sql! (str "UPDATE " (table "orders") " SET title=repeat('x',100000) WHERE id=1"))
+  (let [provider (source {:max-row-bytes 128})
+        q '[:find (count ?title) :in $p :where [$p ?e :order/title ?title]]]
+    (is (= :query-source/limit (category #(d/q q provider))))
+    (is (zero? (:live-sessions (pg/statistics provider)))))
+  (sql! (str "UPDATE " (table "orders") " SET amount='NaN'::numeric WHERE id=1"))
+  (let [provider (source) q '[:find (sum ?amount) :in $p :where [$p ?e :order/amount ?amount]]]
+    (is (= :query-source/invalid (category #(d/q q provider))))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
+(deftest cross-table-joins-and-aggregates-share-the-acquired-snapshot
+  (sql! (str "CREATE TABLE " (table "customers") " (id bigint PRIMARY KEY, name text)"))
+  (sql! (str "INSERT INTO " (table "customers") " VALUES (7,'Ada'),(8,'Bo')"))
+  (let [customers (pg/accept-mapping (pg/discover *profile* [*schema* "customers"])
+                    {:source-instance-id unit/source-id :relation-id :sales/customers :identity-attribute :customer/id
+                     :attributes {:customer/name "name"}})
+        type (get-in customers [:identity :type])
+        orders (pg/accept-mapping (pg/discover *profile* [*schema* "orders"])
+                 {:source-instance-id unit/source-id :relation-id :sales/linked :identity-attribute :order/id
+                  :attributes {:order/customer {:column "owner" :reference {:type type :domain (get-in type [:parameters :identity-domain-id])}}}})
+        order-facts (vec (mapcat #(mapping/project-facts (mapping/compile-logical-mapping orders) [(:order/id %)]
+                                  {:order/customer (when (:order/owner %) (ref/entity-ref type [(:order/owner %)]))}) records))
+        customer-facts (vec (mapcat (fn [[id name]]
+                                     (mapping/project-facts (mapping/compile-logical-mapping customers) [id] {:customer/name name}))
+                                   [[7 "Ada"] [8 "Bo"]]))
+        where '[[$o ?order :order/id ?id] [$o ?order :order/customer ?customer]
+                [$c ?customer :customer/name ?name]]]
+    (doseq [find ['[?id ?customer ?name] '[?name (count ?order)]]]
+      (let [q {:find find :in '[$o $c] :where where}
+            orders (pg/source orders *profile*) customers (pg/source customers *profile*)
+            explained (d/explain {:run? true} q orders customers)]
+        (is (= (set (d/q q order-facts customer-facts)) (set (d/q q orders customers))))
+        (is (relational-plan? explained))
+        (is (= 1 (count (set (map :session-id (:sources explained))))))
+        (is (= 1 (count (:cursors explained))))
+        (is (<= (read-rows explained) 3))
+        (is (zero? (:live-sessions (pg/statistics orders))))))))
+
 (deftest fused-separate-and-eager-queries-have-the-same-complete-results
   (let [queries
         [(query '[?id ?title ?amount] '[[$p ?e :order/id ?id] [$p ?e :order/title ?title] [$p ?e :order/amount ?amount]])
@@ -314,6 +449,11 @@
       (finally (spi/-close-session! session)))
     (is (released? ctl))
     (is (zero? (:live-sessions (pg/statistics provider))))
+    (let [q '[:find (count ?id) . :in $p :where [$p _ :row/id ?id]]
+          explained (d/explain {:run? true} q provider)]
+      (is (= 100000 (d/q q provider)))
+      (is (relational-plan? explained))
+      (is (= 1 (read-rows explained))))
     (control/close! ctl)))
 
 (deftest fetch-pages-shrink-to-fit-the-shared-memory-budget

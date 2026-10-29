@@ -25,8 +25,8 @@ into one table access; cost-based ranking of external accesses is planned. You
 can inspect the plan and execution metrics with `d/explain`.
 
 **Status:** federation adapters are development snapshots (`0.1.0-SNAPSHOT`).
-Datalevin **1.2.8** introduced the query-source SPI. Use **1.2.9** for the
-PostgreSQL adapter's same-entity fusion and the current workspace.
+Datalevin **1.2.8** introduced the query-source SPI. PostgreSQL's current
+pushdown paths require the matching **1.2.10** build with relational SPI support.
 
 ## Data sources
 
@@ -45,14 +45,15 @@ supporting snapshot scans and entity/value lookups.
 
 PostgreSQL's current fit is selective enrichment: use native records or another
 source to identify a small set of rows, then retrieve their scalar attributes.
-Cross-table joins work in Datalevin. Broader reporting workloads still face
-significant gaps: date/decimal filtering has limited pushdown, and views,
+Eligible decimal/time filters, flat same-snapshot joins, and supported
+aggregates can execute in PostgreSQL. Broader reporting workloads still face
+significant gaps: arbitrary aggregates and scoped programs remain in core, and views,
 partitioned parents, RLS-protected tables, and several common column types are
 unsupported. Large scans can exhaust the default request budget. Candidate
 pruning preserves complete access coverage
 within the configured [planning bound](postgres/README.md#planning-bounds-and-follow-up-priorities).
-Fusion reduces repeated reads of one entity; it does not delegate a whole
-relational query to PostgreSQL.
+See the [delegation scope](postgres/README.md#filter-and-relational-delegation)
+for supported query shapes and fallback behavior.
 
 Parquet, dataset, and DataFusion adapters are planned and are not
 yet available in this repository. Contribution is welcome.
@@ -217,8 +218,8 @@ uses the saved identities and mappings without discovering a new schema.
   mappings sharing a source/profile use one read-only, repeatable-read
   transaction. There is no atomic snapshot across independent sources.
 - PostgreSQL batches up to 256 lookup keys per SQL cursor and fetches 128 rows
-  per request by default. SQL joins across entities, aggregates, and ordering are
-  not delegated. Check request and memory budgets for larger workloads; see
+  per request by default. Eligible same-snapshot joins and aggregates are
+  delegated; public ordering and result windows remain in core. Check request and memory budgets for larger workloads; see
   [bounds and lifecycle](postgres/README.md#bounds-and-lifecycle).
 - GitHub queries need an entity, key, or issue number to start a lookup. A query
   that only asks for every title or label cannot run against this adapter.
@@ -247,10 +248,10 @@ Each module has its own artifact at version `0.1.0-SNAPSHOT`:
 Use the modules your application needs. The local adapter takes a complete
 source descriptor and mapped facts; add core if you also need mapping APIs.
 Datalevin has Maven `provided` scope, so your application must supply the
-runtime. Explicitly depend on Datalevin **1.2.9** for PostgreSQL fusion. The
-provided versions in the manifests lag this requirement: core, local, file,
-and GitHub declare `1.2.5`, and PostgreSQL declares `1.2.8`. Those declarations
-do not supply the required runtime; the workspace uses the sibling checkout.
+runtime. PostgreSQL declares **1.2.10** and requires the matching development
+build with its relational SPI extension. Core, local, file, and GitHub still
+declare `1.2.5`; applications supply their Datalevin runtime explicitly. The
+workspace uses the sibling checkout.
 
 ## Development and further reading
 
