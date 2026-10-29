@@ -1,6 +1,6 @@
-# PostgreSQL tables
+# PostgreSQL relations
 
-`org.clojars.huahaiy/datalevin-federation-postgres` queries PostgreSQL tables
+`org.clojars.huahaiy/datalevin-federation-postgres` queries PostgreSQL tables and accepted views
 through ordinary `d/q` and `d/explain`, alongside native Datalevin data and other
 adapters. It supports table scans, entity and value lookups, and same-entity
 fusion: several scalar attributes of one entity can be read by one SQL cursor.
@@ -31,14 +31,14 @@ application schema or a larger reporting query:
 | --- | --- | --- |
 | Enrich large key sets | Batches accept at most 256 keys and 256 KiB of bindings; matches arrive in bounded fetch pages | Request and memory budgets apply across all batches. Network latency and nonunique value matches can still dominate. |
 | Filter orders by amount or events by time | Matching integral, `BigDecimal`, and `Instant` comparisons are pushed down; mixed representations and arbitrary functions stay local | Eligible ranges and equality reduce transfer. Bounds outside the supported timestamp parameter range and unsupported comparisons can still require a broad read. |
-| Read an existing application schema | No `date`, `timestamp without time zone`, `time`, `interval`, enums, domains, `char`, `citext`, arrays, or JSON/JSONB mapping | These fields cannot be exposed, although supported columns of the same table can still be selected. Collection-valued attributes are not implemented. |
-| Read reporting views, partitioned datasets, or tenant tables with RLS | Only ordinary tables with validated nondeferrable primary keys are accepted; queries use `ONLY` | Views, materialized views, partitioned parents, and RLS-enabled tables are rejected. Inheritance children are excluded. A unique index or a user-supplied key assertion cannot substitute for the primary key. |
+| Read an existing application schema | Temporal types and enums are supported; domains, `char`, `citext`, arrays, and JSON/JSONB remain unmapped | Supported columns can be selected independently. Collection-valued attributes are not implemented. |
+| Read reporting views, partitioned datasets, or tenant tables with RLS | Views need declared keys; partitioned parents need primary keys; RLS needs an enforced authorization profile | These relations capture all mapped columns at acquisition under shared row, request, and retention limits. Subsequent accesses use the captured rows; SQL predicate, join, and aggregate delegation is unavailable for these captures. |
 | Aggregate, sort, or join large PostgreSQL relations | Relational delegation covers flat single-snapshot conjunctions and selected aggregates; SQL ordering/limit, arbitrary aggregates, and scoped programs are not delegated | Eligible counts transfer one row per group. Unsupported shapes retain core execution. Backend work remains subject to statement/query timeouts; there is no index discovery or cost-based access choice. |
 | Read large text or binary fields | The default selected-row cap is 16 KiB, measured using SQL text representations | Oversized values fail the query. Referenced fields are fetched even when their value is `_` or not projected, so an existence-only query can hit this limit too. |
-| Discover relationships or restrict a saved mapping to a tenant | Discovery covers one named relation's columns and primary key; foreign keys and restricted-scope mappings are absent | Define references manually and put ordinary filters in the query. Query filters are not an authorization boundary. |
+| Discover relationships | Discovery covers one named relation, its columns, key, enum labels, and applicable view/security contracts; foreign-key discovery is absent | Define references manually. Use PostgreSQL policies and explicit runtime role/settings for authorization; query filters do not establish an authorization boundary. |
 
 Supported columns do not require mapping every physical field. Omitting a
-JSONB or unsupported temporal column is useful when the query does not need
+JSONB or unsupported domain column is useful when the query does not need
 it; it does not make that column queryable. Likewise, a value-lookup alternative
 does not guarantee a PostgreSQL index exists for that column.
 
@@ -67,9 +67,9 @@ The highest-value follow-ups for ordinary federation are:
 
 1. Measure batched lookups and scans with realistic network latency and
    default query budgets.
-2. Add further temporal conversions and common enum/domain mappings.
-3. Extend relation support with proven keys and read guarantees for partitioned
-   tables and views; define authorization behavior before supporting RLS.
+2. Add domain mappings and further safe temporal/enum SQL delegation.
+3. Measure captured relations and investigate bounded alternatives for larger
+   views, partitioned parents, and RLS datasets.
 4. Add foreign-key discovery, prune unneeded payload columns while retaining
    existence checks, and then evaluate further SQL delegation with the core SPI.
 
@@ -146,8 +146,10 @@ containing `:triage/order-id` and `:triage/priority` long attributes:
 
 ## Identity, types, and absence
 
-Acceptance requires an ordinary PostgreSQL table with a validated,
-nondeferrable primary key. Composite keys are supported. Identity is nominal:
+Ordinary tables and partitioned parents require a validated, nondeferrable
+primary key. Views and materialized views require explicit `:key-columns`,
+validated for uniqueness and non-null values at every acquisition. Composite
+keys are supported. Identity is nominal:
 the source UUID, schema/table names, and `:identity-version` (default `0`)
 identify its domain. The identity attribute returns a scalar for one key column
 or a tuple in primary-key order for a composite key. Entity positions contain
@@ -168,10 +170,19 @@ catalog OID; it never silently accepts a replacement.
 | `numeric` | `:bigdec`, preserving decimal scale |
 | `real`, `double precision` | `:float`, `:double` |
 | finite `timestamptz` | `:data` / `java.time.Instant`, preserving microseconds |
+| finite `date` | `:data` / `java.time.LocalDate` |
+| finite `timestamp without time zone` | `:data` / `java.time.LocalDateTime` |
+| `time without time zone` | `:data` / `java.time.LocalTime` |
+| `time with time zone` | `:data` / `java.time.OffsetTime`, retaining the stored offset |
+| finite `interval` | `:data` / `{:months long :days long :microseconds long}` |
+| enum | `:string` / exact catalog label; enum type OID, namespace, name, and ordered labels are rechecked |
 
-Key columns must be integer, text/varchar, or UUID types. Unsupported columns
-remain visible in discovery but cannot be mapped. Numeric and timestamp
-infinities that lack an exact mapped representation fail execution. Each
+Key columns may be integer, text/varchar, UUID, enum, or the listed date/time
+representations. Numeric and interval keys remain unsupported. Unsupported
+columns remain visible in discovery but cannot be mapped. Numeric, date,
+timestamp, and interval infinities and SQL `24:00` fail execution when decoded.
+Intervals retain calendar months and days separately from elapsed microseconds;
+they are never approximated as a Java `Duration`. Each
 mapped attribute is scalar (`:one`); SQL null contributes no fact, including
 when a query uses `_` or omits that value from its results.
 An ordinary conjunction over a nullable attribute therefore excludes rows
@@ -207,10 +218,74 @@ byte content. Eligible integral, decimal, and temporal comparisons can be
 pushed down. Unsupported predicates and scoped programs run in Datalevin. Fusion preserves
 existence guards, repeated variables, and the identities needed by `:with`.
 
-This first adapter reads `ONLY` the accepted table, excluding inheritance
-children. Views, partitioned parents, row-level security, arrays, JSON mapping,
-arbitrary SQL and collection expansion are
-outside its supported scope.
+Ordinary tables use `ONLY`, excluding inheritance children. Partitioned parents
+include all attached partitions. Arrays, JSON mapping, arbitrary SQL declarations,
+and collection expansion remain outside the supported scope.
+
+## Views, partitions, and row-level security
+
+Accept a view or materialized view with an explicit business key:
+
+```clojure
+(postgres/accept-mapping
+  (postgres/discover profile ["reporting" "orders"])
+  {:source-instance-id source-uuid
+   :relation-id :reports/orders :identity-attribute :report/id
+   :key-columns ["tenant_id" "order_id"]
+   :attributes {:report/total "total"}})
+```
+
+The declaration promises that those keys identify the same entities over time.
+Acquisition checks every captured row for null or duplicate keys, even when the
+query only needs a selective subset. A declared view key is not inferred from a
+unique index. Update `:identity-version` when a view replacement changes entity
+meaning. Discovery fingerprints view definitions, owners, options, nested
+relation/policy definitions, and catalog-visible function dependencies; drift
+requires explicit rediscovery and acceptance. Dependencies hidden inside dynamic
+SQL or function bodies remain the profile owner's compatibility responsibility.
+Materialized views must be populated.
+
+Views, materialized views, partitioned parents, and RLS tables capture the entire
+accepted projection once per session, before planning fact accesses. Capture
+uses bounded server-cursor pages, the selected-row cap, and shared request,
+retained-memory, and deadline budgets. No session is returned after a partial
+capture or failed key check. Capture freezes volatile view expressions and
+policy results for identical replay. It can transfer and retain substantially
+more data than a selective query returns. Lookups scan the capture locally;
+predicates, cross-entity joins, and aggregates over these captures run in core.
+Closing the session drops captured rows and releases reservations.
+
+For RLS, discover and reopen with the same authorization context:
+
+```clojure
+(def tenant-profile
+  (assoc profile :role "application_reader"
+                 :session-settings {"app.tenant_id" "tenant-a"}))
+```
+
+`:role` uses transaction-local `SET ROLE`; `:session-settings` applies up to 32
+custom dotted settings with string values, also transaction-local. Identifier
+and value quoting prevents them from becoming SQL. `row_security` is explicitly
+on. RLS acceptance requires `row_security_active` under the effective role;
+superuser, `BYPASSRLS`, and owner bypass are rejected. Owners using `FORCE ROW
+LEVEL SECURITY` can be accepted when enforcement is active. Empty policies can
+produce an empty accepted relation.
+
+Persisted security scopes contain role, membership/context identifiers, and
+setting fingerprints, without setting values or credentials. The scope also
+participates in nominal entity identity, so different tenant scopes cannot
+alias tenant-local view keys. A role, membership, or configured-setting mismatch
+fails acquisition as unauthorized; policy/definition drift is stale metadata.
+Keep every policy-relevant custom setting explicit in `:session-settings` and
+use a compute-context ID only for compatible database, pool, role, settings, and
+function behavior. Arbitrary policy functions can depend on external state that
+catalog discovery cannot infer.
+
+View security follows PostgreSQL's declared behavior: ordinary views use owner
+permissions for base relations, while `security_invoker` views use the caller.
+An owner view over an RLS table can therefore expose rows the caller cannot read
+directly. The adapter does not reinterpret that database authorization contract.
+Both kinds capture under the configured profile and retain a restricted scope.
 
 ## Filter and relational delegation
 
@@ -218,7 +293,10 @@ Ordinary binary `=`, `not=`, `<`, `<=`, `>`, and `>=` predicates are exported by
 core only within their conjunction and source-variable scope. Captured scalar
 `:in` bounds may become constants; potential outputs from another operator do
 not become constants. The adapter accepts matching integral/decimal bounds
-and `Instant` bounds from years 0001 through 9999. Other representations remain
+and `Instant`, `LocalDate`, and `LocalDateTime` bounds from years 0001 through
+9999, plus `LocalTime` comparisons. `OffsetTime` equality uses a SQL superset
+with local offset-aware rechecking; its ordering and interval comparisons stay
+in core. Other representations remain
 residual predicates. Temporal cutoffs retain nanosecond comparisons against
 PostgreSQL's microsecond values by adjusting the bound and strictness before
 binding. No rounding through `java.util.Date` occurs. Pattern and batched-key
@@ -265,6 +343,8 @@ bounded, and a connection arriving after cancellation is closed.
 | `:max-row-bytes` | `16384` | Maximum combined byte size of selected physical values rendered as SQL text |
 | `:fusion?` | `true` | Set false to compare separate EAV accesses |
 | `:relational?` | `true` | Allow eligible whole-conjunction joins and aggregation |
+| `:role` | unset | Transaction-local PostgreSQL role |
+| `:session-settings` | `{}` | Explicit policy/view context: custom dotted GUC names mapped to strings |
 
 Oversized rows produce an error marker before their values cross the network;
 they are never silently truncated or omitted. Reserved workspace includes the

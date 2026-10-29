@@ -13,7 +13,7 @@
            [java.math BigDecimal BigInteger]
            [java.nio ByteBuffer]
            [java.nio.charset CodingErrorAction StandardCharsets]
-           [java.time Duration Instant Period]
+           [java.time Duration Instant LocalDate LocalDateTime LocalTime OffsetTime Period ZoneOffset]
            [java.util Arrays Date UUID]
            [datalevin.utl QueryKey]))
 
@@ -214,6 +214,14 @@
                              (.writeInt out (.getNano ^Duration x)))
     (instance? Period x) (do (.writeByte out 27) (.writeInt out (.getYears ^Period x))
                            (.writeInt out (.getMonths ^Period x)) (.writeInt out (.getDays ^Period x)))
+    (instance? LocalDate x) (do (.writeByte out 28) (.writeLong out (.toEpochDay ^LocalDate x)))
+    (instance? LocalTime x) (do (.writeByte out 29) (.writeLong out (.toNanoOfDay ^LocalTime x)))
+    (instance? LocalDateTime x)
+    (do (.writeByte out 30) (.writeLong out (.toEpochDay (.toLocalDate ^LocalDateTime x)))
+        (.writeLong out (.toNanoOfDay (.toLocalTime ^LocalDateTime x))))
+    (instance? OffsetTime x)
+    (do (.writeByte out 31) (.writeLong out (.toNanoOfDay (.toLocalTime ^OffsetTime x)))
+        (.writeInt out (.getTotalSeconds (.getOffset ^OffsetTime x))))
     :else (invalid!))
   (ensure! (<= (.size out) (get-in state [:limits :max-bytes]))))
 
@@ -281,6 +289,10 @@
     25 (Instant/ofEpochSecond (.readLong in) (.readInt in))
     26 (Duration/ofSeconds (.readLong in) (.readInt in))
     27 (Period/of (.readInt in) (.readInt in) (.readInt in))
+    28 (LocalDate/ofEpochDay (.readLong in))
+    29 (LocalTime/ofNanoOfDay (.readLong in))
+    30 (LocalDateTime/of (LocalDate/ofEpochDay (.readLong in)) (LocalTime/ofNanoOfDay (.readLong in)))
+    31 (OffsetTime/of (LocalTime/ofNanoOfDay (.readLong in)) (ZoneOffset/ofTotalSeconds (.readInt in)))
     (invalid!)))
 
 (deftype EntityRef [descriptor type-wire key-wire ^long retained ^long nodes ^long depth]

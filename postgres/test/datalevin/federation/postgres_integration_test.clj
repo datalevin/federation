@@ -761,3 +761,201 @@
       (finally (spi/-close-cursor! cursor) (spi/-close-session! session)))
     (is (released? ctl))
     (control/close! ctl)))
+
+(defn accept-relation [name attrs & [options profile]]
+  (pg/accept-mapping (pg/discover (or profile *profile*) [*schema* name])
+    (merge {:source-instance-id unit/source-id :relation-id :test/schema
+            :identity-attribute :row/id :attributes attrs} options)))
+
+(deftest temporal-columns-preserve-calendar-offset-and-interval-fields
+  (sql! (str "CREATE TABLE " (table "calendar")
+             " (id date PRIMARY KEY, stamp timestamp, clock time, zoned timetz, span interval)"))
+  (sql! (str "INSERT INTO " (table "calendar") " VALUES "
+             "('2024-02-29','1969-12-31 23:59:59.123456','12:34:56.123456','12:34:56.123456+05:45',"
+             "interval '1 year -2 months 3 days -04:05:06.123456'),"
+             "('2024-03-01',NULL,NULL,NULL,NULL)"))
+  (let [accepted (accept-relation "calendar" {:row/stamp "stamp" :row/clock "clock" :row/zoned "zoned" :row/span "span"})
+        provider (pg/source accepted *profile*)
+        q '[:find ?id ?stamp ?clock ?zoned ?span :in $p :where
+            [$p ?e :row/id ?id] [$p ?e :row/stamp ?stamp] [$p ?e :row/clock ?clock]
+            [$p ?e :row/zoned ?zoned] [$p ?e :row/span ?span]]
+        id (java.time.LocalDate/parse "2024-02-29")
+        entity (ref/entity-ref (get-in accepted [:identity :type]) [id])]
+    (is (= #{[id (java.time.LocalDateTime/parse "1969-12-31T23:59:59.123456")
+              (java.time.LocalTime/parse "12:34:56.123456") (java.time.OffsetTime/parse "12:34:56.123456+05:45")
+              {:months 10 :days 3 :microseconds -14706123456}]}
+           (set (d/q q provider))))
+    (is (= [id] (ref/key-tuple (ref/decode (ref/encode entity)))))
+    (is (= #{[id]} (set (d/q '[:find ?id :in $p ?e :where [$p ?e :row/id ?id]] provider entity))))
+    (is (= #{[id]} (set (d/q '[:find ?id :in $p ?bound :where [$p ?e :row/id ?id] [(< ?id ?bound)]]
+                              provider (java.time.LocalDate/parse "2024-03-01")))))
+    (is (= #{[id]} (set (d/q '[:find ?id :in $p ?bound :where [$p ?e :row/id ?id]
+                              [$p ?e :row/stamp ?v] [(< ?v ?bound)]]
+                              provider (java.time.LocalDateTime/parse "1969-12-31T23:59:59.123456001")))))
+    (is (empty? (d/q '[:find ?id :in $p [?z ...] :where [$p ?e :row/id ?id] [$p ?e :row/zoned ?z]]
+                       provider [(java.time.OffsetTime/parse "12:34:56+18:00")])))
+    (is (= accepted (read-string (pr-str accepted))))))
+
+(deftest temporal-sentinels-fail-without-silent-conversion
+  (doseq [[type literal] [["date" "infinity"] ["timestamp" "-infinity"] ["time" "24:00:00"] ["timetz" "24:00:00+00"]]]
+    (sql! (str "CREATE TABLE " (table "sentinel") " (id bigint PRIMARY KEY, v " type ")"))
+    (try
+      (sql! (str "INSERT INTO " (table "sentinel") " VALUES (1,'" literal "')"))
+      (let [provider (pg/source (accept-relation "sentinel" {:row/value "v"}) *profile*)]
+        (is (= :query-source/invalid (category #(d/q '[:find ?v :in $p :where [$p _ :row/value ?v]] provider))))
+        (is (zero? (:live-sessions (pg/statistics provider)))))
+      (finally (sql! (str "DROP TABLE " (table "sentinel")))))))
+
+(deftest enum-labels-and-batched-lookups-use-catalog-types
+  ;; A user enum may have the same name as a built-in type.
+  (sql! (str "CREATE TYPE " (table "int8") " AS ENUM ('paid','βeta','x''quote',E'control\\001label')"))
+  (sql! (str "CREATE TABLE " (table "enum_rows") " (id " (table "int8") " PRIMARY KEY, v " (table "int8") ")"))
+  (sql! (str "INSERT INTO " (table "enum_rows") " VALUES ('paid','βeta'),('x''quote','paid')"))
+  (let [accepted (accept-relation "enum_rows" {:row/value "v"}) provider (pg/source accepted *profile*)
+        q '[:find ?id ?v :in $p :where [$p ?e :row/id ?id] [$p ?e :row/value ?v]]]
+    (is (= ["paid" "βeta" "x'quote" "control\u0001label"]
+           (get-in accepted [:requirements :columns "v" :enum :labels])))
+    (is (= #{["paid" "βeta"] ["x'quote" "paid"]} (set (d/q q provider))))
+    (is (= #{["paid"]} (set (d/q '[:find ?id :in $p [?v ...] :where
+                                   [$p ?e :row/id ?id] [$p ?e :row/value ?v]] provider ["βeta" "missing"]))))
+    (is (= #{["paid"]} (set (d/q '[:find ?id :in $p :where [$p ?e :row/id ?id] [$p ?e :row/value "βeta"]] provider))))
+    (sql! (str "ALTER TYPE " (table "int8") " ADD VALUE 'new'"))
+    (is (= :query-source/stale-definition (category #(d/q q provider))))))
+
+(deftest partitioned-parent-reads-all-children-with-composite-temporal-identity
+  (sql! (str "CREATE TABLE " (table "events") " (day date, id bigint, title text, PRIMARY KEY(day,id)) PARTITION BY RANGE(day)"))
+  (doseq [[name start end] [["early" "2024-01-01" "2025-01-01"] ["late" "2025-01-01" "2026-01-01"]]]
+    (sql! (str "CREATE TABLE " (table name) " PARTITION OF " (table "events")
+               " FOR VALUES FROM ('" start "') TO ('" end "')")))
+  (sql! (str "INSERT INTO " (table "events") " VALUES ('2024-02-29',1,'early'),('2025-02-28',1,'late')"))
+  (let [provider (pg/source (accept-relation "events" {:row/title "title"}) *profile*)
+        q '[:find ?id ?title :in $p :where [$p ?e :row/id ?id] [$p ?e :row/title ?title]]]
+    (is (= #{[[(java.time.LocalDate/parse "2024-02-29") 1] "early"]
+             [[(java.time.LocalDate/parse "2025-02-28") 1] "late"]} (set (d/q q provider))))
+    (is (not (relational-plan? (d/explain {:run? true} q provider)))))
+  (sql! (str "CREATE TABLE " (table "no_key") " (id bigint) PARTITION BY RANGE(id)"))
+  (is (= :query-source/invalid (category #(accept-relation "no_key" {})))))
+
+(defn replay-captured [provider mutate]
+  (let [ctl (control/create) request (request provider ctl)
+        session (spi/-open-session provider request)
+        clauses [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :row/value] [:var ?v]]}]]
+    (try
+      (let [alt (first (alternatives provider session request clauses []))
+            read! (fn [] (let [cursor (open provider session request alt nil)]
+                           (try (:rows (consume cursor ctl alt false))
+                                (finally (spi/-close-cursor! cursor)))))
+            before (read!)]
+        (mutate)
+        (is (= before (read!)))
+        (is (seq before)))
+      (finally (spi/-close-session! session)))
+    (is (released? ctl))
+    (control/close! ctl)))
+
+(deftest views-validate-declared-keys-and-freeze-volatile-results
+  (sql! (str "CREATE VIEW " (table "report") " AS SELECT id, random() AS v FROM " (table "orders")))
+  (is (= :query-source/invalid (category #(accept-relation "report" {:row/value "v"}))))
+  (let [accepted (accept-relation "report" {:row/value "v"} {:key-columns ["id"]})
+        provider (pg/source accepted *profile*)]
+    (is (= accepted (read-string (pr-str accepted))))
+    (replay-captured provider #(sql! (str "INSERT INTO " (table "orders") " (id) VALUES (5)")))
+    (sql! (str "CREATE OR REPLACE VIEW " (table "report") " AS SELECT id, random()+1 AS v FROM " (table "orders")))
+    (is (= :query-source/stale-definition
+           (category #(d/q '[:find ?v :in $p :where [$p _ :row/value ?v]] provider)))))
+  (doseq [[name select] [["duplicate_keys" "SELECT 1::bigint AS id, 'v'::text AS v FROM generate_series(1,2)"]
+                         ["null_keys" "SELECT NULL::bigint AS id, 'v'::text AS v"]]]
+    (sql! (str "CREATE VIEW " (table name) " AS " select))
+    (let [provider (pg/source (accept-relation name {:row/value "v"} {:key-columns ["id"]}) *profile*)]
+      (is (= :query-source/invalid (category #(d/q '[:find ?v :in $p :where [$p _ :row/value ?v]] provider))))
+      (is (zero? (:live-sessions (pg/statistics provider))))))
+  (sql! (str "CREATE MATERIALIZED VIEW " (table "materialized") " AS SELECT id, title AS v FROM " (table "orders")))
+  (is (= 3 (count (d/q '[:find ?v :in $p :where [$p _ :row/value ?v]]
+                       (pg/source (accept-relation "materialized" {:row/value "v"} {:key-columns ["id"]}) *profile*))))))
+
+(deftest captured-relations-respect-row-and-retention-limits
+  (sql! (str "CREATE VIEW " (table "large_report") " AS SELECT i::bigint AS id, repeat('x',1000) AS v FROM generate_series(1,5000) i"))
+  (let [accepted (accept-relation "large_report" {:row/value "v"} {:key-columns ["id"]})]
+    (doseq [options [{:max-row-bytes 100} {}]]
+      (let [provider (pg/source accepted (merge *profile* options))
+            ctl (control/create {:limits {:retained-bytes (* 16 1024 1024)}})]
+        (is (= :query-source/limit (category #(spi/-open-session provider (request provider ctl)))))
+        (is (released? ctl))
+        (is (zero? (:live-sessions (pg/statistics provider))))
+        (control/close! ctl)))))
+
+(deftest rls-enforces-role-settings-and-snapshot-scope
+  (let [role (str "federation_rls_" (.replace (str (random-uuid)) "-" ""))
+        quoted (jdbc/identifier role)
+        profile (assoc *profile* :role role :session-settings {"app.tenant" "a"})
+        q '[:find ?v :in $p :where [$p _ :row/value ?v]]]
+    (sql! (str "CREATE ROLE " quoted " NOLOGIN"))
+    (try
+      (sql! (str "CREATE TABLE " (table "tenants") " (id bigint PRIMARY KEY, tenant text, v text)"))
+      (sql! (str "INSERT INTO " (table "tenants") " VALUES (1,'a','A'),(2,'b','B')"))
+      (sql! (str "ALTER TABLE " (table "tenants") " ENABLE ROW LEVEL SECURITY"))
+      (sql! (str "CREATE POLICY tenant_read ON " (table "tenants") " USING (tenant=current_setting('app.tenant'))"))
+      (sql! (str "GRANT USAGE ON SCHEMA " (jdbc/identifier *schema*) " TO " quoted))
+      (sql! (str "GRANT SELECT ON " (table "tenants") " TO " quoted))
+      (is (= :query-source/invalid (category #(accept-relation "tenants" {:row/value "v"}))))
+      (let [accepted (accept-relation "tenants" {:row/value "v"} nil profile)
+            provider (pg/source accepted profile)
+            other-profile (assoc profile :session-settings {"app.tenant" "b"})
+            other (accept-relation "tenants" {:row/value "v"} nil other-profile)]
+        (is (= #{["A"]} (set (d/q q provider))))
+        (doseq [[name options expected] [["owner_view" "" #{["A"] ["B"]}]
+                                          ["invoker_view" " WITH (security_invoker=true)" #{["A"]}]]]
+          (sql! (str "CREATE VIEW " (table name) options " AS SELECT id,v FROM " (table "tenants")))
+          (sql! (str "GRANT SELECT ON " (table name) " TO " quoted))
+          (let [view (accept-relation name {:row/value "v"} {:key-columns ["id"]} profile)]
+            (is (= expected (set (d/q q (pg/source view profile)))))))
+        (let [literal-profile (assoc profile :session-settings {"app.tenant" "a'; RESET ROLE; --"})
+              literal (accept-relation "tenants" {:row/value "v"} nil literal-profile)]
+          (is (empty? (d/q q (pg/source literal literal-profile)))))
+        (is (= #{["B"]} (set (d/q q (pg/source other other-profile)))))
+        (is (not= (get-in accepted [:identity :type]) (get-in other [:identity :type])))
+        (is (not (.contains (pr-str accepted) "\"app.tenant\" \"a\"")))
+        (is (= :query-source/unauthorized (category #(d/q q (pg/source accepted other-profile)))))
+        (is (= :query-source/unauthorized (category #(d/q q (pg/source accepted *profile*)))))
+        (replay-captured provider #(sql! (str "UPDATE " (table "tenants") " SET v='changed' WHERE tenant='a'")))
+        (sql! (str "ALTER POLICY tenant_read ON " (table "tenants") " USING (false)"))
+        (is (= :query-source/stale-definition (category #(d/q q provider)))))
+      (let [accepted (accept-relation "tenants" {:row/value "v"} nil profile)]
+        (is (empty? (d/q q (pg/source accepted profile)))))
+      (finally
+        (sql! (str "DROP OWNED BY " quoted))
+        (sql! (str "DROP ROLE " quoted))))))
+
+(deftest nested-view-function-drift-is-detected
+  (sql! (str "CREATE FUNCTION " (table "view_value") "() RETURNS text LANGUAGE sql AS $$ SELECT 'before'::text $$"))
+  (sql! (str "CREATE VIEW " (table "inner_view") " AS SELECT 1::bigint AS id, " (table "view_value") "() AS v"))
+  (sql! (str "CREATE VIEW " (table "outer_view") " AS SELECT * FROM " (table "inner_view")))
+  (let [provider (pg/source (accept-relation "outer_view" {:row/value "v"} {:key-columns ["id"]}) *profile*)
+        q '[:find ?v :in $p :where [$p _ :row/value ?v]]]
+    (is (= #{["before"]} (set (d/q q provider))))
+    (sql! (str "CREATE OR REPLACE FUNCTION " (table "view_value") "() RETURNS text LANGUAGE sql AS $$ SELECT 'after'::text $$"))
+    (is (= :query-source/stale-definition (category #(d/q q provider))))))
+
+(deftest captured-lookups-preserve-binding-ids-without-further-sql
+  (sql! (str "CREATE VIEW " (table "lookup_view") " AS SELECT id,title AS v FROM " (table "orders")))
+  (let [provider (pg/source (accept-relation "lookup_view" {:row/value "v"} {:key-columns ["id"]}) *profile*)
+        ctl (control/create) request (request provider ctl)
+        session (spi/-open-session provider request)
+        clauses [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :row/value] [:var ?v]]}]]
+    (try
+      (let [alt (first (filter #(= :value-lookup (get-in % [:access :kind]))
+                               (alternatives provider session request clauses [{:variable '?v :type :string :nullable? false}])))
+            requests (:external-requests (control/usage ctl))
+            cursor (open provider session request alt [{:binding-id 11 :values ["Alpha"]}
+                                                       {:binding-id 12 :values ["missing"]}
+                                                       {:binding-id 13 :values ["βeta"]}])]
+        (try
+          (let [result (consume cursor ctl alt true)]
+            (is (= [11 13] (:ids result)))
+            (is (= ["Alpha" "βeta"] (mapv second (:rows result))))
+            (is (= requests (:external-requests (control/usage ctl)))))
+          (finally (spi/-close-cursor! cursor))))
+      (finally (spi/-close-session! session)))
+    (is (every? #(nil? @(:snapshot %)) (vals (:views session))))
+    (is (released? ctl))
+    (control/close! ctl)))

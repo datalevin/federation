@@ -1,5 +1,5 @@
 (ns datalevin.federation.postgres
-  "Read-only PostgreSQL tables with accepted primary keys and snapshot sessions."
+  "Read-only PostgreSQL relations with validated keys and replayable snapshot sessions."
   (:require [datalevin.federation.mapping :as mapping]
             [datalevin.federation.postgres.jdbc :as jdbc :refer [ensure! fail!]]
             [datalevin.federation.postgres.mapping :as pm]
@@ -7,14 +7,16 @@
             [datalevin.federation.postgres.relational :as relational]
             [datalevin.query.source :as spi]
             [datalevin.query.source.value :as value])
-  (:import [java.sql Connection ResultSet SQLException]
+  (:import [datalevin.utl QueryKey$KeySet]
+           [java.sql Connection ResultSet SQLException]
            [java.util UUID]))
 
 (def accept-mapping
   "Accept discovery metadata, a source UUID, relation/identity attribute IDs,
   and an attribute map. Values are column names or {:columns [...] :reference
-  {:domain ... :type ...}}. Only a validated nondeferrable primary key establishes
-  durable identity. This function performs no I/O."
+  {:domain ... :type ...}}. Tables require a validated nondeferrable primary key;
+  views require declared :key-columns, checked against each captured snapshot.
+  This function performs no I/O."
   pm/accept)
 
 (defn discover
@@ -24,7 +26,9 @@
   [profile table]
   (let [context {:profile (jdbc/profile! profile) :cancelled (atom false)}]
     (with-open [conn (jdbc/connect! context)]
-      (jdbc/catalog! (assoc context :connection conn) table))))
+      (let [context (assoc context :connection conn)]
+        (try (jdbc/begin! context) (jdbc/catalog! context table)
+             (finally (.rollback ^Connection conn)))))))
 
 (def ^:private common [:control :query-id :spi-version :features :authorization :consistency :limits])
 (def ^:private request-constraints {:max-concurrent-requests 1 :rate-limit nil})
@@ -65,7 +69,7 @@
     (jdbc/check! context)
     (when (:closed? @state) (fail! :query-source/invalid :fetch))
     (let [inputs @inputs
-          {:keys [pending remaining portal more? input-index input-start columns]} @state]
+          {:keys [pending remaining portal more? input-index input-start columns snapshot?]} @state]
       (cond
         pending pending
         (seq remaining)
@@ -73,6 +77,7 @@
               input (when inputs (nth inputs (+ input-start ordinal)))
               bindings (merge (:bindings candidate)
                               (zipmap (map :variable (:requires candidate)) (:values input)))]
+          (when snapshot? (swap! metrics update :read-rows inc))
           (swap! state assoc :remaining (next remaining))
           (if-let [result (if (:relational? candidate) row (plan/match-row accepted candidate bindings row))]
             (let [pending {:row result :id (:binding-id input)}]
@@ -150,15 +155,21 @@
         (swap! session-state update :cursors disj this)))
     nil))
 
-(defn- cursor! [session accepted candidate bindings]
+(defn- cursor! [session accepted candidate bindings snapshot]
   (let [{:keys [context state request]} session
-        [token fetch-size] (reserve-cursor! (:control request) accepted candidate bindings (:profile context))]
+        [token fetch-size] (reserve-cursor! (:control request) accepted candidate bindings
+                                            (cond-> (:profile context) snapshot (assoc :fetch-size 1)))]
     (try
       (let [metrics (atom {:batches 0 :rows 0 :charged-bytes 0 :read-rows 0 :read-bytes nil
                            :external-requests 0 :elapsed-ns 0})
-            cursor (->Cursor accepted candidate (atom (when bindings (value/owned-copy bindings)))
+            owned-inputs (when bindings (value/owned-copy bindings))
+            cursor (->Cursor accepted candidate (atom owned-inputs)
                              (-> context (assoc :metrics metrics) (assoc-in [:profile :fetch-size] fetch-size))
-                             (atom {:input-index 0}) metrics token state)]
+                             (atom (if snapshot
+                                     {:snapshot? true :input-start 0 :input-index (if owned-inputs (count owned-inputs) 1)
+                                      :remaining (mapcat (fn [i] (map #(vector i %) @snapshot))
+                                                         (range (if owned-inputs (count owned-inputs) 1)))}
+                                     {:input-index 0})) metrics token state)]
         (swap! state update :cursors conj cursor)
         cursor)
       (catch Throwable e (spi/release! token) (throw e)))))
@@ -198,7 +209,7 @@
                        (min 262144 (get-in request [:limits :binding-bytes])))
                 (fail! :query-source/limit :open)))
           (ensure! (not (contains? open :bindings)) :open))
-        (cursor! this (:accepted view) candidate (when dependent? (:bindings open))))))
+        (cursor! this (:accepted view) candidate (when dependent? (:bindings open)) (:snapshot view)))))
   (-cancel-session! [_ _]
     (reset! (:cancelled context) true)
     (jdbc/abort! (:connection context))
@@ -211,6 +222,7 @@
         (try (.rollback ^Connection (:connection context)) (catch Exception _ nil))
         (jdbc/close! (:connection context))
         (jdbc/close! (:limiter context))
+        (doseq [view (vals views)] (when-let [snapshot (:snapshot view)] (reset! snapshot nil)))
         (run! spi/release! @reservations)
         (reset! reservations [])
         (reset! state {:closed? true})
@@ -237,12 +249,38 @@
                       (= (:scope-id open) (get-in descriptor [:scope :id])) (= 0 (:region-id open))
                       compiled (= (:columns open) (:columns compiled))) :open)
         (cursor! this (accepted (:symbol (first sources)))
-                 {:relational? true :query compiled :columns (:columns compiled) :requires [] :bindings {}} nil)))))
+                 {:relational? true :query compiled :columns (:columns compiled) :requires [] :bindings {}} nil nil)))))
 
 (defn- descriptor [accepted profile]
   (assoc (mapping/source-info accepted (:compute-context-id profile))
          :read-capabilities #{:snapshot}
          ::accepted accepted))
+
+(defn- capture!
+  "Capture one bounded owned relation before publishing a replayable session."
+  [context accepted reservations]
+  (let [query (plan/snapshot-sql accepted (get-in context [:profile :max-row-bytes]))
+        [workspace n] (reserve-cursor! (:control context) accepted {:snapshot? true} nil (:profile context))
+        portal (str "dtlv_" (.replace (str (UUID/randomUUID)) "-" ""))
+        state (atom {}) seen (QueryKey$KeySet.)]
+    (try
+      (jdbc/execute! context :acquisition (str "DECLARE " portal " NO SCROLL CURSOR FOR " (:sql query)) [])
+      (reset! state {:portal portal})
+      (loop [out []]
+        (let [rows (jdbc/query! context :acquisition (str "FETCH FORWARD " n " FROM " portal) []
+                                #(plan/read-row accepted (:columns query) %))
+              out (reduce (fn [out row]
+                            (jdbc/check! context)
+                            (let [key (mapv row (pm/key-columns accepted))]
+                              (when-not (every? some? key) (fail! :query-source/invalid :identity))
+                              ;; Reserve both retained rows and duplicate-key tracking before ownership.
+                              (let [token (spi/reserve! (:control context)
+                                            {:retained-bytes (+ 512 (* 4 (value/value-charge [row key])))})]
+                                (swap! reservations conj token)
+                                (when-not (.add seen key) (fail! :query-source/invalid :identity))
+                                (conj out (value/owned-copy row))))) out rows)]
+          (if (= n (count rows)) (recur out) out)))
+      (finally (close-portal! context state) (spi/release! workspace)))))
 
 (defn- acquire [source request]
   (let [{:keys [profile stats]} source
@@ -264,29 +302,30 @@
                              (ensure! (and (= d (descriptor accepted profile))
                                            (= (:source-instance-id d) (get-in source [:descriptor :source-instance-id])))
                                       :acquisition)
-                             [(:definition-fingerprint d) {:descriptor d :accepted accepted}])))
+                             [(:definition-fingerprint d) (cond-> {:descriptor d :accepted accepted}
+                                                         (pm/spooled? accepted) (assoc :snapshot (atom nil)))])))
                     (:source-descriptors request))
             context {:profile profile :control ctl :cancelled cancelled :limiter @limiter :metrics stats}
             conn (jdbc/request! context :acquisition #(let [conn (jdbc/connect! context)]
                                                        (reset! connection conn) conn))
             context (assoc context :connection conn)]
         (jdbc/check! context)
-        (ensure! (.getAutoCommit ^Connection conn) :acquisition)
-        (.setReadOnly ^Connection conn true)
-        (.setAutoCommit ^Connection conn false)
-        (jdbc/execute! context :acquisition "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY" [])
-        ;; SET/LOCK utility statements do not pin the data snapshot. Lock every
-        ;; accepted relation before the first catalog SELECT, so a concurrent
-        ;; DDL commit cannot hide behind an earlier repeatable-read snapshot.
-        (jdbc/execute! context :acquisition "SET LOCAL search_path = pg_catalog" [])
-        (jdbc/execute! context :acquisition
-                       (str "SET LOCAL statement_timeout = " (:statement-timeout-ms profile)) [])
+        (jdbc/begin! context)
+        ;; Lock every relation before the first catalog SELECT pins the snapshot.
         (doseq [view (sort-by #(pr-str (get-in % [:accepted :requirements :table])) (vals views))]
-          (jdbc/execute! context :acquisition
-                         (str "LOCK TABLE ONLY " (jdbc/relation (get-in view [:accepted :requirements :table]))
-                              " IN ACCESS SHARE MODE") []))
+          (let [kind (get-in view [:accepted :requirements :kind])
+                table (jdbc/relation (get-in view [:accepted :requirements :table]))]
+            (if (= "m" kind)
+              ;; PostgreSQL rejects LOCK TABLE for materialized views. A zero-row
+              ;; SELECT holds ACCESS SHARE without transferring relation data.
+              (jdbc/query! context :acquisition (str "SELECT 1 FROM " table " LIMIT 0") [] (constantly nil))
+              (jdbc/execute! context :acquisition
+                             (str "LOCK TABLE " (when (= "r" kind) "ONLY ") table " IN ACCESS SHARE MODE") []))))
         (doseq [view (vals views)]
           (pm/verify! (:accepted view) (jdbc/catalog! context (get-in view [:accepted :requirements :table]))))
+        (doseq [view (vals views)]
+          (when-let [snapshot (:snapshot view)]
+            (reset! snapshot (capture! context (:accepted view) reservations))))
         (let [session (->Session views request context
                         (merge (select-keys (:descriptor source) [:source-instance-id :compute-context-id])
                                {:spi-version 2 :features #{} :consistency :snapshot :session-id (UUID/randomUUID)
@@ -331,7 +370,7 @@
         {:alternatives
          (mapv
            (fn [{:keys [id anchor columns requires kind] :as candidate}]
-             (let [predicates (plan/predicates accepted candidate request)
+             (let [predicates (if (pm/spooled? accepted) [] (plan/predicates accepted candidate request))
                    candidate (merge candidate (select-keys request [:source-symbol :region-id :scope-id :bindings])
                                     {:predicates predicates :definition-fingerprint (:definition-fingerprint descriptor)})
                    token (spi/reserve! ctl {:retained-bytes (+ 4096 (* 4 (value/value-charge candidate)))})]

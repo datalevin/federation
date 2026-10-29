@@ -39,6 +39,10 @@ the two native 64-bit halves. Collection counts precede their nodes.
 | 22, 23, 24 | signed Integer, Short, Byte |
 | 25, 26 | Instant, Duration: signed seconds and signed 32-bit nanos |
 | 27 | Period: signed 32-bit years, months, days |
+| 28 | LocalDate: signed 64-bit epoch day |
+| 29 | LocalTime: signed 64-bit nanosecond of day |
+| 30 | LocalDateTime: signed 64-bit epoch day and nanosecond of day |
+| 31 | OffsetTime: signed 64-bit nanosecond of day and signed 32-bit offset seconds |
 
 Map entries and set elements sort by encoded length, then unsigned bytes;
 equal encoded map keys tie-break by encoded value. Descriptor normalization

@@ -1,12 +1,34 @@
 (ns datalevin.federation.postgres-test
   (:require [clojure.test :refer [deftest is testing]]
             [datalevin.federation.entity-ref :as ref]
+            [datalevin.federation.mapping :as mapping]
             [datalevin.federation.postgres :as pg]
             [datalevin.federation.postgres.jdbc :as jdbc]
             [datalevin.federation.postgres.plan :as plan]
             [datalevin.federation.postgres.mapping :as pm]
+            [datalevin.federation.postgres.temporal :as temporal]
             [datalevin.query.access.dependency :as dependency]
-            [datalevin.query.source :as spi]))
+            [datalevin.query.source :as spi]
+            [datalevin.query.source.value :as value]))
+
+(deftest exact-interval-fields-and-immutable-calendar-keys
+  (doseq [[text expected] [["PT0S" {:months 0 :days 0 :microseconds 0}]
+                           ["P-1Y2M-3DT4H-5M6.123456S" {:months -10 :days -3 :microseconds 14106123456}]
+                           ["PT2562047788H54.775807S" {:months 0 :days 0 :microseconds Long/MAX_VALUE}]
+                           ["PT-2562047788H-54.775808S" {:months 0 :days 0 :microseconds Long/MIN_VALUE}]]]
+    (is (= expected (temporal/interval text))))
+  (doseq [text ["P" "PT0.0000001S" "PT99999999999999999999H"]]
+    (is (thrown? clojure.lang.ExceptionInfo (temporal/interval text))))
+  (doseq [x [(java.time.LocalDate/parse "0001-01-01")
+             (java.time.LocalDate/parse "-0001-12-31")
+             (java.time.LocalTime/parse "23:59:59.999999999")
+             (java.time.LocalDateTime/parse "1969-12-31T23:59:59.123456789")
+             (java.time.OffsetTime/parse "12:34:56.123456789-05:45")]]
+    (let [type (mapping/entity-type ref/type-contract [:calendar 0] [:data])
+          entity (ref/entity-ref type [x])]
+      (is (= x (value/owned-copy x)))
+      (is (<= 64 (value/value-charge x)))
+      (is (= [x] (ref/key-tuple (ref/decode (ref/encode entity))))))))
 
 (def source-id #uuid "e8d23d75-321f-4d88-a293-077ed468b8b1")
 (def catalog
@@ -179,3 +201,8 @@
     (is (= ["TRUE" []] (plan/comparison-filter "timestamptz" "x" :not= instant))))
   (doseq [bound [java.time.Instant/MIN java.time.Instant/MAX (java.util.Date.)]]
     (is (nil? (plan/comparison-filter "timestamptz" "x" :>= bound)))))
+
+
+(deftest unbindable-offsets-remain-local
+  (doseq [offset ["+16:00" "-16:00" "+18:00" "-18:00"]]
+    (is (nil? (plan/comparison-filter "timetz" "x" := (java.time.OffsetTime/parse (str "12:00" offset)))))))

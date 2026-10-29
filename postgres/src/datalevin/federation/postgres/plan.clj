@@ -4,11 +4,12 @@
             [datalevin.federation.entity-ref :as ref]
             [datalevin.federation.postgres.jdbc :as jdbc]
             [datalevin.federation.postgres.mapping :as pm]
+            [datalevin.federation.postgres.temporal :as temporal]
             [datalevin.query.source.value :as value])
   (:import [datalevin.utl QueryKey]
            [java.sql ResultSet]
            [java.math BigDecimal]
-           [java.time Instant OffsetDateTime]
+           [java.time Instant LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime]
            [java.time.temporal ChronoUnit]))
 
 (def constraints {:max-binding-rows 256 :max-binding-bytes 262144 :max-request-binding-rows 256})
@@ -104,6 +105,25 @@
            (<= (.scale ^BigDecimal x) 16383))
       [(str column " " (operators operator) " ?::numeric") [x]]
 
+      (and (= type "date") (instance? LocalDate x) (<= 1 (.getYear ^LocalDate x) 9999))
+      [(str column " " (operators operator) " ?::date") [(str x)]]
+
+      (or (and (= type "timestamp") (instance? LocalDateTime x) (<= 1 (.getYear ^LocalDateTime x) 9999))
+          (and (= type "time") (instance? LocalTime x)))
+      (let [floor (if (= type "time") (.truncatedTo ^LocalTime x ChronoUnit/MICROS)
+                      (.truncatedTo ^LocalDateTime x ChronoUnit/MICROS))
+            aligned? (= x floor)
+            op (if aligned? operator (case operator :>= :> :< :<= operator))]
+        (cond
+          (and (not aligned?) (= operator :=)) ["FALSE" []]
+          (and (not aligned?) (= operator :not=)) ["TRUE" []]
+          :else [(str column " " (operators op) " ?::" type) [(str floor)]]))
+
+      (and (= type "timetz") (= operator :=) (instance? OffsetTime x)
+           (<= (Math/abs (.getTotalSeconds (.getOffset ^OffsetTime x))) 57599))
+      (if (zero? (mod (.getNano ^OffsetTime x) 1000))
+        [(str column " = ?::timetz") [(str x)]] ["FALSE" []])
+
       (and (= type "timestamptz") (instance? Instant x)
            (not (.isBefore ^Instant x (Instant/parse "0001-01-01T00:00:00Z")))
            (.isBefore ^Instant x (Instant/parse "+10000-01-01T00:00:00Z")))
@@ -121,15 +141,15 @@
   (let [xs (if (= 1 (count columns)) [x] x)]
     (when (and (sequential? xs) (= (count columns) (count xs))
                 (every? true? (map (fn [column v]
-                                    (let [type (pm/types (get-in accepted [:requirements :columns column :type]))]
+                                    (let [type (pm/logical-type (get-in accepted [:requirements :columns column]))]
                                       (or (and (not= :data type) (value/matches-type? type v))
                                           (some? (comparison-filter
-                                                   (get-in accepted [:requirements :columns column :type])
+                                                   (pm/storage-type (get-in accepted [:requirements :columns column]))
                                                    (column-sql column) := v))))) columns xs)))
       (let [filters (mapv (fn [column v]
-                            (or (comparison-filter (get-in accepted [:requirements :columns column :type])
+                            (or (comparison-filter (pm/storage-type (get-in accepted [:requirements :columns column]))
                                                    (column-sql column) := v)
-                                [(str (column-sql column) " = ?") [v]])) columns xs)]
+                                [(str (column-sql column) (when (get-in accepted [:requirements :columns column :enum]) "::text") " = ?") [v]])) columns xs)]
         [(str/join " AND " (map first filters)) (vec (mapcat second filters))]))))
 
 (defn- pattern-filters [accepted clauses bindings]
@@ -167,14 +187,16 @@
                          [a b op] (if (= :const (first a)) [b a (reverse-operator operator)] [a b operator])
                          [tag v] a [ctag x] b column (vars v)]
                      (when (and (= :var tag) column (= :const ctag))
-                       (when-let [filter (comparison-filter (get-in accepted [:requirements :columns column :type])
+                       (when-let [filter (comparison-filter (pm/storage-type (get-in accepted [:requirements :columns column]))
                                                            (column-sql column) op x)]
                          (assoc predicate :column column :filter filter)))))) (:clauses request)))))
 
 (defn- selected-columns [accepted plan]
-  (vec (distinct (concat (pm/key-columns accepted)
-                         (mapcat #(pm/attribute-columns accepted (second (second (:terms %))))
-                                 (:clauses plan))))))
+  (if (:snapshot? plan)
+    (vec (keys (get-in accepted [:requirements :columns])))
+    (vec (distinct (concat (pm/key-columns accepted)
+                           (mapcat #(pm/attribute-columns accepted (second (second (:terms %))))
+                                   (:clauses plan)))))))
 
 (defn fetch-charge
   "Reserve a decoded page and scratch. Fixed-width PostgreSQL scalars need
@@ -195,12 +217,16 @@
     {:columns columns
      :sql (str "SELECT " ordinal "NOT (" bounded "), "
                (str/join ", " (map #(str "CASE WHEN " bounded " THEN " (column-sql %) " END") columns))
-               " FROM ONLY " (jdbc/relation (get-in accepted [:requirements :table])) " AS r" join-sql
+               " FROM " (when (= "r" (get-in accepted [:requirements :kind])) "ONLY ")
+               (jdbc/relation (get-in accepted [:requirements :table])) " AS r" join-sql
                (when (seq filters) (str " WHERE " (str/join " AND " (map first filters)))))
      :params (into (vec params) (mapcat second) filters)}))
 
 (defn sql [accepted plan bindings max-row-bytes]
   (query-sql accepted plan bindings max-row-bytes nil nil []))
+
+(defn snapshot-sql [accepted max-row-bytes]
+  (query-sql accepted {:snapshot? true} {} max-row-bytes nil nil []))
 
 (defn batch-sql
   "Join bounded input keys to the table and return an input ordinal per row.
@@ -225,15 +251,15 @@
         pushdown? (every? some? keys)
         ;; Widen integral inputs: casting an out-of-range lookup key to int2
         ;; or int4 would fail instead of correctly finding no matching row.
-        types (mapv #(let [type (get-in accepted [:requirements :columns % :type])]
-                       (if (#{"int2" "int4"} type) "int8" type)) columns)
+        types (mapv #(let [type (pm/storage-type (get-in accepted [:requirements :columns %]))]
+                       (cond (= type "enum") "text" (#{"int2" "int4"} type) "int8" :else type)) columns)
         names (mapv #(str "k" %) (range (count columns)))
         placeholders (when pushdown? (str ", " (str/join ", " (map #(str "?::" %) types))))
         rows (map-indexed (fn [i _] (str "(" i placeholders ")")) inputs)
         join-sql (str " JOIN (VALUES " (str/join ", " rows) ") AS b(i"
                       (when pushdown? (str ", " (str/join ", " names))) ") ON "
                       (if pushdown?
-                        (str/join " AND " (map #(str (column-sql %1) " = b." %2) columns names))
+                        (str/join " AND " (map #(str (column-sql %1) (when (get-in accepted [:requirements :columns %1 :enum]) "::text") " = b." %2) columns names))
                         "TRUE"))]
     (query-sql accepted plan (:bindings plan) max-row-bytes join-sql "b.i, "
                (when pushdown? (mapcat identity keys)))))
@@ -242,7 +268,8 @@
   (let [x (case type
             ("int2" "int4" "int8") (.getLong rs (int i))
             "bool" (.getBoolean rs (int i))
-            ("text" "varchar") (.getString rs (int i))
+            ("text" "varchar" "enum") (.getString rs (int i))
+            ("date" "timestamp" "time" "timetz" "interval") (temporal/decode type rs i)
             "uuid" (.getObject rs (int i) java.util.UUID)
             "bytea" (.getBytes rs (int i))
             "numeric" (.getBigDecimal rs (int i))
@@ -255,7 +282,11 @@
     (when-not (.wasNull rs) x)))
 
 (defn decode [accepted column rs i]
-  (decode-value (get-in accepted [:requirements :columns column :type]) rs i))
+  (let [physical (get-in accepted [:requirements :columns column])
+        x (decode-value (pm/storage-type physical) rs i)]
+    (when (and (:enum physical) (some? x) (not (some #{x} (get-in physical [:enum :labels]))))
+      (jdbc/fail! :query-source/stale-definition :decode))
+    x))
 
 (defn read-row
   ([accepted columns rs] (read-row accepted columns rs 0))

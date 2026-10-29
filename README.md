@@ -32,7 +32,7 @@ pushdown paths require the matching **1.2.10** build with relational SPI support
 
 | Source type | Role | Current support |
 | --- | --- | --- |
-| Other databases (SQL) | Query relational tables alongside other sources. | [PostgreSQL](postgres/README.md) ordinary primary-key tables, scalar scans/lookups, and same-entity fusion in a read-only snapshot; see [workload limits](postgres/README.md#workload-fit-and-current-gaps). |
+| Other databases (SQL) | Query relational tables alongside other sources. | [PostgreSQL](postgres/README.md) primary-key tables, declared-key views, partitioned parents, RLS profiles, temporal/enum values, and eligible SQL delegation; see [workload limits](postgres/README.md#workload-fit-and-current-gaps). |
 | Files | Query exports and file-based datasets. | [EDN Lines](file/README.md) exports with scalar and collection attributes; verified snapshot scans. |
 | APIs | Query data exposed by external services. | [GitHub](github/README.md) issue and pull-request lookups by entity, repository/issue key, or issue number; live, best-effort reads. |
 | Datalevin databases | Query native entities and attributes alongside external data. | Supplied directly to `d/q`; no adapter needed. |
@@ -47,9 +47,11 @@ PostgreSQL's current fit is selective enrichment: use native records or another
 source to identify a small set of rows, then retrieve their scalar attributes.
 Eligible decimal/time filters, flat same-snapshot joins, and supported
 aggregates can execute in PostgreSQL. Broader reporting workloads still face
-significant gaps: arbitrary aggregates and scoped programs remain in core, and views,
-partitioned parents, RLS-protected tables, and several common column types are
-unsupported. Large scans can exhaust the default request budget. Candidate
+significant gaps: arbitrary aggregates and scoped programs remain in core.
+Views, partitioned parents, and RLS-protected tables use bounded captures of all
+mapped columns, which can increase acquisition transfer and retained memory.
+Domains, arrays, and JSON mapping remain unsupported. Large scans can exhaust
+the default request budget. Candidate
 pruning preserves complete access coverage
 within the configured [planning bound](postgres/README.md#planning-bounds-and-follow-up-priorities).
 See the [delegation scope](postgres/README.md#filter-and-relational-delegation)
@@ -216,7 +218,9 @@ uses the saved identities and mappings without discovering a new schema.
 - GitHub reads are best-effort: separate requests may observe different updates.
   Local relations and accepted file exports provide snapshots. PostgreSQL
   mappings sharing a source/profile use one read-only, repeatable-read
-  transaction. There is no atomic snapshot across independent sources.
+  transaction. Views, partitioned parents, and RLS tables capture mapped rows
+  once before access, including volatile view values and policy results.
+  There is no atomic snapshot across independent sources.
 - PostgreSQL batches up to 256 lookup keys per SQL cursor and fetches 128 rows
   per request by default. Eligible same-snapshot joins and aggregates are
   delegated; public ordering and result windows remain in core. Check request and memory budgets for larger workloads; see

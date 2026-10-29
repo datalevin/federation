@@ -18,7 +18,7 @@
   (and (string? x) (not (str/includes? x "\u0000")) (.canEncode (.newEncoder StandardCharsets/UTF_8) ^String x)))
 
 (defn- expression [accepted alias columns type shape]
-  (let [types (mapv #(get-in accepted [:requirements :columns % :type]) columns)]
+  (let [types (mapv #(pm/storage-type (get-in accepted [:requirements :columns %])) columns)]
     (require! (every? #{"int2" "int4" "int8" "bool" "uuid" "text" "varchar" "bytea" "numeric" "timestamptz"} types))
     {:sql (mapv #(text-column (str alias "." (jdbc/identifier %1)) %2) columns types)
      :types types :type type :shape shape
@@ -106,6 +106,7 @@
   not been established. Views are accepted mappings indexed by source alias."
   [views request max-row-bytes]
   (try
+    (require! (not-any? pm/spooled? (vals views)))
     (require! (and (= :relational (:mode request)) (= 1 (:semantics-version request)) (seq (:find request))
                    (= (count views) (count (:sources request)))
                    (= (set (keys views)) (set (map :symbol (:sources request))))))
