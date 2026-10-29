@@ -206,3 +206,27 @@
 (deftest unbindable-offsets-remain-local
   (doseq [offset ["+16:00" "-16:00" "+18:00" "-18:00"]]
     (is (nil? (plan/comparison-filter "timetz" "x" := (java.time.OffsetTime/parse (str "12:00" offset)))))))
+
+(deftest existence-projections-keep-presence-and-omit-payload-size
+  (let [d (spi/-source-info (pg/source accepted profile))
+        clauses [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :order/title] [:ignore]]}]
+        choice (first (plan/choices d (request clauses) true))
+        sql (plan/sql accepted choice {} 128)]
+    (is (= #{"title"} (:presence-columns sql)))
+    (is (.contains (:sql sql) "r.\"title\" IS NOT NULL"))
+    (is (not (.contains (:sql sql) "octet_length(r.\"title\"")))
+    (is (< (plan/fetch-charge accepted choice 128 16384) 1048576))
+    (let [value-clause {:id 1 :kind :pattern :terms '[[:var ?e] [:const :order/title] [:var ?title]]}
+          choice (first (plan/choices d (request (conj clauses value-clause)) true))
+          sql (plan/sql accepted choice {} 128)]
+      (is (empty? (:presence-columns sql)))
+      (is (.contains (:sql sql) "octet_length(r.\"title\""))))
+  (let [reference (get-in accepted [:identity :type])
+        accepted (pg/accept-mapping catalog
+                   (assoc declaration :attributes {:order/parent {:column "id" :reference
+                                                                 {:domain (get-in reference [:parameters :identity-domain-id])
+                                                                  :type reference}}}))
+        d (spi/-source-info (pg/source accepted profile))
+        clauses [{:id 0 :kind :pattern :terms '[[:ignore] [:const :order/parent] [:ignore]]}]
+        choice (first (plan/choices d (request clauses) true))]
+    (is (= [] (plan/match-row accepted choice {} {"id" 1})))))

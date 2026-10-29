@@ -175,11 +175,11 @@
     (let [q '[:find (min ?a) :in $p :where [$p ?e :row/a ?a]]]
       (is (not (relational-plan? (d/explain {:run? false} q (pg/source accepted *profile*))))))))
 
-(deftest delegated-aggregates-enforce-input-row-and-conversion-limits
+(deftest delegated-aggregates-enforce-output-row-and-input-conversion-limits
   (sql! (str "UPDATE " (table "orders") " SET title=repeat('x',100000) WHERE id=1"))
   (let [provider (source {:max-row-bytes 128})
         q '[:find (count ?title) :in $p :where [$p ?e :order/title ?title]]]
-    (is (= :query-source/limit (category #(d/q q provider))))
+    (is (= #{[3]} (set (d/q q provider))))
     (is (zero? (:live-sessions (pg/statistics provider)))))
   (sql! (str "UPDATE " (table "orders") " SET amount='NaN'::numeric WHERE id=1"))
   (let [provider (source) q '[:find (sum ?amount) :in $p :where [$p ?e :order/amount ?amount]]]
@@ -785,6 +785,7 @@
               (java.time.LocalTime/parse "12:34:56.123456") (java.time.OffsetTime/parse "12:34:56.123456+05:45")
               {:months 10 :days 3 :microseconds -14706123456}]}
            (set (d/q q provider))))
+    (is (= #{[id]} (set (d/q '[:find ?id :in $p :where [$p ?e :row/id ?id] [$p ?e :row/span _]] provider))))
     (is (= [id] (ref/key-tuple (ref/decode (ref/encode entity)))))
     (is (= #{[id]} (set (d/q '[:find ?id :in $p ?e :where [$p ?e :row/id ?id]] provider entity))))
     (is (= #{[id]} (set (d/q '[:find ?id :in $p ?bound :where [$p ?e :row/id ?id] [(< ?id ?bound)]]
@@ -803,6 +804,7 @@
       (sql! (str "INSERT INTO " (table "sentinel") " VALUES (1,'" literal "')"))
       (let [provider (pg/source (accept-relation "sentinel" {:row/value "v"}) *profile*)]
         (is (= :query-source/invalid (category #(d/q '[:find ?v :in $p :where [$p _ :row/value ?v]] provider))))
+        (is (= :query-source/invalid (category #(d/q '[:find ?id :in $p :where [$p ?e :row/id ?id] [$p ?e :row/value _]] provider))))
         (is (zero? (:live-sessions (pg/statistics provider)))))
       (finally (sql! (str "DROP TABLE " (table "sentinel")))))))
 
@@ -873,7 +875,7 @@
   (is (= 3 (count (d/q '[:find ?v :in $p :where [$p _ :row/value ?v]]
                        (pg/source (accept-relation "materialized" {:row/value "v"} {:key-columns ["id"]}) *profile*))))))
 
-(deftest captured-relations-respect-row-and-retention-limits
+(deftest captured-relations-and-size-markers-respect-retention-limits
   (sql! (str "CREATE VIEW " (table "large_report") " AS SELECT i::bigint AS id, repeat('x',1000) AS v FROM generate_series(1,5000) i"))
   (let [accepted (accept-relation "large_report" {:row/value "v"} {:key-columns ["id"]})]
     (doseq [options [{:max-row-bytes 100} {}]]
@@ -959,3 +961,106 @@
     (is (every? #(nil? @(:snapshot %)) (vals (:views session))))
     (is (released? ctl))
     (control/close! ctl)))
+
+(defn large-fields! []
+  (sql! (str "CREATE TABLE " (table "large_fields") " (id bigint PRIMARY KEY, title text, payload text, bytes bytea, parent bigint)"))
+  (sql! (str "INSERT INTO " (table "large_fields") " VALUES "
+             "(1,'one',repeat('x',1000000),decode(repeat('ab',1000000),'hex'),2),"
+             "(2,'two','small',decode('ab','hex'),NULL),(3,'three',NULL,NULL,NULL),"
+             "(4,'four','',decode('','hex'),NULL)")))
+
+(deftest existence-only-large-fields-work-through-scans-fusion-and-lookups
+  (large-fields!)
+  (let [attrs {:row/title "title" :row/payload "payload" :row/bytes "bytes"
+               :row/reference {:columns ["id" "payload"] :reference
+                               {:domain [:large-reference 0]
+                                :type (mapping/entity-type ref/type-contract [:large-reference 0] [:long :string])}}}
+        accepted (accept-relation "large_fields" attrs)
+        q '[:find ?id :in $p :where [$p ?e :row/id ?id] [$p ?e :row/payload _] [$p ?e :row/bytes _]]
+        title-query '[:find ?title :in $p :where [$p ?e :row/title ?title] [$p ?e :row/payload _]]]
+    (doseq [fusion? [false true] relational? [false true]
+            :let [provider (pg/source accepted (assoc *profile* :fusion? fusion? :relational? relational?))]]
+      (is (= #{[1] [2] [4]} (set (d/q q provider))))
+      (is (= #{["one"] ["two"] ["four"]} (set (d/q title-query provider))))
+      (is (= #{[1] [2] [4]}
+             (set (d/q '[:find ?id :in $p :where [$p ?e :row/id ?id] [$p ?e :row/reference _]] provider))))
+      (is (= #{[1]} (set (d/q '[:find ?id :in $p [?id ...] :where
+                                [$p ?e :row/id ?id] [$p ?e :row/payload _] [$p ?e :row/bytes _]] provider [1 3]))))
+      (doseq [attribute [:row/payload :row/bytes]]
+        (is (= :query-source/limit
+               (category #(d/q {:find '[?v] :in '[$p] :where [['$p '_ attribute '?v]]} provider)))))
+      (is (zero? (:live-sessions (pg/statistics provider)))))
+    (let [provider (pg/source accepted *profile*)
+          q '[:find (count ?e) . :in $p :where [$p ?e :row/payload _] [$p ?e :row/bytes _]]
+          unprojected '[:find ?id :in $p :where [$p ?e :row/id ?id] [$p ?e :row/payload ?unused]
+                        [$p ?other :row/title "two"]]]
+      (is (= 3 (d/q q provider)))
+      (is (relational-plan? (d/explain {:run? true} q provider)))
+      (is (= #{[1] [2] [4]} (set (d/q unprojected provider))))
+      (is (relational-plan? (d/explain {:run? true} unprojected provider))))
+    (let [provider (pg/source accepted (assoc *profile* :relational? false))
+          ctl (control/create) request (request provider ctl) session (spi/-open-session provider request)
+          clauses [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :row/id] [:var ?id]]}
+                   {:id 1 :kind :pattern :terms '[[:var ?e] [:const :row/payload] [:ignore]]}]
+          type (get-in accepted [:identity :type])]
+      (try
+        (let [alt (first (alternatives provider session request clauses [{:variable '?e :type type :nullable? false}]))
+              cursor (open provider session request alt [{:binding-id 41 :values [(ref/entity-ref type [1])]}
+                                                         {:binding-id 43 :values [(ref/entity-ref type [3])]}])]
+          (try
+            (let [result (consume cursor ctl alt true)]
+              (is (= [41] (:ids result)))
+              (is (= [1] (mapv second (:rows result)))))
+            (finally (spi/-close-cursor! cursor))))
+        (finally (spi/-close-session! session)))
+      (is (released? ctl))
+      (control/close! ctl))))
+
+(deftest presence-checks-still-validate-unrepresentable-values
+  (sql! (str "UPDATE " (table "orders") " SET amount='NaN'::numeric, stamp='infinity' WHERE id=1"))
+  (doseq [relational? [false true] attribute [:order/amount :order/stamp]
+          :let [provider (source {:relational? relational?})
+                q {:find '[?id] :in '[$p] :where ['[$p ?e :order/id ?id] ['$p '?e attribute '_]]}]]
+    (is (= :query-source/invalid (category #(d/q q provider))))))
+
+(deftest captured-existence-checks-preserve-large-field-presence-and-replay
+  (large-fields!)
+  (sql! (str "CREATE VIEW " (table "large_view") " AS SELECT * FROM " (table "large_fields")))
+  (let [accepted (accept-relation "large_view" {:row/value "title" :row/payload "payload" :row/bytes "bytes"} {:key-columns ["id"]})
+        provider (pg/source accepted *profile*)
+        q '[:find ?id :in $p :where [$p ?e :row/id ?id] [$p ?e :row/payload _] [$p ?e :row/bytes _]]]
+    (is (= #{[1] [2] [4]} (set (d/q q provider))))
+    (is (= #{["one"] ["two"] ["three"] ["four"]}
+           (set (d/q '[:find ?v :in $p :where [$p _ :row/value ?v]] provider))))
+    (doseq [attribute [:row/payload :row/bytes]]
+      (is (= :query-source/limit
+             (category #(d/q {:find '[?v] :in '[$p] :where [['$p '_ attribute '?v]]} provider)))))
+    (let [ctl (control/create) request (request provider ctl) session (spi/-open-session provider request)
+          clauses [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :row/id] [:var ?id]]}
+                   {:id 1 :kind :pattern :terms '[[:var ?e] [:const :row/payload] [:ignore]]}
+                   {:id 2 :kind :pattern :terms '[[:var ?e] [:const :row/bytes] [:ignore]]}]]
+      (try
+        (let [alt (first (alternatives provider session request clauses []))
+              read! (fn [] (let [cursor (open provider session request alt nil)]
+                             (try (set (map second (:rows (consume cursor ctl alt false))))
+                                  (finally (spi/-close-cursor! cursor)))))
+              requests (:external-requests (control/usage ctl))]
+          (is (= #{1 2 4} (read!)))
+          (sql! (str "UPDATE " (table "large_fields") " SET title='changed', payload=NULL,bytes=NULL WHERE id=1"))
+          (is (= #{1 2 4} (read!)))
+          (is (= requests (:external-requests (control/usage ctl)))))
+        (finally (spi/-close-session! session)))
+      (is (released? ctl))
+      (control/close! ctl))
+    (is (= #{[2] [4]} (set (d/q q provider))))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
+(deftest captured-materialized-values-enforce-combined-row-cap
+  (sql! (str "CREATE VIEW " (table "combined_view") " AS SELECT 1::bigint AS id,repeat('a',80) AS a,repeat('b',80) AS b"))
+  (let [accepted (accept-relation "combined_view" {:row/a "a" :row/b "b"} {:key-columns ["id"]})
+        provider (pg/source accepted (assoc *profile* :max-row-bytes 128))]
+    (is (= #{[1]} (set (d/q '[:find ?id :in $p :where [$p ?e :row/id ?id] [$p ?e :row/a _] [$p ?e :row/b _]] provider))))
+    (is (= #{[(apply str (repeat 80 "a"))]}
+           (set (d/q '[:find ?a :in $p :where [$p ?e :row/a ?a] [$p ?e :row/b _]] provider))))
+    (is (= :query-source/limit
+           (category #(d/q '[:find ?a ?b :in $p :where [$p ?e :row/a ?a] [$p ?e :row/b ?b]] provider))))))

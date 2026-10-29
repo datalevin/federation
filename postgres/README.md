@@ -34,7 +34,7 @@ application schema or a larger reporting query:
 | Read an existing application schema | Temporal types and enums are supported; domains, `char`, `citext`, arrays, and JSON/JSONB remain unmapped | Supported columns can be selected independently. Collection-valued attributes are not implemented. |
 | Read reporting views, partitioned datasets, or tenant tables with RLS | Views need declared keys; partitioned parents need primary keys; RLS needs an enforced authorization profile | These relations capture all mapped columns at acquisition under shared row, request, and retention limits. Subsequent accesses use the captured rows; SQL predicate, join, and aggregate delegation is unavailable for these captures. |
 | Aggregate, sort, or join large PostgreSQL relations | Relational delegation covers flat single-snapshot conjunctions and selected aggregates; SQL ordering/limit, arbitrary aggregates, and scoped programs are not delegated | Eligible counts transfer one row per group. Unsupported shapes retain core execution. Backend work remains subject to statement/query timeouts; there is no index discovery or cost-based access choice. |
-| Read large text or binary fields | The default selected-row cap is 16 KiB, measured using SQL text representations | Oversized values fail the query. Referenced fields are fetched even when their value is `_` or not projected, so an existence-only query can hit this limit too. |
+| Read large text or binary fields | The default payload-row cap is 16 KiB, measured using SQL text representations | `_` existence checks use presence flags and do not fetch the payload. Values needed for output or local matching remain capped; delegated SQL applies the cap to its final returned row. |
 | Discover relationships | Discovery covers one named relation, its columns, key, enum labels, and applicable view/security contracts; foreign-key discovery is absent | Define references manually. Use PostgreSQL policies and explicit runtime role/settings for authorization; query filters do not establish an authorization boundary. |
 
 Supported columns do not require mapping every physical field. Omitting a
@@ -70,8 +70,8 @@ The highest-value follow-ups for ordinary federation are:
 2. Add domain mappings and further safe temporal/enum SQL delegation.
 3. Measure captured relations and investigate bounded alternatives for larger
    views, partitioned parents, and RLS datasets.
-4. Add foreign-key discovery, prune unneeded payload columns while retaining
-   existence checks, and then evaluate further SQL delegation with the core SPI.
+4. Add foreign-key discovery, extend unused-variable pruning in the shared
+   compiler, and evaluate further SQL delegation with the core SPI.
 
 These are follow-up work, not current capabilities. The existing integration
 suite checks correctness and failure handling on small fixtures; it does not
@@ -245,15 +245,24 @@ requires explicit rediscovery and acceptance. Dependencies hidden inside dynamic
 SQL or function bodies remain the profile owner's compatibility responsibility.
 Materialized views must be populated.
 
-Views, materialized views, partitioned parents, and RLS tables capture the entire
-accepted projection once per session, before planning fact accesses. Capture
-uses bounded server-cursor pages, the selected-row cap, and shared request,
-retained-memory, and deadline budgets. No session is returned after a partial
-capture or failed key check. Capture freezes volatile view expressions and
-policy results for identical replay. It can transfer and retain substantially
-more data than a selective query returns. Lookups scan the capture locally;
-predicates, cross-entity joins, and aggregates over these captures run in core.
-Closing the session drops captured rows and releases reservations.
+Views, materialized views, partitioned parents, and RLS tables capture the
+accepted projection once per session, before planning fact accesses. Each
+non-key column contributes its value when it fits the cap, or an exact
+size/presence marker when it is oversized. Oversized payloads stay in PostgreSQL;
+the adapter retains no truncated value. Keys must fit the cap at acquisition.
+A cursor can check a marked value's existence, while an access that needs its
+payload fails as `:query-source/limit`. An access also checks the combined size
+of the key and materialized columns, so splitting a captured row into individual
+bounded columns does not bypass its payload cap.
+
+Capture uses bounded server-cursor pages and shared request, retained-memory,
+and deadline budgets. No session is returned after a partial capture or failed
+key/conversion check. Capture freezes volatile view expressions and policy
+results for identical replay, including presence and size markers. It can
+transfer and retain substantially more data than a selective query returns.
+Lookups scan the capture locally; predicates, cross-entity joins, and aggregates
+over these captures run in core. Closing the session drops captured rows and
+releases reservations.
 
 For RLS, discover and reopen with the same authorization context:
 
@@ -315,8 +324,10 @@ Supported aggregates are `count`, `count-distinct`, decimal `sum`, integral
 aggregation, unrestricted integral sums, and other reducers remain in core.
 The SQL projection establishes distinct `:find`/`:with` input tuples before
 grouping. Empty inputs yield no groups, matching ordinary query behavior.
-Input conversion and row-size guards still apply even when aggregation would
-return a small value.
+Input conversion guards still apply when aggregation returns a small value.
+The row-size guard applies to the final SQL projection: values used only inside
+PostgreSQL for joins, filters, distinctness, or aggregation do not consume that
+wire payload cap.
 
 The initial relational contract accepts up to 32 patterns and 128 physical
 output components. Rules, unions, negation, functions, `:having`, collection
@@ -340,15 +351,34 @@ bounded, and a connection arriving after cancellation is closed.
 | `:connect-timeout-ms` | `10000` | Maximum connection/checkout wait |
 | `:statement-timeout-ms` | `10000` | PostgreSQL statement timeout |
 | `:fetch-size` | `128` | Maximum rows per explicit server-cursor fetch; up to 256, reduced when needed to admit cursor workspace |
-| `:max-row-bytes` | `16384` | Maximum combined byte size of selected physical values rendered as SQL text |
+| `:max-row-bytes` | `16384` | Maximum combined SQL text size of materialized values and keys per fact-access row, or the final returned row for delegated SQL |
 | `:fusion?` | `true` | Set false to compare separate EAV accesses |
 | `:relational?` | `true` | Allow eligible whole-conjunction joins and aggregation |
 | `:role` | unset | Transaction-local PostgreSQL role |
 | `:session-settings` | `{}` | Explicit policy/view context: custom dotted GUC names mapped to strings |
 
-Oversized rows produce an error marker before their values cross the network;
-they are never silently truncated or omitted. Reserved workspace includes the
-fetch page, decoding, and pending row; returned batches have separate charges.
+Use `_` or an omitted value position for existence checks:
+
+```clojure
+(d/q '[:find ?id :in $p :where
+       [$p ?e :row/id ?id]
+       [$p ?e :row/large-payload _]] source)
+```
+
+Ordinary fact reads select non-null presence flags for ignored values and keep
+all component guards for references. A field also needed by another clause is
+materialized once and remains subject to the cap. Null is absent; empty text and
+empty byte arrays are present. Conversion checks still reject unsupported
+non-finite temporal/numeric values, even in existence-only patterns.
+
+A named value variable can still require materialization for joins, predicates,
+`:with`, or intermediate fact-access output, even when absent from `:find`.
+Eligible delegated SQL avoids transferring fields absent from its final
+projection. Use `_` for an explicit existence-only pattern on any execution path.
+
+Oversized payloads produce an error or size marker before their values cross
+the network; values are never silently truncated. Reserved workspace includes
+the fetch page, decoding, and pending row; returned batches have separate charges.
 The query's `:timeout` and `:query-source :limits` apply across all accesses.
 Cancellation aborts blocked database I/O and releases owned resources.
 
@@ -369,8 +399,10 @@ the reserved fetch workspace for variable-width fields: a 1 MiB row cap with
 128 rows per fetch would require over 2 GiB of cursor workspace. Before SQL
 runs, the adapter reduces the fetch page until its reservation fits the shared
 memory budget. It still fails if even one row's workspace cannot be admitted.
-Pages selecting only fixed-width physical scalars reserve a smaller workspace
-based on those types. Smaller admitted pages can increase request pressure;
+Pages selecting only fixed-width physical scalars and presence flags reserve a
+smaller workspace based on those types. Captures reserve up to one capped value
+per mapped column, plus size markers, and can need smaller pages than ordinary
+fact reads. Smaller admitted pages can increase request pressure;
 inspect both request and memory limits when accepting larger fields.
 
 Dependent inputs use bound parameters and a generated ordinal to correlate
@@ -408,7 +440,9 @@ The [integration suite](test/datalevin/federation/postgres_integration_test.clj)
 compares fused, separate, and eager results, runs the shared scan/lookup checks,
 and exercises native joins, rules, generated data, exact types, composite keys,
 references, saved definitions, concurrent writes, drift, quotas, pool return,
-late checkout, blocked fetch cancellation, and snapshot loss. Scaling checks
+late checkout, blocked fetch cancellation, and snapshot loss. Large-field tests
+cover presence flags, composite references, empty/null values, dependent binding
+IDs, captured replay, combined caps, and final SQL output limits. Scaling checks
 exercise 1,200 dependent keys through ordinary queries and stream 100,000
 rows under the default request and memory limits. The fault checks
 need permission to terminate their own test connection.

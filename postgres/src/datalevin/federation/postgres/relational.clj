@@ -158,10 +158,8 @@
           columns (mapcat (fn [{:keys [alias accepted columns]}]
                             (map #(vector (str alias "." (jdbc/identifier %))
                                           (get-in accepted [:requirements :columns % :type])) columns)) tables)
-          oversized (str/join " OR "
-                      (map (fn [{:keys [alias columns]}]
-                             (str "(" (str/join " + " (map #(str "COALESCE(octet_length(" alias "." (jdbc/identifier %)
-                                                                 "::text)::bigint,0)") columns)) ") > " (long max-row-bytes))) tables))
+          ;; Backend-only intermediate values do not consume the wire row cap.
+          oversized "FALSE"
           invalid (str/join " OR " (cons "FALSE"
                                     (keep (fn [[sql type]]
                                             (case type

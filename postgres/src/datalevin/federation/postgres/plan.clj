@@ -198,25 +198,55 @@
                            (mapcat #(pm/attribute-columns accepted (second (second (:terms %))))
                                    (:clauses plan)))))))
 
+(defn- value-columns [accepted plan]
+  (set (concat (pm/key-columns accepted)
+               (mapcat (fn [clause]
+                         (when (not= :ignore (first (nth (:terms clause) 2)))
+                           (pm/attribute-columns accepted (second (second (:terms clause))))))
+                       (:clauses plan)))))
+
+(defn- invalid-sql
+  "Build a guard for conversions that can fail during decoding."
+  [type column]
+  (case type
+    "numeric" (str column "::text IN ('NaN','Infinity','-Infinity')")
+    ("date" "timestamp" "timestamptz" "interval") (str "NOT isfinite(" column ")")
+    ("time" "timetz") (str column "::text LIKE '24:%'")
+    "FALSE"))
+
+(defn- text-size [column]
+  (str "COALESCE(octet_length(" (column-sql column) "::text)::bigint,0)"))
+
+(defn- row-size [columns]
+  (if (seq columns) (str/join " + " (map text-size columns)) "0"))
+
 (defn fetch-charge
-  "Reserve a decoded page and scratch. Fixed-width PostgreSQL scalars need
-  at most 64 text bytes each; variable-width values retain the SQL row cap."
+  "Reserve a decoded page and scratch. Presence flags and fixed-width scalars
+  use small bounds. Captures can retain one capped value per physical column."
   [accepted plan fetch-size max-row-bytes]
   (let [columns (selected-columns accepted plan)
-        fixed? (every? #(#{"int2" "int4" "int8" "bool" "uuid" "float4" "float8" "timestamptz"}
-                          (get-in accepted [:requirements :columns % :type])) columns)
-        row-bytes (if fixed? (min max-row-bytes (* 64 (count columns))) max-row-bytes)]
+        values (if (:snapshot? plan) (set columns) (value-columns accepted plan))
+        fixed? (every? #(or (not (values %))
+                           (#{"int2" "int4" "int8" "bool" "uuid" "float4" "float8" "timestamptz"}
+                             (get-in accepted [:requirements :columns % :type]))) columns)
+        row-bytes (if fixed? (min max-row-bytes (* 64 (count columns)))
+                      (* max-row-bytes (if (:snapshot? plan) (count columns) 1)))]
     (+ 131072 (* fetch-size (+ (* 16 row-bytes) (* 1024 (count columns)) 2048)))))
 
 (defn- query-sql [accepted plan bindings max-row-bytes join-sql ordinal params]
   (let [columns (selected-columns accepted plan)
-        size (str/join " + " (map #(str "COALESCE(octet_length(" (column-sql %) "::text)::bigint,0)") columns))
-        bounded (str "(" size ") <= " (long max-row-bytes))
+        values (value-columns accepted plan)
+        presence (set (remove values columns))
+        bounded (str "(" (row-size (filterv values columns)) ") <= " (long max-row-bytes))
+        invalid (str/join " OR " (cons "FALSE" (map #(invalid-sql
+                                                       (pm/storage-type (get-in accepted [:requirements :columns %]))
+                                                       (column-sql %)) presence)))
         filters (concat (pattern-filters accepted (:clauses plan) bindings)
                         (map :filter (:predicates plan)))]
-    {:columns columns
-     :sql (str "SELECT " ordinal "NOT (" bounded "), "
-               (str/join ", " (map #(str "CASE WHEN " bounded " THEN " (column-sql %) " END") columns))
+    {:columns columns :presence-columns presence
+     :sql (str "SELECT " ordinal "NOT (" bounded "), (" invalid "), "
+               (str/join ", " (map #(if (presence %) (str (column-sql %) " IS NOT NULL")
+                                        (str "CASE WHEN " bounded " THEN " (column-sql %) " END")) columns))
                " FROM " (when (= "r" (get-in accepted [:requirements :kind])) "ONLY ")
                (jdbc/relation (get-in accepted [:requirements :table])) " AS r" join-sql
                (when (seq filters) (str " WHERE " (str/join " AND " (map first filters)))))
@@ -225,8 +255,23 @@
 (defn sql [accepted plan bindings max-row-bytes]
   (query-sql accepted plan bindings max-row-bytes nil nil []))
 
-(defn snapshot-sql [accepted max-row-bytes]
-  (query-sql accepted {:snapshot? true} {} max-row-bytes nil nil []))
+(defn snapshot-sql
+  "Capture bounded individual values and exact size/presence markers. Keys must
+  fit immediately; oversized payloads stay on the server and fail only if read."
+  [accepted max-row-bytes]
+  (let [columns (selected-columns accepted {:snapshot? true})
+        cap (long max-row-bytes)]
+    {:columns columns :snapshot? true :max-row-bytes cap
+     :sql (str "SELECT (" (row-size (pm/key-columns accepted)) ") > " cap ", "
+               (str/join ", "
+                 (mapcat (fn [column]
+                           (let [sql (column-sql column)
+                                 invalid (invalid-sql (pm/storage-type (get-in accepted [:requirements :columns column])) sql)]
+                             [(str "CASE WHEN " sql " IS NULL THEN -1 WHEN " invalid " THEN -2 ELSE " (text-size column) " END")
+                              (str "CASE WHEN (" (text-size column) ") <= " cap " AND NOT (" invalid ") THEN " sql " END")])) columns))
+               " FROM " (when (= "r" (get-in accepted [:requirements :kind])) "ONLY ")
+               (jdbc/relation (get-in accepted [:requirements :table])) " AS r")
+     :params []}))
 
 (defn batch-sql
   "Join bounded input keys to the table and return an input ordinal per row.
@@ -289,10 +334,36 @@
     x))
 
 (defn read-row
-  ([accepted columns rs] (read-row accepted columns rs 0))
-  ([accepted columns ^ResultSet rs offset]
+  ([accepted projection rs] (read-row accepted projection rs 0))
+  ([accepted {:keys [columns presence-columns snapshot? max-row-bytes]} ^ResultSet rs offset]
    (when (.getBoolean rs (inc offset)) (jdbc/fail! :query-source/limit :decode))
-   (into {} (map-indexed (fn [i column] [column (decode accepted column rs (+ i offset 2))]) columns))))
+   (if snapshot?
+     (let [[row sizes]
+           (reduce (fn [[row sizes] [i column]]
+                     (let [index (+ offset 2 (* 2 i)) size (.getLong rs (int index))]
+                       (when (= -2 size) (jdbc/fail! :query-source/invalid :values))
+                       [(assoc row column (cond (= -1 size) nil
+                                                (> size max-row-bytes) ::oversized
+                                                :else (decode accepted column rs (inc index))))
+                        (assoc sizes column (max 0 size))])) [{} {}] (map-indexed vector columns))]
+       (with-meta row {::sizes sizes ::max-row-bytes max-row-bytes}))
+     (do
+       (when (.getBoolean rs (+ offset 2)) (jdbc/fail! :query-source/invalid :values))
+       (into {} (map-indexed (fn [i column]
+                              [column (if (contains? presence-columns column)
+                                        (when (.getBoolean rs (int (+ i offset 3))) true)
+                                        (decode accepted column rs (+ i offset 3)))]) columns))))))
+
+(defn- match-term [bound bindings term x]
+  (when bound
+    (case (first term)
+      :ignore bound
+      :const (when (QueryKey/equiv (second term) x) bound)
+      :var (let [sym (second term)]
+             (if (contains? bound sym)
+               (when (if (contains? bindings sym) (QueryKey/equals (bound sym) x)
+                         (QueryKey/equiv (bound sym) x)) bound)
+               (assoc bound sym x))))))
 
 (defn match-row [accepted plan bindings row]
   (let [keys (mapv row (pm/key-columns accepted))
@@ -300,25 +371,20 @@
         matched
         (reduce
           (fn [bound clause]
-            (when bound
-              (let [attribute (second (second (:terms clause)))
-                    raw (mapv row (pm/attribute-columns accepted attribute))
-                    x (when (every? some? raw)
-                        (if-let [type (get-in accepted [:attributes attribute :reference :type])]
-                          (ref/entity-ref type raw)
-                          (if (= 1 (count raw)) (first raw) raw)))]
-                (when (some? x)
-                  (reduce (fn [out [term x]]
-                            (when out
-                              (case (first term)
-                                :ignore out
-                                :const (when (QueryKey/equiv (second term) x) out)
-                                :var (let [sym (second term)]
-                                       (if (contains? out sym)
-                                         (when (if (contains? bindings sym)
-                                                 (QueryKey/equals (out sym) x)
-                                                 (QueryKey/equiv (out sym) x)) out)
-                                         (assoc out sym x))))))
-                          bound (map vector (:terms clause) [entity attribute x]))))))
-          bindings (:clauses plan))]
-    (when matched (mapv matched (map :variable (:columns plan))))))
+            (let [[entity-term _ term] (:terms clause)
+                  bound (match-term bound bindings entity-term entity)]
+              (when bound
+                (let [attribute (second (second (:terms clause)))
+                      raw (mapv row (pm/attribute-columns accepted attribute))]
+                  (when (every? some? raw)
+                    (if (= :ignore (first term)) bound
+                      (do
+                        (when (some #{::oversized} raw) (jdbc/fail! :query-source/limit :decode))
+                        (let [x (if-let [type (get-in accepted [:attributes attribute :reference :type])]
+                                  (ref/entity-ref type raw) (if (= 1 (count raw)) (first raw) raw))]
+                          (match-term bound bindings term x))))))))) bindings (:clauses plan))]
+    (when matched
+      (when-let [sizes (::sizes (meta row))]
+        (when (> (reduce + 0 (map sizes (value-columns accepted plan))) (::max-row-bytes (meta row)))
+          (jdbc/fail! :query-source/limit :decode)))
+      (mapv matched (map :variable (:columns plan))))))

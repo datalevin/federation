@@ -69,7 +69,7 @@
     (jdbc/check! context)
     (when (:closed? @state) (fail! :query-source/invalid :fetch))
     (let [inputs @inputs
-          {:keys [pending remaining portal more? input-index input-start columns snapshot?]} @state]
+          {:keys [pending remaining portal more? input-index input-start projection snapshot?]} @state]
       (cond
         pending pending
         (seq remaining)
@@ -89,7 +89,7 @@
                                 (fn [^ResultSet rs]
                                   [(if inputs (.getInt rs 1) 0)
                                    (if (:relational? candidate) (relational/read-row (:query candidate) rs)
-                                       (plan/read-row accepted columns rs (if inputs 1 0)))]))]
+                                       (plan/read-row accepted projection rs (if inputs 1 0)))]))]
           (swap! metrics update :read-rows + (count rows))
           (swap! state assoc :remaining (seq rows) :more? (= n (count rows)))
           (recur))
@@ -102,7 +102,7 @@
                           :else (plan/sql accepted candidate (:bindings candidate) max-row-bytes))
               portal (str "dtlv_" (.replace (str (UUID/randomUUID)) "-" ""))]
           (jdbc/execute! context :open (str "DECLARE " portal " NO SCROLL CURSOR FOR " (:sql query)) (:params query))
-          (swap! state assoc :portal portal :columns (:columns query) :more? true
+          (swap! state assoc :portal portal :projection (select-keys query [:columns :presence-columns]) :more? true
                  :input-index end :input-start input-index)
           (recur))
         :else nil))))
@@ -268,7 +268,7 @@
       (reset! state {:portal portal})
       (loop [out []]
         (let [rows (jdbc/query! context :acquisition (str "FETCH FORWARD " n " FROM " portal) []
-                                #(plan/read-row accepted (:columns query) %))
+                                #(plan/read-row accepted query %))
               out (reduce (fn [out row]
                             (jdbc/check! context)
                             (let [key (mapv row (pm/key-columns accepted))]
