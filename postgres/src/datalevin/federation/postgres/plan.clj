@@ -9,7 +9,7 @@
            [java.sql ResultSet]
            [java.time OffsetDateTime]))
 
-(def constraints {:max-binding-rows 256 :max-binding-bytes 262144 :max-request-binding-rows 1})
+(def constraints {:max-binding-rows 256 :max-binding-bytes 262144 :max-request-binding-rows 256})
 
 (defn columns [descriptor clauses]
   (reduce
@@ -29,11 +29,14 @@
                       (sort-by (comp pr-str key))
                       (keep (fn [[entity clauses]]
                               (when (and (not= :ignore (first entity)) (> (count clauses) 1)) clauses)))))
+        fused-ids (into #{} (mapcat #(map :id %)) groups)
+        units (into (vec groups) (comp (remove #(contains? fused-ids (:id %))) (map vector)) patterns)
+        maximum (get request :max-alternatives 32)
+        _ (when (> (count units) maximum) (jdbc/fail! :query-source/limit :planning))
         available (into {} (map (juxt :variable identity)) (:available-inputs request))
         candidate
-        (fn [clauses anchor kind position]
-          (let [cols (columns descriptor clauses)
-                [tag x] (when position (nth (:terms anchor) position))
+        (fn [clauses cols anchor kind position]
+          (let [[tag x] (when position (nth (:terms anchor) position))
                 column (some #(when (= x (:variable %)) %) cols)
                 bound? (and (= :var tag) (contains? (:bindings request) x))
                 required (if (and position (= :var tag) (not bound?)) [column] [])]
@@ -43,12 +46,28 @@
                :clauses (vec clauses) :anchor anchor :kind kind :position position
                :columns cols :requires required})))
         for-group (fn [clauses]
-                    (concat
-                      (keep #(candidate clauses % :entity-lookup 0) clauses)
-                      (keep #(candidate clauses % :value-lookup 2) clauses)
-                      [(candidate clauses (first clauses) :attribute-enumeration nil)]))]
-    (vec (take (get request :max-alternatives 32)
-               (concat (mapcat for-group groups) (mapcat #(for-group [%]) patterns))))))
+                    (let [cols (columns descriptor clauses)]
+                      (concat
+                        ;; All clauses in a group have the same entity term.
+                        (keep identity [(candidate clauses cols (first clauses) :entity-lookup 0)])
+                        (keep #(candidate clauses cols % :value-lookup 2) clauses)
+                        [(candidate clauses cols (first clauses) :attribute-enumeration nil)])))
+        ;; These independent accesses partition the patterns, so they remain
+        ;; schedulable even when available inputs are only potential producers.
+        ;; Coverage in dependent lookups alone could leave a dependency cycle.
+        required (mapv #(candidate % (columns descriptor %) (first %) :attribute-enumeration nil) units)
+        required-ids (set (map :id required))
+        candidates (concat (mapcat for-group groups) (mapcat #(for-group [%]) patterns))
+        selected (into required
+                       (comp (remove #(contains? required-ids (:id %)))
+                             (take (- maximum (count required)))) candidates)
+        group-order (zipmap (map #(mapv :id %) (concat groups (map vector patterns))) (range))
+        anchor-order (zipmap (map :id patterns) (range))]
+    ;; Preserve access preference without realizing the discarded candidate tail.
+    (vec (sort-by (fn [{:keys [clauses kind anchor]}]
+                    [(group-order (mapv :id clauses))
+                     (case kind :entity-lookup 0 :value-lookup 1 :attribute-enumeration 2)
+                     (anchor-order (:id anchor))]) selected))))
 
 (defn unknown-estimate [dependent?]
   (merge (zipmap (if dependent?
@@ -63,6 +82,8 @@
         (and (= :var tag) (contains? bindings x)) [true (get bindings x)]
         :else [false nil]))
 
+(defn- column-sql [column] (str "r." (jdbc/identifier column)))
+
 (defn- equality-filter [accepted columns x]
   ;; SQL equality is used only as a superset. The shared query equality is
   ;; always rechecked, including numeric scale, signed zero, and collation.
@@ -71,7 +92,7 @@
                 (every? true? (map (fn [column v]
                                     (let [type (pm/types (get-in accepted [:requirements :columns column :type]))]
                                       (and (not= :data type) (value/matches-type? type v)))) columns xs)))
-      [(str/join " AND " (map #(str (jdbc/identifier %) " = ?") columns)) (vec xs)])))
+      [(str/join " AND " (map #(str (column-sql %) " = ?") columns)) (vec xs)])))
 
 (defn- pattern-filters [accepted clauses bindings]
   (mapcat
@@ -90,7 +111,7 @@
                 ["FALSE" []]))
             v (if (ref/entity-ref? v)
                 (let [k (ref/key-tuple v)] (if (= 1 (count k)) (first k) k)) v)]
-        (concat (map #(vector (str (jdbc/identifier %) " IS NOT NULL") []) columns)
+        (concat (map #(vector (str (column-sql %) " IS NOT NULL") []) columns)
                 (keep identity [entity-filter (when vbound? (equality-filter accepted columns v))])))) clauses))
 
 (defn predicates
@@ -109,23 +130,73 @@
                      (when (and (= :var tag) (vars v) (= :const ctag) (instance? Long x))
                        (assoc predicate :column (vars v)))))) (:clauses request)))))
 
-(defn sql [accepted plan bindings max-row-bytes]
-  (let [columns (vec (distinct (concat (pm/key-columns accepted)
-                                      (mapcat #(pm/attribute-columns accepted (second (second (:terms %))))
-                                              (:clauses plan)))))
-        size (str/join " + " (map #(str "COALESCE(octet_length(" (jdbc/identifier %) "::text)::bigint,0)") columns))
+(defn- selected-columns [accepted plan]
+  (vec (distinct (concat (pm/key-columns accepted)
+                         (mapcat #(pm/attribute-columns accepted (second (second (:terms %))))
+                                 (:clauses plan))))))
+
+(defn fetch-charge
+  "Reserve a decoded page and scratch. Fixed-width PostgreSQL scalars need
+  at most 64 text bytes each; variable-width values retain the SQL row cap."
+  [accepted plan fetch-size max-row-bytes]
+  (let [columns (selected-columns accepted plan)
+        fixed? (every? #(#{"int2" "int4" "int8" "bool" "uuid" "float4" "float8" "timestamptz"}
+                          (get-in accepted [:requirements :columns % :type])) columns)
+        row-bytes (if fixed? (min max-row-bytes (* 64 (count columns))) max-row-bytes)]
+    (+ 131072 (* fetch-size (+ (* 16 row-bytes) (* 1024 (count columns)) 2048)))))
+
+(defn- query-sql [accepted plan bindings max-row-bytes join-sql ordinal params]
+  (let [columns (selected-columns accepted plan)
+        size (str/join " + " (map #(str "COALESCE(octet_length(" (column-sql %) "::text)::bigint,0)") columns))
         bounded (str "(" size ") <= " (long max-row-bytes))
         filters (concat (pattern-filters accepted (:clauses plan) bindings)
                         (map (fn [{:keys [column operator args]}]
-                               [(str (jdbc/identifier column) " "
+                               [(str (column-sql column) " "
                                      ({:= "=" :not= "<>" :< "<" :<= "<=" :> ">" :>= ">="} operator) " ?")
                                 [(second (second args))]]) (:predicates plan)))]
     {:columns columns
-     :sql (str "SELECT NOT (" bounded "), "
-               (str/join ", " (map #(str "CASE WHEN " bounded " THEN " (jdbc/identifier %) " END") columns))
-               " FROM ONLY " (jdbc/relation (get-in accepted [:requirements :table]))
+     :sql (str "SELECT " ordinal "NOT (" bounded "), "
+               (str/join ", " (map #(str "CASE WHEN " bounded " THEN " (column-sql %) " END") columns))
+               " FROM ONLY " (jdbc/relation (get-in accepted [:requirements :table])) " AS r" join-sql
                (when (seq filters) (str " WHERE " (str/join " AND " (map first filters)))))
-     :params (vec (mapcat second filters))}))
+     :params (into (vec params) (mapcat second) filters)}))
+
+(defn sql [accepted plan bindings max-row-bytes]
+  (query-sql accepted plan bindings max-row-bytes nil nil []))
+
+(defn batch-sql
+  "Join bounded input keys to the table and return an input ordinal per row.
+  SQL equality remains a superset; each result is rechecked with its original
+  binding. Keys without safe equality pushdown use an ordinal-only join."
+  [accepted plan inputs max-row-bytes]
+  (jdbc/ensure! (and (<= 1 (count inputs) (:max-request-binding-rows constraints))
+                     (= 1 (count (:requires plan)))) :open)
+  (let [entity? (= 0 (:position plan))
+        columns (if entity? (pm/key-columns accepted)
+                    (pm/attribute-columns accepted (second (second (:terms (:anchor plan))))))
+        keys (mapv (fn [{:keys [values]}]
+                     (let [x (first values)
+                           valid? (or (not entity?)
+                                      (and (ref/entity-ref? x)
+                                           (value/matches-type? (get-in accepted [:identity :type]) x)))
+                           x (if (ref/entity-ref? x)
+                               (let [key (ref/key-tuple x)] (if (= 1 (count key)) (first key) key)) x)]
+                       (when valid? (second (equality-filter accepted columns x))))) inputs)
+        pushdown? (every? some? keys)
+        ;; Widen integral inputs: casting an out-of-range lookup key to int2
+        ;; or int4 would fail instead of correctly finding no matching row.
+        types (mapv #(let [type (get-in accepted [:requirements :columns % :type])]
+                       (if (#{"int2" "int4"} type) "int8" type)) columns)
+        names (mapv #(str "k" %) (range (count columns)))
+        placeholders (when pushdown? (str ", " (str/join ", " (map #(str "?::" %) types))))
+        rows (map-indexed (fn [i _] (str "(" i placeholders ")")) inputs)
+        join-sql (str " JOIN (VALUES " (str/join ", " rows) ") AS b(i"
+                      (when pushdown? (str ", " (str/join ", " names))) ") ON "
+                      (if pushdown?
+                        (str/join " AND " (map #(str (column-sql %1) " = b." %2) columns names))
+                        "TRUE"))]
+    (query-sql accepted plan (:bindings plan) max-row-bytes join-sql "b.i, "
+               (when pushdown? (mapcat identity keys)))))
 
 (defn decode [accepted column ^ResultSet rs i]
   (let [x (case (get-in accepted [:requirements :columns column :type])
@@ -143,9 +214,11 @@
                             (some-> x .toInstant)))]
     (when-not (.wasNull rs) x)))
 
-(defn read-row [accepted columns ^ResultSet rs]
-  (when (.getBoolean rs 1) (jdbc/fail! :query-source/limit :decode))
-  (into {} (map-indexed (fn [i column] [column (decode accepted column rs (+ i 2))]) columns)))
+(defn read-row
+  ([accepted columns rs] (read-row accepted columns rs 0))
+  ([accepted columns ^ResultSet rs offset]
+   (when (.getBoolean rs (inc offset)) (jdbc/fail! :query-source/limit :decode))
+   (into {} (map-indexed (fn [i column] [column (decode accepted column rs (+ i offset 2))]) columns))))
 
 (defn match-row [accepted plan bindings row]
   (let [keys (mapv row (pm/key-columns accepted))

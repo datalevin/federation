@@ -46,7 +46,7 @@
 
 (defn profile! [profile]
   (let [profile (merge {:connect-timeout-ms 10000 :statement-timeout-ms 10000
-                        :fetch-size 32 :max-row-bytes 16384 :fusion? true} profile)]
+                        :fetch-size 128 :max-row-bytes 16384 :fusion? true} profile)]
     (ensure! (= 1 (count (filter some? ((juxt :jdbc-url :data-source) profile)))) :profile)
     (when-let [url (:jdbc-url profile)]
       (ensure! (and (string? url) (str/starts-with? url "jdbc:postgresql:")) :profile))

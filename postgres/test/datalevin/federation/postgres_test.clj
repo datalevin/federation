@@ -1,9 +1,11 @@
 (ns datalevin.federation.postgres-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is testing]]
+            [datalevin.federation.entity-ref :as ref]
             [datalevin.federation.postgres :as pg]
             [datalevin.federation.postgres.jdbc :as jdbc]
             [datalevin.federation.postgres.plan :as plan]
             [datalevin.federation.postgres.mapping :as pm]
+            [datalevin.query.access.dependency :as dependency]
             [datalevin.query.source :as spi]))
 
 (def source-id #uuid "e8d23d75-321f-4d88-a293-077ed468b8b1")
@@ -67,6 +69,65 @@
         (is (every? #(= 1 (count (:clauses %))) (plan/choices d (request different) true)))))
     (is (every? #(= 1 (count (:clauses %))) (plan/choices d (request patterns) false)))))
 
+(deftest bounded-alternatives-keep-a-complete-independent-cover
+  (doseq [width [11 40]]
+    (let [attributes (into {} (map #(vector (keyword "row" (str "value" %)) "title")) (range width))
+          accepted (pg/accept-mapping catalog (assoc declaration :attributes attributes))
+          d (spi/-source-info (pg/source accepted profile))
+          entity (ref/entity-ref (get-in accepted [:identity :type]) [1])
+          clauses (conj (mapv (fn [i]
+                               {:id i :kind :pattern
+                                :terms [[:var '?e] [:const (keyword "row" (str "value" i))]
+                                        [:var (symbol (str "?v" i))]]}) (range width))
+                        {:id width :kind :pattern
+                         :terms '[[:var ?other] [:const :row/value0] [:var ?v0]]})]
+      (doseq [fusion? [false true]
+              :let [minimum (if fusion? 2 (count clauses))]
+              cap (distinct [minimum (max minimum 32)])
+              bindings [{} {'?e entity}]
+              available [[{:variable '?e :type (get-in accepted [:identity :type]) :nullable? false}]
+                         (plan/columns d clauses)]]
+        (testing (pr-str {:width width :fusion? fusion? :cap cap :bound? (seq bindings)
+                          :inputs (count available)})
+          (let [req (assoc (request clauses) :bindings bindings :available-inputs available :max-alternatives cap)
+                choices (plan/choices d req fusion?)
+                scans (filter #(= :attribute-enumeration (:kind %)) choices)
+                scheduled (dependency/schedule
+                            {:inputs [] :required-work (set (map :id clauses)) :required-vars #{}
+                             :choices (mapv #(assoc % :covers (set (map :id (:clauses %)))
+                                                    :after #{} :resources #{}) scans)
+                             :check! (fn []) :reserve! (fn [_]) :max-states 4096})]
+            (is (<= (count choices) cap))
+            (is (= choices (plan/choices d req fusion?)))
+            (is (= (count choices) (count (set (map :id choices)))))
+            ;; Scans alone must form a disjoint, executable cover. Merely
+            ;; retaining each clause in some dependent lookup is insufficient.
+            (is (every? #(empty? (:requires %)) scans))
+            (is (= :complete (:status scheduled)))
+            (is (= (zipmap (map :id clauses) (repeat 1))
+                   (frequencies (mapcat :covers (:choices scheduled)))))))))))
+
+(deftest fused-entity-lookups-do-not-repeat-the-same-access
+  (let [d (spi/-source-info (pg/source accepted profile))
+        req (assoc (request patterns) :available-inputs
+                   [{:variable '?e :type (get-in accepted [:identity :type]) :nullable? false}])
+        lookups (filter #(and (= :entity-lookup (:kind %)) (= 2 (count (:clauses %))))
+                        (plan/choices d req true))]
+    (is (= 1 (count lookups)))
+    (is (= '?e (get-in (first lookups) [:requires 0 :variable])))))
+
+(deftest insufficient-alternative-budgets-fail-explicitly
+  (let [d (spi/-source-info (pg/source accepted profile))]
+    (doseq [fusion? [false true]
+            clauses [patterns (assoc-in patterns [1 :terms 0] [:var '?other])
+                     (mapv #(assoc-in % [:terms 0] [:ignore]) patterns)]
+            :when (or (not fusion?) (not= clauses patterns))]
+      (is (= {:error :query-source/limit :phase :planning}
+             (try
+               (plan/choices d (assoc (request clauses) :max-alternatives 1) fusion?)
+               nil
+               (catch clojure.lang.ExceptionInfo e (ex-data e))))))))
+
 (deftest identifiers-and-values-cannot-become-sql
   (is (= "\"odd\"\"name\"" (jdbc/identifier "odd\"name")))
   (let [d (spi/-source-info (pg/source accepted profile))
@@ -76,3 +137,30 @@
         q (plan/sql accepted choice {} 4096)]
     (is (= [input] (:params q)))
     (is (not (.contains (:sql q) input)))))
+
+(deftest batched-keys-use-parameters-and-keep-constant-filters
+  (let [d (spi/-source-info (pg/source accepted profile))
+        clauses (conj patterns {:id 2 :kind :pattern :terms '[[:var ?e] [:const :order/id] [:const 1]]})
+        req (assoc (request clauses) :available-inputs [{:variable '?title :type :string :nullable? false}])
+        choice (first (plan/choices d req true))
+        input "'; DROP TABLE orders; --"
+        q (plan/batch-sql accepted choice [{:binding-id 91 :values [input]}
+                                           {:binding-id 92 :values ["Alpha"]}] 4096)]
+    (is (.contains (:sql q) "JOIN (VALUES (0, ?::text), (1, ?::text)) AS b(i, k0) ON r.\"title\" = b.k0"))
+    (is (.contains (:sql q) "r.\"amount\" IS NOT NULL"))
+    (is (.contains (:sql q) "r.\"id\" = ?"))
+    (is (= [input "Alpha" 1] (:params q)))
+    (is (not (.contains (:sql q) input)))))
+
+(deftest batched-integral-keys-are-not-narrowed-to-the-physical-column-type
+  (let [accepted (pg/accept-mapping (assoc-in catalog [:columns "amount"]
+                                             {:type "int2" :type-id 21 :modifier -1 :not-null? false :collation 0})
+                                    declaration)
+        d (spi/-source-info (pg/source accepted profile))
+        clauses [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :order/amount] [:var ?amount]]}]
+        req (assoc (request clauses) :available-inputs [{:variable '?amount :type :long :nullable? false}])
+        q (plan/batch-sql accepted (first (plan/choices d req true))
+                          [{:binding-id 1 :values [40000]} {:binding-id 2 :values [1]}] 4096)]
+    (is (.contains (:sql q) "?::int8"))
+    (is (not (.contains (:sql q) "?::int2")))
+    (is (= [40000 1] (:params q)))))

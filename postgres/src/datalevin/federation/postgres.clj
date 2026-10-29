@@ -6,7 +6,7 @@
             [datalevin.federation.postgres.plan :as plan]
             [datalevin.query.source :as spi]
             [datalevin.query.source.value :as value])
-  (:import [java.sql Connection SQLException]
+  (:import [java.sql Connection ResultSet SQLException]
            [java.util UUID]))
 
 (def accept-mapping
@@ -42,38 +42,58 @@
       (with-open [stmt (jdbc/statement context (str "CLOSE " portal) [])] (.execute stmt))
       (catch Exception _ nil))))
 
+(defn- reserve-cursor! [ctl accepted candidate bindings profile]
+  (let [fixed (* 4 (value/value-charge [candidate bindings]))]
+    (loop [n (:fetch-size profile)]
+      (let [bytes (+ fixed (plan/fetch-charge accepted candidate n (:max-row-bytes profile)))
+            result (try
+                     (spi/reserve! ctl {:retained-bytes bytes})
+                     (catch clojure.lang.ExceptionInfo e
+                       (if (and (> n 1) (= :query-source/limit (:error (ex-data e)))
+                                (= :retained-bytes (:category (ex-data e))))
+                         nil (throw e))))]
+        ;; Failed reservations charge nothing. Reduce the page before any SQL
+        ;; runs, retaining the same row cap and shared query memory limit.
+        (if result [result n] (recur (max 1 (quot n 2))))))))
+
 (defn- next-row! [{:keys [accepted candidate inputs context state metrics]}]
   (loop []
     (jdbc/check! context)
     (when (:closed? @state) (fail! :query-source/invalid :fetch))
     (let [inputs @inputs
-          {:keys [pending remaining portal more? input-index current-bindings binding-id columns]} @state]
+          {:keys [pending remaining portal more? input-index input-start columns]} @state]
       (cond
         pending pending
         (seq remaining)
-        (let [row (first remaining)]
+        (let [[ordinal row] (first remaining)
+              input (when inputs (nth inputs (+ input-start ordinal)))
+              bindings (merge (:bindings candidate)
+                              (zipmap (map :variable (:requires candidate)) (:values input)))]
           (swap! state assoc :remaining (next remaining))
-          (if-let [result (plan/match-row accepted candidate current-bindings row)]
-            (let [pending {:row result :id binding-id}]
+          (if-let [result (plan/match-row accepted candidate bindings row)]
+            (let [pending {:row result :id (:binding-id input)}]
               (swap! state assoc :pending pending) pending)
             (recur)))
         (and portal more?)
         (let [n (get-in context [:profile :fetch-size])
               rows (jdbc/query! context :fetch (str "FETCH FORWARD " n " FROM " portal) []
-                                #(plan/read-row accepted columns %))]
+                                (fn [^ResultSet rs]
+                                  [(if inputs (.getInt rs 1) 0)
+                                   (plan/read-row accepted columns rs (if inputs 1 0))]))]
           (swap! metrics update :read-rows + (count rows))
           (swap! state assoc :remaining (seq rows) :more? (= n (count rows)))
           (recur))
         portal (do (close-portal! context state) (recur))
         (< input-index (if inputs (count inputs) 1))
-        (let [input (when inputs (nth inputs input-index))
-              bindings (merge (:bindings candidate)
-                              (zipmap (map :variable (:requires candidate)) (:values input)))
-              query (plan/sql accepted candidate bindings (get-in context [:profile :max-row-bytes]))
+        (let [end (if inputs (min (count inputs) (+ input-index (:max-request-binding-rows plan/constraints))) 1)
+              max-row-bytes (get-in context [:profile :max-row-bytes])
+              query (if inputs
+                      (plan/batch-sql accepted candidate (subvec inputs input-index end) max-row-bytes)
+                      (plan/sql accepted candidate (:bindings candidate) max-row-bytes))
               portal (str "dtlv_" (.replace (str (UUID/randomUUID)) "-" ""))]
           (jdbc/execute! context :open (str "DECLARE " portal " NO SCROLL CURSOR FOR " (:sql query)) (:params query))
           (swap! state assoc :portal portal :columns (:columns query) :more? true
-                 :input-index (inc input-index) :current-bindings bindings :binding-id (:binding-id input))
+                 :input-index end :input-start input-index)
           (recur))
         :else nil))))
 
@@ -151,17 +171,13 @@
                 (fail! :query-source/limit :open)))
           (ensure! (not (contains? open :bindings)) :open))
         (let [profile (:profile context)
-              columns (count (get-in view [:accepted :requirements :columns]))
-              bytes (+ 131072 (* (:fetch-size profile) (+ (* 16 (:max-row-bytes profile))
-                                                          (* 1024 columns) 2048))
-                       (* 4 (value/value-charge [candidate (:bindings open)])))
-              token (spi/reserve! ctl {:retained-bytes bytes})]
+              [token fetch-size] (reserve-cursor! ctl (:accepted view) candidate (:bindings open) profile)]
           (try
             (let [metrics (atom {:batches 0 :rows 0 :charged-bytes 0 :read-rows 0 :read-bytes nil
                                  :external-requests 0 :elapsed-ns 0})
                   cursor (->Cursor (:accepted view) candidate
                                    (atom (when dependent? (value/owned-copy (:bindings open))))
-                                   (assoc context :metrics metrics)
+                                   (-> context (assoc :metrics metrics) (assoc-in [:profile :fetch-size] fetch-size))
                                    (atom {:input-index 0}) metrics token state)]
               (swap! state update :cursors conj cursor)
               cursor)

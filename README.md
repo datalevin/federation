@@ -46,11 +46,11 @@ supporting snapshot scans and entity/value lookups.
 PostgreSQL's current fit is selective enrichment: use native records or another
 source to identify a small set of rows, then retrieve their scalar attributes.
 Cross-table joins work in Datalevin. Broader reporting workloads still face
-significant gaps: lookups issue SQL for each key, date/decimal filtering has
-limited pushdown, and views, partitioned parents, RLS-protected tables, and
-several common column types are unsupported. Large scans can exhaust the
-default request budget. Wide queries can also hit a
-[known planning limit](postgres/README.md#known-planning-limit-and-follow-up-priorities).
+significant gaps: date/decimal filtering has limited pushdown, and views,
+partitioned parents, RLS-protected tables, and several common column types are
+unsupported. Large scans can exhaust the default request budget. Candidate
+pruning preserves complete access coverage
+within the configured [planning bound](postgres/README.md#planning-bounds-and-follow-up-priorities).
 Fusion reduces repeated reads of one entity; it does not delegate a whole
 relational query to PostgreSQL.
 
@@ -216,8 +216,8 @@ uses the saved identities and mappings without discovering a new schema.
   Local relations and accepted file exports provide snapshots. PostgreSQL
   mappings sharing a source/profile use one read-only, repeatable-read
   transaction. There is no atomic snapshot across independent sources.
-- PostgreSQL currently reads one key per SQL cursor and fetches 32 rows per
-  request by default. SQL joins across entities, aggregates, and ordering are
+- PostgreSQL batches up to 256 lookup keys per SQL cursor and fetches 128 rows
+  per request by default. SQL joins across entities, aggregates, and ordering are
   not delegated. Check request and memory budgets for larger workloads; see
   [bounds and lifecycle](postgres/README.md#bounds-and-lifecycle).
 - GitHub queries need an entity, key, or issue number to start a lookup. A query

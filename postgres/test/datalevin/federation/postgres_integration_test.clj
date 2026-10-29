@@ -112,6 +112,35 @@
     (is (not (.contains (pr-str fused) "DROP TABLE")))
     (is (not (.contains (pr-str fused) "jdbc:postgresql")))))
 
+(deftest wide-two-entity-queries-keep-complete-plans-under-the-candidate-cap
+  (let [attributes (into {} (map #(vector (keyword "row" (str "value" %)) "title")) (range 11))
+        accepted (pg/accept-mapping (pg/discover *profile* [*schema* "orders"])
+                   {:source-instance-id unit/source-id :relation-id :test/wide
+                    :identity-attribute :row/id :attributes attributes})
+        compiled (mapping/compile-logical-mapping accepted)
+        facts (vec (mapcat #(mapping/project-facts compiled [(:order/id %)]
+                             (zipmap (keys attributes) (repeat (:order/title %)))) records))
+        entities (mapv #(ref/entity-ref (get-in accepted [:identity :type]) [%]) [1 2 4 99])
+        where (conj (mapv (fn [i] ['$p '?e (keyword "row" (str "value" i))
+                                  (symbol (str "?v" i))]) (range 11))
+                    '[$p ?other :row/id ?other-id])
+        q (assoc (query '[?v0 ?other-id] where) :in '[$p [?e ...]])
+        expected (set (d/q (dissoc q :query-source) facts entities))]
+    (is (= 8 (count expected)))
+    (doseq [fusion? [false true]
+            cap [nil (if fusion? 2 12)]]
+      (let [provider (pg/source accepted (assoc *profile* :fusion? fusion?))
+            q (cond-> q cap (assoc-in [:query-source :planning :max-alternatives] cap))
+            explained (d/explain {:run? true} q provider entities)]
+        (is (= expected (set (d/q q provider entities))) (pr-str [fusion? cap]))
+        (is (= (count expected) (:result-rows explained)))
+        (is (= 12 (count (set (mapcat :covers (mapcat :steps (:regions explained)))))))
+        (is (zero? (:live-sessions (pg/statistics provider))))))
+    (let [provider (pg/source accepted *profile*)]
+      (is (= :query-source/limit
+             (category #(d/q (assoc-in q [:query-source :planning :max-alternatives] 1) provider entities))))
+      (is (zero? (:live-sessions (pg/statistics provider)))))))
+
 (deftest dependent-inputs-entities-native-joins-and-rules
   (let [q (assoc (query '[?id ?title ?witness]
                         '[[$p ?e :order/id ?id] [$p ?e :order/title ?title]])
@@ -192,6 +221,122 @@
     (is (zero? (:live-sessions (pg/statistics provider))))
     (control/close! ctl)))
 
+(deftest batched-lookups-preserve-binding-ids-and-equality
+  (let [entity-type (get-in *accepted* [:identity :type])
+        entity #(ref/entity-ref entity-type [%])
+        stamp (:order/stamp (first records))]
+    (doseq [[attribute variable type values]
+            [[:order/title '?value :string ["βeta" "Alpha" "missing"]]
+             [:order/status '?value :string ["paid" "held" "missing"]]
+             [:order/amount '?value :bigdec [10.2500M 10.25M 99M 30.0000M]]
+             [:order/stamp '?value :data [stamp (.plusNanos ^Instant stamp 1000)]]
+             [:order/title '?e entity-type [(entity 2) (entity 1) (entity 99)]]]]
+      (let [provider (source {:fetch-size 2}) ctl (control/create) request (request provider ctl)
+            session (spi/-open-session provider request)
+            clauses [{:id 0 :kind :pattern :terms [[:var '?e] [:const attribute] [:var '?value]]}
+                     {:id 1 :kind :pattern :terms '[[:var ?e] [:const :order/id] [:var ?id]]}]
+            available [{:variable variable :type type :nullable? false}]
+            alternative (first (alternatives provider session request clauses available))
+            inputs (mapv (fn [i x] {:binding-id (+ 90 i) :values [x]}) (range) values)
+            q {:find '[?witness ?id] :in ['$p [[variable '?witness]]]
+               :where [['$p '?e attribute '?value] '[$p ?e :order/id ?id]]}
+            expected (set (d/q q (eager) (mapv #(vector (first (:values %)) (:binding-id %)) inputs)))]
+        (try
+          (let [cursor (open provider session request alternative inputs)]
+            (try
+              (let [{:keys [rows ids]} (consume cursor ctl alternative true)
+                    columns (map :variable (:columns alternative))
+                    actual (set (map (fn [id row] [id (get (zipmap columns row) '?id)]) ids rows))]
+                (is (= expected actual) (pr-str attribute))
+                (is (<= (:external-requests (spi/-cursor-metrics cursor)) 10)))
+              (finally (spi/-close-cursor! cursor))))
+          (finally (spi/-close-session! session)))
+        (is (released? ctl))
+        (is (zero? (:live-sessions (pg/statistics provider))))
+        (control/close! ctl)))))
+
+(deftest thousands-of-dependent-keys-fit-the-default-request-budget
+  (sql! (str "CREATE TABLE " (table "bulk") " (id bigint PRIMARY KEY, value bigint)"))
+  (sql! (str "INSERT INTO " (table "bulk") " SELECT i, i*10 FROM generate_series(1,1200) i"))
+  (let [accepted (pg/accept-mapping (pg/discover *profile* [*schema* "bulk"])
+                   {:source-instance-id unit/source-id :relation-id :test/bulk :identity-attribute :row/id
+                    :attributes {:row/value "value"}})
+        entity #(ref/entity-ref (get-in accepted [:identity :type]) [%])
+        inputs (conj (mapv #(vector (entity %) :original) (range 1 1201))
+                     [(entity 1) :duplicate] [(entity 99999) :missing])
+        q {:find '[?id ?value ?witness] :in '[$p [[?e ?witness]]]
+           :where '[[$p ?e :row/id ?id] [$p ?e :row/value ?value]] :timeout 30000
+           :query-source {:limits {:batch-rows 7}}}
+        expected (conj (set (map #(vector % (* 10 %) :original) (range 1 1201))) [1 10 :duplicate])]
+    (doseq [fusion? [false true] variable '[?e ?id]]
+      (let [inputs (if (= variable '?e) inputs
+                        (mapv (fn [[entity witness]] [(first (ref/key-tuple entity)) witness]) inputs))
+            q (assoc q :in ['$p [[variable '?witness]]])
+            provider (pg/source accepted (assoc (dissoc *profile* :fetch-size) :fusion? fusion?))
+            explained (d/explain {:run? true} q provider inputs)
+            requests (reduce + (map #(get-in % [:metrics :external-requests]) (:cursors explained)))]
+        (is (= expected (set (d/q q provider inputs))))
+        (is (= (count expected) (:result-rows explained)))
+        ;; Entity references reach the binding-byte cap before the row cap;
+        ;; separate accesses also collect entity keys for their second step.
+        (is (< requests (if (and fusion? (= variable '?id)) 32 128))
+            (pr-str {:lookup variable :fusion? fusion? :requests requests}))
+        (is (zero? (:live-sessions (pg/statistics provider))))))))
+
+(deftest larger-default-fetches-stream-a-hundred-thousand-rows-within-budget
+  (sql! (str "CREATE TABLE " (table "scan") " (id bigint PRIMARY KEY)"))
+  (sql! (str "INSERT INTO " (table "scan") " SELECT i FROM generate_series(1,100000) i"))
+  (let [accepted (pg/accept-mapping (pg/discover *profile* [*schema* "scan"])
+                   {:source-instance-id unit/source-id :relation-id :test/scan :identity-attribute :row/id
+                    :attributes {}})
+        provider (pg/source accepted (dissoc *profile* :fetch-size))
+        ctl (control/create) request (request provider ctl)
+        session (spi/-open-session provider request)]
+    (try
+      (let [clauses [{:id 0 :kind :pattern :terms '[[:ignore] [:const :row/id] [:var ?id]]}]
+            alternative (first (alternatives provider session request clauses []))
+            cursor (open provider session request alternative nil)]
+        (try
+          ;; Stream and release pages; core result materialization has separate
+          ;; memory charges and is not part of this adapter request-budget check.
+          (let [[rows total]
+                (loop [rows 0 total 0]
+                  (let [fetch {:control ctl :max-rows 4096 :max-bytes 1048576}
+                        batch (batch/accept! {:control ctl} (:columns alternative) false fetch
+                                (spi/-next-batch! cursor fetch) identity)
+                        rows (+ rows (:row-count batch))
+                        total (+ total (reduce + (map first (:rows batch))))]
+                    (spi/release! (:reservation batch))
+                    (if (:exhausted? batch) [rows total] (recur rows total))))]
+            (is (= [100000 5000050000] [rows total]))
+            (is (< (:external-requests (control/usage ctl)) 800)))
+          (finally (spi/-close-cursor! cursor))))
+      (finally (spi/-close-session! session)))
+    (is (released? ctl))
+    (is (zero? (:live-sessions (pg/statistics provider))))
+    (control/close! ctl)))
+
+(deftest fetch-pages-shrink-to-fit-the-shared-memory-budget
+  (doseq [max-row-bytes [16384 1048576]]
+    (let [provider (pg/source *accepted* (assoc (dissoc *profile* :fetch-size) :max-row-bytes max-row-bytes))
+          ctl (control/create {:limits {:retained-bytes (* 16 1024 1024)}})
+          request (request provider ctl)
+          session (spi/-open-session provider request)]
+      (try
+        (let [clauses [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :order/title] [:var ?title]]}]
+              alternative (first (alternatives provider session request clauses []))]
+          (if (= max-row-bytes 16384)
+            (let [cursor (open provider session request alternative nil)]
+              (try
+                (is (= #{"Alpha" "βeta" "x'; DROP TABLE orders; --"}
+                       (set (map second (:rows (consume cursor ctl alternative false))))))
+                (finally (spi/-close-cursor! cursor))))
+            (is (= :query-source/limit (category #(open provider session request alternative nil))))))
+        (finally (spi/-close-session! session)))
+      (is (released? ctl))
+      (is (zero? (:live-sessions (pg/statistics provider))))
+      (control/close! ctl))))
+
 (deftest used-schema-drift-fails-unrelated-additions-do-not
   (let [provider (source) q '[:find ?title :in $p :where [$p ?e :order/title ?title]]]
     (sql! (str "ALTER TABLE " (table "orders") " ADD COLUMN unused integer"))
@@ -216,7 +361,15 @@
                        [$p ?e :row/key ?key] [$p ?e :row/title ?title] [$p ?e :row/parent ?parent]] provider))))
     (is (= #{["right"]}
            (set (d/q '[:find ?title :in $p ?key :where [$p ?e :row/key ?key] [$p ?e :row/title ?title]]
-                     provider ["b" 1]))))))
+                     provider ["b" 1]))))
+    (is (= #{["left" :a] ["right" :b] ["left" :duplicate]}
+           (set (d/q '[:find ?title ?witness :in $p [[?key ?witness]] :where
+                       [$p ?e :row/key ?key] [$p ?e :row/title ?title]]
+                     provider [[["a" 1] :a] [["b" 1] :b] [["a" 1] :duplicate] [["missing" 1] :missing]]))))
+    (is (= #{["left"] ["right"]}
+           (set (d/q '[:find ?title :in $p [?parent ...] :where
+                       [$p ?e :row/parent ?parent] [$p ?e :row/title ?title]]
+                     provider (mapv #(ref/entity-ref type [%]) [8 7 99])))))))
 
 (deftest aliases-and-relations-share-one-session
   (let [provider (source)
@@ -334,6 +487,10 @@
                                                             [(byte-array [0 1 -1]) 1.2500M 9007199254740993]) a)
             q {:find '[?id] :in ['$p [v '...]] :where [['$p '?e a v] ['$p '?e :row/id '?id]]}]
         (is (= 1 (count (d/q q provider [expected]))))))
+    (doseq [[attribute values] [[:row/small [-4 40000]] [:row/n [42 3000000000]]]]
+      (let [q {:find '[?id] :in '[$p [?value ...]]
+               :where [['$p '?e attribute '?value] '[$p ?e :row/id ?id]]}]
+        (is (= 1 (count (d/q q provider values))))))
     (sql! (str "UPDATE " (table "types") " SET stamp='infinity'"))
     (is (= :query-source/invalid (category #(d/q q provider))))))
 

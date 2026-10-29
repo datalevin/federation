@@ -4,6 +4,8 @@
 through ordinary `d/q` and `d/explain`, alongside native Datalevin data and other
 adapters. It supports table scans, entity and value lookups, and same-entity
 fusion: several scalar attributes of one entity can be read by one SQL cursor.
+Dependent lookups combine up to 256 input keys in a parameterized `VALUES`
+join, with results associated with their original binding IDs.
 
 This is a development snapshot requiring **Datalevin 1.2.9** for same-entity
 fusion. The module still declares `1.2.8` as a provided dependency; applications
@@ -24,7 +26,7 @@ application schema or a larger reporting query:
 
 | Use case | Current gap | Effect on the workload |
 | --- | --- | --- |
-| Enrich hundreds or thousands of keys | One SQL cursor per distinct input key; no bulk `VALUES`, `IN`, or array binding | At least a declaration and a fetch per key, plus cleanup. Network latency and the request budget can dominate even indexed lookups. |
+| Enrich large key sets | Batches accept at most 256 keys and 256 KiB of bindings; matches arrive in bounded fetch pages | Request and memory budgets apply across all batches. Network latency and nonunique value matches can still dominate. |
 | Filter orders by amount or events by time | Only eligible `Long` comparisons are pushed down; decimal and temporal ranges stay in Datalevin | A selective final result can still require fetching a large PostgreSQL population. Pattern equality has broader pushdown support, but `timestamptz` equality currently also stays local. |
 | Read an existing application schema | No `date`, `timestamp without time zone`, `time`, `interval`, enums, domains, `char`, `citext`, arrays, or JSON/JSONB mapping | These fields cannot be exposed, although supported columns of the same table can still be selected. Collection-valued attributes are not implemented. |
 | Read reporting views, partitioned datasets, or tenant tables with RLS | Only ordinary tables with validated nondeferrable primary keys are accepted; queries use `ONLY` | Views, materialized views, partitioned parents, and RLS-enabled tables are rejected. Inheritance children are excluded. A unique index or a user-supplied key assertion cannot substitute for the primary key. |
@@ -42,33 +44,31 @@ preserve microseconds. Native Datalevin `:db.type/instant` uses `java.util.Date`
 Joining those representations needs an explicit conversion and a decision
 about precision; they are not interchangeable query keys.
 
-## Known planning limit and follow-up priorities
+## Planning bounds and follow-up priorities
 
-The [adapter planner](src/datalevin/federation/postgres/plan.clj) currently takes
-the first `:max-alternatives` candidates, default `32`, without preserving
-coverage of every pattern. A review probe with eleven attributes on one bound
-entity and a second entity clause generated 32 candidates, all omitting the
-second clause. Such a request has no complete plan even though the adapter
-could execute it. This is a planning defect, not an unsupported SQL type or
-an empty result.
+The [adapter planner](src/datalevin/federation/postgres/plan.clj) preserves a
+complete set of independent accesses within `:max-alternatives`, default `32`,
+then fills remaining slots with lookup and separate-pattern alternatives.
+Same-entity fusion needs one reserved access per distinct entity term;
+patterns with an ignored entity each need their own access. With fusion
+disabled, each pattern needs its own reserved access. Repeated entity-lookup
+anchors within one fused group share a single alternative.
 
-Using `{:query-source {:planning {:max-alternatives 64}}}` restored coverage
-in that probe. It is a workaround for that request, not a general guarantee:
-candidate pruning must preserve a complete set of accesses. Disabling fusion
-can also change candidate pressure but is not a general fix.
+Wide queries, including eleven attributes on one bound entity plus a second
+entity clause, retain complete coverage under the default cap. If the cap
+cannot hold even the reserved accesses, planning fails explicitly with
+`:query-source/limit`. Increase the cap for that query, for example with
+`{:query-source {:planning {:max-alternatives 64}}}`.
 
 The highest-value follow-ups for ordinary federation are:
 
-1. Preserve complete coverage when bounding alternatives and avoid redundant
-   fused candidates. Wide queries should not fail because earlier candidates
-   consumed the response budget.
-2. Batch dependent keys into SQL requests, and measure scans and lookups with
-   realistic network latency and default query budgets.
-3. Add explicit temporal conversions and safe decimal/temporal predicate
+1. Measure batched lookups and scans with realistic network latency and
+   default query budgets.
+2. Add explicit temporal conversions and safe decimal/temporal predicate
    pushdown, followed by common enum/domain mappings.
-4. Extend relation support with proven keys and read guarantees for partitioned
+3. Extend relation support with proven keys and read guarantees for partitioned
    tables and views; define authorization behavior before supporting RLS.
-5. Add foreign-key discovery, prune unneeded payload columns while retaining
+4. Add foreign-key discovery, prune unneeded payload columns while retaining
    existence checks, and then evaluate further SQL delegation with the core SPI.
 
 These are follow-up work, not current capabilities. The existing integration
@@ -222,7 +222,7 @@ bounded, and a connection arriving after cancellation is closed.
 | --- | --- | --- |
 | `:connect-timeout-ms` | `10000` | Maximum connection/checkout wait |
 | `:statement-timeout-ms` | `10000` | PostgreSQL statement timeout |
-| `:fetch-size` | `32` | Rows per explicit server-cursor fetch; maximum 256 |
+| `:fetch-size` | `128` | Maximum rows per explicit server-cursor fetch; up to 256, reduced when needed to admit cursor workspace |
 | `:max-row-bytes` | `16384` | Maximum combined byte size of selected physical values rendered as SQL text |
 | `:fusion?` | `true` | Set false to compare separate EAV accesses |
 
@@ -232,27 +232,37 @@ fetch page, decoding, and pending row; returned batches have separate charges.
 The query's `:timeout` and `:query-source :limits` apply across all accesses.
 Cancellation aborts blocked database I/O and releases owned resources.
 
-The default query budget allows 1,024 external requests. At 32 rows per fetch,
-a scan returning 100,000 rows needs at least 3,125 fetch requests before counting
-setup and cursor declaration, so it cannot complete under that budget. Likewise,
-1,000 distinct lookup keys need at least 2,000 declaration/fetch requests. These
-are request-count calculations, not measured throughput limits. More accesses,
-aliases, or other sources share the same query budget.
+The default query budget allows 1,024 external requests. At 128 rows per fetch,
+a scan returning 100,000 rows needs 782 fetch requests, plus setup and cursor
+declaration. A thousand distinct lookup keys can share four SQL cursors when
+the bindings fit the byte cap. Smaller fetch settings still increase request
+pressure: at 32 rows per fetch, that scan needs at least 3,125 fetch requests.
+More accesses, aliases, or other sources share the same query budget. These
+counts describe requests, not throughput or backend work. Result
+materialization has separate memory charges; fitting the request budget does
+not guarantee that the whole query fits the memory budget.
 
 For larger workloads, inspect executed `d/explain` metrics and adjust both the
 profile's `:fetch-size` and the query's `:query-source :limits` deliberately.
 Larger fetches reserve more memory. Increasing `:max-row-bytes` also increases
-the reserved fetch workspace: a 1 MiB row cap with the default fetch size alone
-requires over 512 MiB of cursor workspace, exceeding the default 64 MiB query
-retention budget. Lower the fetch size or provide an appropriate memory budget
-when accepting larger fields. These settings do not add bulk lookup or broader
-predicate pushdown.
+the reserved fetch workspace for variable-width fields: a 1 MiB row cap with
+128 rows per fetch would require over 2 GiB of cursor workspace. Before SQL
+runs, the adapter reduces the fetch page until its reservation fits the shared
+memory budget. It still fails if even one row's workspace cannot be admitted.
+Pages selecting only fixed-width physical scalars reserve a smaller workspace
+based on those types. Smaller admitted pages can increase request pressure;
+inspect both request and memory limits when accepting larger fields.
 
-Each dependent input is executed with bound parameters; this initial version
-does not combine multiple keys into one SQL request. Connection setup, catalog
-reads, cursor declarations, and fetches consume the shared request budget.
-Resource cleanup (`CLOSE`, rollback, connection close) runs even after budget
-exhaustion. Cursor metrics report decoded rows, output batches, requests, and
+Dependent inputs use bound parameters and a generated ordinal to correlate
+each match with its binding ID. Composite keys and typed references retain
+their key components; every match rechecks Datalevin equality. When a key has
+no safe SQL equality filter, its batch uses local matching and can still scan
+the underlying table. Batching reduces round trips without adding predicate
+pushdown or delegating joins between mapped entities.
+
+Connection setup, catalog reads, cursor declarations, and fetches consume the
+shared request budget. Resource cleanup (`CLOSE`, rollback, connection close)
+runs even after budget exhaustion. Cursor metrics report decoded rows, output batches, requests, and
 elapsed time. Wire byte counts are unknown. `postgres/statistics` reports
 acquisition requests and live sessions separately.
 
@@ -278,5 +288,7 @@ The [integration suite](test/datalevin/federation/postgres_integration_test.clj)
 compares fused, separate, and eager results, runs the shared scan/lookup checks,
 and exercises native joins, rules, generated data, exact types, composite keys,
 references, saved definitions, concurrent writes, drift, quotas, pool return,
-late checkout, blocked fetch cancellation, and snapshot loss. The fault checks
+late checkout, blocked fetch cancellation, and snapshot loss. Scaling checks
+exercise 1,200 dependent keys through ordinary queries and stream 100,000
+rows under the default request and memory limits. The fault checks
 need permission to terminate their own test connection.
