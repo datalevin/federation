@@ -84,6 +84,166 @@
 (defn relational-plan? [explanation]
   (some #(= :relational-v1 (:policy %)) (:regions explanation)))
 
+(defn delegated-window [explanation]
+  (some :result-window (:regions explanation)))
+
+(deftest local-expressions-fall-back-from-sql-delegation
+  (let [queries
+        ['[:find ?id ?adjusted :in $p :where
+           [(+ ?amount 1M) ?adjusted] [$p ?e :order/id ?id] [$p ?e :order/amount ?amount]]
+         '[:find (sum ?adjusted) :with ?e :in $p :where
+           [$p ?e :order/amount ?amount] [(* ?amount 2M) ?adjusted]]
+         '[:find ?id :in $p :where
+           [$p ?e :order/id ?id] [$p ?e :order/title ?title] [(like ?title "A%")]]
+         '[:find ?id ?matches :in $p :where
+           [$p ?e :order/id ?id] [$p ?e :order/title ?title] [(not-like ?title "%a") ?matches]]
+         '[:find ?id :in $p :where
+           [$p ?e :order/id ?id] [$p ?e :order/status ?status] [(in ?status ["paid" "held"])]]
+         '[:find ?id :in $p :where
+           [$p ?e :order/id ?id] [$p ?e :order/amount ?amount] [(in ?amount [10.2500M])]]
+         '[:find ?id :in $p :where
+           [$p ?e :order/id ?id] [$p ?e :order/amount ?amount] [(in ?amount [10.25M])]]
+         '[:find ?id :in $p :where
+           [$p ?e :order/id ?id] [$p ?e :order/status ?status] [(not-in ?status #{"held"})]]]]
+    (doseq [fusion? [true false] relational? [true false]
+            :let [provider (source {:fusion? fusion? :relational? relational?})]
+            q queries]
+      (is (= (d/q q (eager)) (d/q q provider)) (pr-str [fusion? relational? q])))
+    (let [provider (source)
+          explained (d/explain {:run? true} (first queries) provider)]
+      (is (not (relational-plan? explained)))
+      (is (zero? (:live-sessions (pg/statistics provider)))))))
+
+(deftest local-expressions-compose-with-native-joins-and-input-collections
+  (let [q '[:find ?label ?adjusted :in $native $p ?allowed
+            :where [$native ?customer :customer/id ?owner] [$native ?customer :customer/label ?label]
+            [$p ?e :order/owner ?owner] [$p ?e :order/status ?status] [(in ?status ?allowed)]
+            [$p ?e :order/amount ?amount] [(+ ?amount 1M) ?adjusted]]
+        native [[1 :customer/id 7] [1 :customer/label "selected"]
+                [2 :customer/id 8] [2 :customer/label "other"]]
+        conn (d/create-conn nil {:customer/id {:db/valueType :db.type/long}
+                                :customer/label {:db/valueType :db.type/string}}
+                           {:kv-opts {:inmemory? true} :background-sampling? false})]
+    (try
+      (d/transact! conn [[:db/add 1 :customer/id 7] [:db/add 1 :customer/label "selected"]
+                        [:db/add 2 :customer/id 8] [:db/add 2 :customer/label "other"]])
+      (doseq [provider [(source) (source {:fusion? false :relational? false})]]
+        (is (= (d/q q native (eager) ["paid"])
+               (d/q q @conn provider ["paid"])))
+        (is (zero? (:live-sessions (pg/statistics provider)))))
+      (finally (d/close conn)))))
+
+(deftest failed-local-expressions-release-postgres-session-and-workspace
+  (doseq [expression '[(/ ?amount 0M) (+ ?amount 1E-10000000M)]
+          :let [provider (source)
+                q {:find '[?adjusted] :in '[$p]
+                   :where [['$p '_ :order/amount '?amount] [expression '?adjusted]]
+                   :query-source {:limits {:retained-bytes (* 16 1024 1024)}}}
+                failure (error #(d/q q provider))]]
+    (is (= (if (= '/ (first expression)) :query-source/provider :query-source/limit) (:error failure)))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
+(deftest sql-windows-follow-find-distinctness-with-and-grouping
+  (sql! (str "CREATE TABLE " (table "window_groups") " (id bigint PRIMARY KEY, g bigint, v numeric, flag boolean)"))
+  (sql! (str "INSERT INTO " (table "window_groups") " VALUES (1,1,1.0,false),(2,1,1.00,false),"
+             "(3,2,1.0,true),(4,2,2.0,true),(5,3,3.0,false)"))
+  (let [accepted (pg/accept-mapping (pg/discover *profile* [*schema* "window_groups"])
+                   {:source-instance-id unit/source-id :relation-id :test/window-groups :identity-attribute :row/id
+                    :attributes {:row/group "g" :row/value "v" :row/flag "flag"}})
+        provider (pg/source accepted *profile*) compiled (mapping/compile-logical-mapping accepted)
+        facts (vec (mapcat (fn [[id group v flag]]
+                            (mapping/project-facts compiled [id] {:row/group group :row/value v :row/flag flag}))
+                          [[1 1 1.0M false] [2 1 1.00M false] [3 2 1.0M true] [4 2 2.0M true] [5 3 3.0M false]]))
+        queries [{:find '[?v] :with '[?e] :in '[$p] :order-by '[[?v :asc]] :limit 2
+                  :where '[[$p ?e :row/value ?v]]}
+                 {:find '[?g (count ?e)] :with '[?v] :in '[$p] :order-by '[[1 :desc ?g :asc]] :limit 2 :offset 1
+                  :where '[[$p ?e :row/group ?g] [$p ?e :row/value ?v]]}
+                 {:find '[?g (sum ?v)] :with '[?e] :in '[$p] :order-by '[[1 :desc ?g :asc]] :limit 2
+                  :where '[[$p ?e :row/group ?g] [$p ?e :row/value ?v]]}
+                 {:find '[?flag] :with '[?e] :in '[$p] :order-by '[[?flag :desc]] :limit 1
+                  :where '[[$p ?e :row/flag ?flag]]}]]
+    (doseq [query queries]
+      (let [expected (d/q query facts) actual (d/q query provider)
+            explained (d/explain {:run? true} query provider)]
+        (is (= (count expected) (count actual)))
+        (is (every? (fn [row] (some #(QueryKey/equals row %) actual)) expected))
+        (is (some? (delegated-window explained)))
+        (is (<= (read-rows explained) (:limit query)))))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
+(deftest sql-windows-preserve-failures-outside-the-selected-result
+  (sql! (str "CREATE TABLE " (table "invalid_window") " (id bigint PRIMARY KEY, title text, n numeric)"))
+  (sql! (str "INSERT INTO " (table "invalid_window") " VALUES (1,'small',1),(2,repeat('x',20000),'NaN')"))
+  (let [accepted (pg/accept-mapping (pg/discover *profile* [*schema* "invalid_window"])
+                   {:source-instance-id unit/source-id :relation-id :test/invalid-window :identity-attribute :row/id
+                    :attributes {:row/title "title" :row/n "n"}})
+        provider (pg/source accepted *profile*)]
+    (doseq [offset [0 99999]]
+      (is (= :query-source/limit
+             (category #(d/q {:find '[?id ?title] :in '[$p] :order-by '[[?id :asc]] :limit 1 :offset offset
+                              :where '[[$p ?e :row/id ?id] [$p ?e :row/title ?title]]} provider))))
+      (is (= :query-source/invalid
+             (category #(d/q {:find '[?id] :in '[$p] :order-by '[[?id :asc]] :limit 1 :offset offset
+                              :where '[[$p ?e :row/id ?id] [$p ?e :row/n ?n]]} provider)))))
+    (is (zero? (:live-sessions (pg/statistics provider)))))
+  (sql! (str "CREATE TABLE " (table "overflow_window") " (id bigint PRIMARY KEY, g bigint, v bigint)"))
+  (sql! (str "INSERT INTO " (table "overflow_window") " VALUES (1,1,1),(2,2,9223372036854775807),(3,2,1)"))
+  (let [accepted (pg/accept-mapping (pg/discover *profile* [*schema* "overflow_window"])
+                   {:source-instance-id unit/source-id :relation-id :test/overflow-window :identity-attribute :row/id
+                    :attributes {:row/group "g" :row/value "v"}})
+        provider (pg/source accepted *profile*)]
+    (is (= :query-source/invalid
+           (category #(d/q {:find '[?g (sum ?v)] :with '[?e] :in '[$p] :order-by '[[?g :asc]] :limit 1
+                            :where '[[$p ?e :row/group ?g] [$p ?e :row/value ?v] [(>= ?v 0)]]} provider))))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
+(deftest latest-orders-delegate-distinct-sort-and-final-window
+  (sql! (str "CREATE TABLE " (table "latest") " (id bigint PRIMARY KEY, stamp timestamptz, title text)"))
+  (sql! (str "INSERT INTO " (table "latest")
+             " SELECT i,TIMESTAMPTZ '2026-01-01 00:00:00+00'+i*INTERVAL '1 second',repeat('x',128) FROM generate_series(1,50000) i"))
+  (let [accepted (pg/accept-mapping (pg/discover *profile* [*schema* "latest"])
+                   {:source-instance-id unit/source-id :relation-id :test/latest :identity-attribute :row/id
+                    :attributes {:row/stamp "stamp" :row/title "title"}})
+        provider (pg/source accepted (dissoc *profile* :fetch-size))
+        query {:find '[?id ?stamp ?title] :in '[$p] :order-by '[[?stamp :desc ?id :desc]] :limit 20
+               :where '[[$p ?e :row/id ?id] [$p ?e :row/stamp ?stamp] [$p ?e :row/title ?title]]
+               :query-source {:limits {:retained-bytes (* 16 1024 1024) :batch-rows 5}}}
+        explained (d/explain {:run? true} query provider)]
+    (is (= 20 (:result-rows explained)))
+    (is (= 20 (:limit (delegated-window explained))))
+    (is (= 20 (read-rows explained)))
+    (is (= (vec (range 50000 49980 -1)) (mapv first (d/q query provider))))
+    (let [dynamic (assoc query :in '[$p ?size ?skip] :limit '?size :offset '?skip)
+          explained (d/explain {:run? true} dynamic provider 20 10)]
+      (is (= 10 (:offset (delegated-window explained))))
+      (is (= 20 (read-rows explained)))
+      (is (= (vec (range 49990 49970 -1)) (mapv first (d/q dynamic provider 20 10)))))
+    (is (empty? (d/q (assoc query :offset 999999) provider)))
+    (let [plan (d/explain {:run? false} query provider)]
+      (is (some? (delegated-window plan)))
+      (is (empty? (:cursors plan))))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
+(deftest unsupported-sql-order-uses-bounded-core-top-k
+  (sql! (str "CREATE TABLE " (table "unicode_window") " (id bigint PRIMARY KEY, title text)"))
+  (sql! (str "INSERT INTO " (table "unicode_window")
+             " SELECT i,(CASE WHEN i%2=1 THEN chr(65536) ELSE chr(57344) END)||lpad(i::text,5,'0') FROM generate_series(1,20000) i"))
+  (let [accepted (pg/accept-mapping (pg/discover *profile* [*schema* "unicode_window"])
+                   {:source-instance-id unit/source-id :relation-id :test/unicode-window :identity-attribute :row/id
+                    :attributes {:row/title "title"}})
+        provider (pg/source accepted (assoc (dissoc *profile* :fetch-size) :max-row-bytes 128))
+        query {:find '[?id ?title] :in '[$p] :order-by '[[?title :asc ?id :asc]] :limit 20
+               :where '[[$p ?e :row/id ?id] [$p ?e :row/title ?title]]
+               :query-source {:limits {:retained-bytes (* 16 1024 1024) :batch-rows 16}}}
+        explained (d/explain {:run? true} query provider)]
+    ;; UTF-16 ordering puts supplementary characters before U+E000. PostgreSQL
+    ;; C collation orders their UTF-8 encodings the other way around.
+    (is (nil? (delegated-window explained)))
+    (is (= 20000 (read-rows explained)))
+    (is (= 20 (:result-rows explained)))
+    (is (= (vec (range 1 40 2)) (mapv first (d/q query provider))))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
 (deftest decimal-and-temporal-filters-reduce-transfer-in-ordinary-queries
   (sql! (str "CREATE TABLE " (table "filtered") " (id bigint PRIMARY KEY, amount numeric(18,4), stamp timestamptz)"))
   (sql! (str "INSERT INTO " (table "filtered")
@@ -767,6 +927,145 @@
     (merge {:source-instance-id unit/source-id :relation-id :test/schema
             :identity-attribute :row/id :attributes attrs} options)))
 
+(deftest column-level-select-grants-authorize-mapped-reads
+  (let [role (str "federation_columns_" (.replace (str (random-uuid)) "-" ""))
+        quoted (jdbc/identifier role) profile (assoc *profile* :role role)
+        query '[:find ?id ?title :in $p :where [$p ?e :row/id ?id] [$p ?e :row/title ?title]]]
+    (sql! (str "CREATE ROLE " quoted " NOLOGIN"))
+    (try
+      (sql! (str "GRANT USAGE ON SCHEMA " (jdbc/identifier *schema*) " TO " quoted))
+      (sql! (str "GRANT SELECT(id,title) ON " (table "orders") " TO " quoted))
+      (with-open [connection (DriverManager/getConnection (:jdbc-url *profile*))
+                  stmt (.createStatement connection)]
+        (.execute stmt (str "SET ROLE " quoted))
+        (with-open [rs (.executeQuery stmt (str "SELECT id,title FROM ONLY " (table "orders") " WHERE title IS NOT NULL ORDER BY id"))]
+          (is (= [1 2 3] (loop [out []] (if (.next rs) (recur (conj out (.getLong rs 1))) out))))))
+      (let [provider (pg/source (accept-relation "orders" {:row/title "title"} nil profile) profile)]
+        (is (= #{[1 "Alpha"] [2 "βeta"] [3 "x'; DROP TABLE orders; --"]} (set (d/q query provider))))
+        (is (= #{[2 "βeta"]}
+               (set (d/q '[:find ?id ?title :in $p [?id ...]
+                           :where [$p ?e :row/id ?id] [$p ?e :row/title ?title]] provider [2 99]))))
+        (is (= [[3 "x'; DROP TABLE orders; --"] [2 "βeta"]]
+               (d/q {:find '[?id ?title] :in '[$p] :where '[[$p ?e :row/id ?id] [$p ?e :row/title ?title]]
+                     :order-by '[[?id :desc]] :limit 2} provider)))
+        (is (zero? (:live-sessions (pg/statistics provider)))))
+      (let [checkouts (atom 0) db *db* url (:jdbc-url *profile*)
+            update-sql (str "UPDATE " (table "orders") " SET title='after' WHERE id=1")
+            pool (data-source #(do (when (= 2 (swap! checkouts inc))
+                                    (with-open [stmt (.createStatement ^Connection db)] (.execute stmt update-sql)))
+                                  (DriverManager/getConnection url)))
+            provider (pg/source (accept-relation "orders" {:row/title "title"} nil profile)
+                                (-> profile (dissoc :jdbc-url) (assoc :data-source pool)))]
+        ;; Fresh catalog verification must preserve the ordinary data snapshot.
+        (is (contains? (set (d/q query provider)) [1 "Alpha"]))
+        (is (= 2 @checkouts))
+        (is (zero? (:live-sessions (pg/statistics provider)))))
+      (let [unreadable (pg/source (accept-relation "orders" {:row/note "note"} nil profile) profile)]
+        (is (= :query-source/unauthorized
+               (category #(d/q '[:find ?v :in $p :where [$p _ :row/note ?v]] unreadable)))))
+      (finally
+        (sql! (str "DROP OWNED BY " quoted))
+        (sql! (str "DROP ROLE " quoted))))))
+
+(deftest column-grants-cover-captured-relations-and-security-invoker-views
+  (sql! (str "CREATE TABLE " (table "column_parent") " (id bigint PRIMARY KEY,title text,secret text) PARTITION BY RANGE(id)"))
+  (sql! (str "CREATE TABLE " (table "column_child") " PARTITION OF " (table "column_parent") " FOR VALUES FROM (0) TO (10)"))
+  (sql! (str "INSERT INTO " (table "column_parent") " VALUES (1,'visible','private')"))
+  (sql! (str "CREATE VIEW " (table "column_view") " WITH (security_invoker=true) AS SELECT id,title,'private'::text AS secret FROM " (table "column_parent")))
+  (sql! (str "CREATE MATERIALIZED VIEW " (table "column_materialized") " AS SELECT id,title,secret FROM " (table "column_parent")))
+  (sql! (str "CREATE TABLE " (table "column_rls") " (id bigint PRIMARY KEY,title text,tenant text)"))
+  (sql! (str "INSERT INTO " (table "column_rls") " VALUES (1,'visible','a'),(2,'hidden','b')"))
+  (sql! (str "ALTER TABLE " (table "column_rls") " ENABLE ROW LEVEL SECURITY"))
+  (sql! (str "CREATE POLICY tenant ON " (table "column_rls") " USING (tenant=current_setting('app.tenant'))"))
+  (let [role (str "federation_captured_columns_" (.replace (str (random-uuid)) "-" ""))
+        quoted (jdbc/identifier role) profile (assoc *profile* :role role :session-settings {"app.tenant" "a"})]
+    (sql! (str "CREATE ROLE " quoted " NOLOGIN"))
+    (try
+      (sql! (str "GRANT USAGE ON SCHEMA " (jdbc/identifier *schema*) " TO " quoted))
+      (doseq [name ["column_parent" "column_view" "column_materialized" "column_rls"]]
+        (sql! (str "GRANT SELECT(id,title) ON " (table name) " TO " quoted)))
+      (doseq [name ["column_parent" "column_view" "column_materialized" "column_rls"]]
+        (let [accepted (accept-relation name {:row/title "title"}
+                         (when (#{"column_view" "column_materialized"} name) {:key-columns ["id"]}) profile)
+              provider (pg/source accepted profile)]
+          (is (= #{[1 "visible"]}
+                 (set (d/q '[:find ?id ?v :in $p :where [$p ?e :row/id ?id] [$p ?e :row/title ?v]] provider))) name)
+          (is (zero? (:live-sessions (pg/statistics provider))))))
+      (finally
+        (sql! (str "DROP OWNED BY " quoted))
+        (sql! (str "DROP ROLE " quoted))))))
+
+(deftest column-lock-fallback-detects-schema-and-column-identity-races
+  (let [role (str "federation_column_race_" (.replace (str (random-uuid)) "-" ""))
+        quoted (jdbc/identifier role) url (:jdbc-url *profile*)]
+    (sql! (str "CREATE ROLE " quoted " NOLOGIN"))
+    (try
+      (sql! (str "GRANT USAGE ON SCHEMA " (jdbc/identifier *schema*) " TO " quoted))
+      (doseq [change [:typmod :rewrite :ordinal]]
+        (let [a-name (str "a_" (name change)) z-name (str "z_" (name change))]
+          (doseq [name [a-name z-name]]
+            (sql! (str "CREATE TABLE " (table name) " (id bigint PRIMARY KEY,title varchar(100))"))
+            (sql! (str "INSERT INTO " (table name) " VALUES (1,'before')"))
+            (sql! (str "GRANT SELECT(id,title) ON " (table name) " TO " quoted)))
+          (let [base-profile (assoc *profile* :role role)
+                a (accept-relation a-name {:row/title "title"} {:relation-id (keyword "test" a-name)} base-profile)
+                z (accept-relation z-name {:row/title "title"} {:relation-id (keyword "test" z-name)} base-profile)
+                changed? (atom false) connections (atom [])
+                target (str "SELECT \"id\",\"title\" FROM ONLY " (table z-name) " LIMIT 0")
+                pool (data-source
+                       #(let [connection (intercepted-connection url
+                                           (fn [sql]
+                                             (when (and (= sql target) (compare-and-set! changed? false true))
+                                               (case change
+                                                 :typmod (sql! (str "ALTER TABLE " (table z-name) " ALTER COLUMN title TYPE varchar(200)"))
+                                                 :rewrite (sql! (str "ALTER TABLE " (table z-name) " ALTER COLUMN title TYPE bigint USING 7"))
+                                                 :ordinal (do (sql! (str "ALTER TABLE " (table z-name) " DROP COLUMN title"))
+                                                              (sql! (str "ALTER TABLE " (table z-name) " ADD COLUMN title varchar(100) DEFAULT 'after'"))
+                                                              (sql! (str "GRANT SELECT(title) ON " (table z-name) " TO " quoted)))))
+                                             sql))]
+                          (swap! connections conj connection) connection))
+                profile (-> base-profile (dissoc :jdbc-url) (assoc :data-source pool))
+                a (pg/source a profile) z (pg/source z profile)
+                query '[:find ?v :in $a $z :where [$a _ :row/title _] [$z _ :row/title ?v]]]
+            (is (= (if (= change :typmod) :query-source/stale-definition :query-source/snapshot-lost)
+                   (category #(d/q query a z))) (str change))
+            (is @changed?)
+            (is (every? #(.isClosed ^Connection %) @connections))
+            (is (zero? (:live-sessions (pg/statistics a))))
+            (is (zero? (:live-sessions (pg/statistics z)))))))
+      (finally
+        (sql! (str "DROP OWNED BY " quoted))
+        (sql! (str "DROP ROLE " quoted))))))
+
+(deftest captured-column-readers-reuse-one-pooled-connection
+  (sql! (str "CREATE VIEW " (table "pooled_columns")
+             " AS SELECT 1::bigint AS id,'visible'::text AS title,'private'::text AS secret"))
+  (let [role (str "federation_pooled_columns_" (.replace (str (random-uuid)) "-" ""))
+        quoted (jdbc/identifier role) checkouts (atom 0) returns (atom 0)
+        pool (doto (PGConnectionPoolDataSource.) (.setURL (:jdbc-url *profile*)))
+        pooled (.getPooledConnection pool)
+        listener (reify ConnectionEventListener
+                   (connectionClosed [_ _] (swap! returns inc)) (connectionErrorOccurred [_ _]))
+        _ (.addConnectionEventListener pooled listener)]
+    (sql! (str "CREATE ROLE " quoted " NOLOGIN"))
+    (try
+      (sql! (str "GRANT USAGE ON SCHEMA " (jdbc/identifier *schema*) " TO " quoted))
+      (sql! (str "GRANT SELECT(id,title) ON " (table "pooled_columns") " TO " quoted))
+      (let [base-profile (assoc *profile* :role role)
+            accepted (accept-relation "pooled_columns" {:row/title "title"} {:key-columns ["id"]} base-profile)
+            profile (-> base-profile (dissoc :jdbc-url)
+                        (assoc :data-source (data-source #(do (swap! checkouts inc) (.getConnection pooled)))))
+            provider (pg/source accepted profile)]
+        (is (= #{[1 "visible"]}
+               (set (d/q '[:find ?id ?v :in $p :where [$p ?e :row/id ?id] [$p ?e :row/title ?v]] provider))))
+        (is (= 1 @checkouts))
+        (is (= 1 @returns))
+        (is (zero? (:live-sessions (pg/statistics provider)))))
+      (finally
+        (.close pooled)
+        (sql! (str "DROP OWNED BY " quoted))
+        (sql! (str "DROP ROLE " quoted))))))
+
 (deftest temporal-columns-preserve-calendar-offset-and-interval-fields
   (sql! (str "CREATE TABLE " (table "calendar")
              " (id date PRIMARY KEY, stamp timestamp, clock time, zoned timetz, span interval)"))
@@ -886,6 +1185,78 @@
         (is (zero? (:live-sessions (pg/statistics provider))))
         (control/close! ctl)))))
 
+(deftest materialized-view-locking-cannot-pin-a-snapshot-before-table-locks
+  ;; This name sorts before orders, reproducing the former interleaved loop.
+  (sql! (str "CREATE MATERIALIZED VIEW " (table "a_snapshot") " AS SELECT 1::bigint AS id,'anchor'::text AS v"))
+  (let [accepted (accept-relation "a_snapshot" {:anchor/value "v"} {:key-columns ["id"]})
+        query '[:find ?id ?amount :in $m $p
+                :where [$m _ :anchor/value _] [$p ?e :order/id ?id] [$p ?e :order/amount ?amount]]
+        changed? (atom false) connections (atom []) url (:jdbc-url *profile*)
+        pool (data-source
+               #(let [connection (intercepted-connection url
+                                    (fn [sql]
+                                      (when (and (.startsWith ^String sql "LOCK TABLE ONLY")
+                                                 (compare-and-set! changed? false true))
+                                        ;; A separate connection commits a physical rewrite
+                                        ;; just before acquisition locks the ordinary table.
+                                        (sql! (str "ALTER TABLE " (table "orders") " ALTER COLUMN amount TYPE numeric(20,2)")))
+                                      sql))]
+                  (swap! connections conj connection) connection))
+        profile (-> *profile* (dissoc :jdbc-url) (assoc :data-source pool))
+        materialized (pg/source accepted profile) ordinary (pg/source *accepted* profile)]
+    (is (= 3 (count (d/q query (pg/source accepted *profile*) (source)))))
+    (is (= {:error :query-source/stale-definition}
+           (try {:rows (d/q query materialized ordinary)}
+                (catch clojure.lang.ExceptionInfo e (select-keys (ex-data e) [:error])))))
+    (is @changed?)
+    (is (every? #(.isClosed ^Connection %) @connections))
+    (is (zero? (:live-sessions (pg/statistics materialized))))
+    (is (zero? (:live-sessions (pg/statistics ordinary))))))
+
+(deftest materialized-refreshes-between-acquisition-locks-invalidate-the-snapshot
+  (sql! (str "CREATE MATERIALIZED VIEW " (table "a_snapshot") " AS SELECT 1::bigint AS id,'anchor'::text AS v"))
+  (sql! (str "CREATE MATERIALIZED VIEW " (table "b_snapshot") " AS SELECT id,title AS v FROM " (table "orders")))
+  (sql! (str "CREATE UNIQUE INDEX ON " (table "b_snapshot") " (id)"))
+  (sql! (str "CREATE VIEW " (table "z_report") " AS SELECT * FROM " (table "b_snapshot")))
+  (let [anchor (accept-relation "a_snapshot" {:anchor/value "v"} {:key-columns ["id"] :relation-id :test/anchor})
+        query '[:find ?id ?v :in $a $b
+                :where [$a _ :anchor/value _] [$b ?e :row/id ?id] [$b ?e :row/value ?v]]
+        url (:jdbc-url *profile*)]
+    (doseq [name ["b_snapshot" "z_report"] moment [:before-snapshot :between-locks :concurrent-refresh]]
+      (let [accepted (accept-relation name {:row/value "v"} {:key-columns ["id"] :relation-id (keyword "test" name)})
+            changed? (atom false) connections (atom [])
+            target (str "SELECT 1 FROM " (table (if (= moment :before-snapshot) "a_snapshot" name)) " LIMIT 0")
+            pool (data-source
+                   #(let [connection (intercepted-connection url
+                                        (fn [sql]
+                                          (when (and (= sql target) (compare-and-set! changed? false true))
+                                            (when (= moment :concurrent-refresh)
+                                              (sql! (str "UPDATE " (table "orders") " SET title='concurrent-" name "' WHERE id=1")))
+                                            (sql! (str "REFRESH MATERIALIZED VIEW "
+                                                       (when (= moment :concurrent-refresh) "CONCURRENTLY ") (table "b_snapshot"))))
+                                          sql))]
+                      (swap! connections conj connection) connection))
+            profile (-> *profile* (dissoc :jdbc-url) (assoc :data-source pool))
+            a (pg/source anchor profile) b (pg/source accepted profile)
+            expected (d/q query (pg/source anchor *profile*) (pg/source accepted *profile*))
+            outcome (try {:rows (d/q query a b)}
+                         (catch clojure.lang.ExceptionInfo e (select-keys (ex-data e) [:error])))]
+        (if (= moment :between-locks)
+          (is (= {:error :query-source/snapshot-lost} outcome) (str name " " moment))
+          (is (= {:rows expected} outcome) (str name " " moment)))
+        (is @changed?)
+        (is (every? #(.isClosed ^Connection %) @connections))
+        (is (zero? (:live-sessions (pg/statistics a))))
+        (is (zero? (:live-sessions (pg/statistics b))))))))
+
+(deftest catalog-backed-views-do-not-treat-mapped-files-as-rewrites
+  (sql! (str "CREATE VIEW " (table "catalog_report")
+             " AS SELECT oid::bigint AS id,relname::text AS v FROM pg_catalog.pg_class WHERE oid="
+             (get-in *accepted* [:requirements :oid])))
+  (let [provider (pg/source (accept-relation "catalog_report" {:row/value "v"} {:key-columns ["id"]}) *profile*)]
+    (is (= #{["orders"]} (set (d/q '[:find ?v :in $p :where [$p _ :row/value ?v]] provider))))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
 (deftest rls-enforces-role-settings-and-snapshot-scope
   (let [role (str "federation_rls_" (.replace (str (random-uuid)) "-" ""))
         quoted (jdbc/identifier role)
@@ -937,6 +1308,159 @@
     (is (= #{["before"]} (set (d/q q provider))))
     (sql! (str "CREATE OR REPLACE FUNCTION " (table "view_value") "() RETURNS text LANGUAGE sql AS $$ SELECT 'after'::text $$"))
     (is (= :query-source/stale-definition (category #(d/q q provider))))))
+
+(defn function-view! []
+  (sql! (str "CREATE FUNCTION " (table "capture_value") "() RETURNS text LANGUAGE sql AS $$ SELECT 'before'::text $$"))
+  (sql! (str "CREATE VIEW " (table "function_capture") " AS SELECT 1::bigint AS id," (table "capture_value") "() AS v"))
+  (accept-relation "function_capture" {:row/value "v"} {:key-columns ["id"]}))
+
+(deftest view-function-replacement-between-verification-and-capture-is-stale
+  (let [accepted (function-view!)
+        url (:jdbc-url *profile*) changed? (atom false) connections (atom [])
+        pool (data-source
+               #(let [connection (intercepted-connection url
+                                    (fn [sql]
+                                      (when (and (.startsWith ^String sql "DECLARE ")
+                                                 (compare-and-set! changed? false true))
+                                        (sql! (str "CREATE OR REPLACE FUNCTION " (table "capture_value")
+                                                   "() RETURNS text LANGUAGE sql AS $$ SELECT 'after'::text $$")))
+                                      sql))]
+                  (swap! connections conj connection) connection))
+        provider (pg/source accepted (-> *profile* (dissoc :jdbc-url) (assoc :data-source pool)))
+        ctl (control/create) invocation (request provider ctl)]
+    (try
+      (let [outcome (try
+                      (let [session (spi/-open-session provider invocation)]
+                        (try
+                          (let [clauses [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :row/value] [:var ?v]]}]
+                                alt (first (alternatives provider session invocation clauses []))
+                                cursor (open provider session invocation alt nil)]
+                            (try {:rows (:rows (consume cursor ctl alt false))}
+                                 (finally (spi/-close-cursor! cursor))))
+                          (finally (spi/-close-session! session))))
+                      (catch clojure.lang.ExceptionInfo e (select-keys (ex-data e) [:error])))]
+        (is (= {:error :query-source/stale-definition} outcome)))
+      (is @changed?)
+      (is (released? ctl))
+      (is (every? #(.isClosed ^Connection %) @connections))
+      (is (zero? (:live-sessions (pg/statistics provider))))
+      (finally (control/close! ctl)))))
+
+(deftest restoring-a-view-function-does-not-hide-a-capture-time-change
+  (let [accepted (function-view!) url (:jdbc-url *profile*)
+        changed? (atom false) restored? (atom false)
+        pool (data-source #(intercepted-connection url
+                             (fn [sql]
+                               (when (and (.startsWith ^String sql "DECLARE ") (compare-and-set! changed? false true))
+                                 (sql! (str "CREATE OR REPLACE FUNCTION " (table "capture_value")
+                                            "() RETURNS text LANGUAGE sql AS $$ SELECT 'after'::text $$")))
+                               (when (and (.startsWith ^String sql "CLOSE ") @changed?
+                                          (compare-and-set! restored? false true))
+                                 (sql! (str "CREATE OR REPLACE FUNCTION " (table "capture_value")
+                                            "() RETURNS text LANGUAGE sql AS $$ SELECT 'before'::text $$")))
+                               sql)))
+        provider (pg/source accepted (-> *profile* (dissoc :jdbc-url) (assoc :data-source pool)))]
+    (is (= :query-source/stale-definition
+           (category #(d/q '[:find ?v :in $p :where [$p _ :row/value ?v]] provider))))
+    (is @changed?)
+    (is @restored?)
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
+(deftest captured-function-verification-reuses-one-pooled-connection-and-replays
+  (let [accepted (function-view!) checkouts (atom 0) returns (atom 0)
+        pool (doto (PGConnectionPoolDataSource.) (.setURL (:jdbc-url *profile*)))
+        pooled (.getPooledConnection pool)
+        listener (reify ConnectionEventListener
+                   (connectionClosed [_ _] (swap! returns inc)) (connectionErrorOccurred [_ _]))
+        _ (.addConnectionEventListener pooled listener)
+        profile (-> *profile* (dissoc :jdbc-url)
+                    (assoc :data-source (data-source #(do (swap! checkouts inc) (.getConnection pooled)))))
+        provider (pg/source accepted profile)]
+    (try
+      (replay-captured provider
+        #(sql! (str "CREATE OR REPLACE FUNCTION " (table "capture_value")
+                    "() RETURNS text LANGUAGE sql AS $$ SELECT 'after'::text $$")))
+      (is (= 1 @checkouts))
+      (is (= 1 @returns))
+      (is (zero? (:live-sessions (pg/statistics provider))))
+      (finally (.close pooled)))))
+
+(deftest mixed-function-verification-preserves-the-ordinary-data-snapshot
+  (function-view!)
+  (doseq [replace? [false true]]
+    (sql! (str "UPDATE " (table "orders") " SET title='Alpha' WHERE id=1"))
+    (sql! (str "CREATE OR REPLACE FUNCTION " (table "capture_value") "() RETURNS text LANGUAGE sql AS $$ SELECT 'before'::text $$"))
+    (let [accepted (accept-relation "function_capture" {:row/value "v"} {:key-columns ["id"]})
+          url (:jdbc-url *profile*) db *db* changed? (atom false) checkouts (atom 0) connections (atom [])
+          update-sql (str "UPDATE " (table "orders") " SET title='changed' WHERE id=1")
+          pool (data-source
+                 #(do
+                    (when (= 2 (swap! checkouts inc))
+                      (with-open [stmt (.createStatement ^Connection db)] (.execute stmt update-sql)))
+                    (let [connection (intercepted-connection url
+                                       (fn [sql]
+                                         (when (and replace? (.startsWith ^String sql "DECLARE ")
+                                                    (compare-and-set! changed? false true))
+                                           (sql! (str "CREATE OR REPLACE FUNCTION " (table "capture_value")
+                                                      "() RETURNS text LANGUAGE sql AS $$ SELECT 'after'::text $$")))
+                                         sql))]
+                      (swap! connections conj connection) connection)))
+          profile (-> *profile* (dissoc :jdbc-url) (assoc :data-source pool))
+          view (pg/source accepted profile) ordinary (pg/source *accepted* profile)
+          query '[:find ?id ?title ?v :in $v $p
+                  :where [$v _ :row/value ?v] [$p ?e :order/id ?id] [$p ?e :order/title ?title]]]
+      (if replace?
+        (do (is (= :query-source/stale-definition (category #(d/q query view ordinary)))) (is @changed?))
+        (is (= #{[1 "Alpha" "before"] [2 "βeta" "before"] [3 "x'; DROP TABLE orders; --" "before"]}
+               (set (d/q query view ordinary)))))
+      (is (= 2 @checkouts))
+      (is (every? #(.isClosed ^Connection %) @connections))
+      (is (zero? (:live-sessions (pg/statistics view))))
+      (is (zero? (:live-sessions (pg/statistics ordinary)))))))
+
+(deftest cancellation-closes-the-mixed-function-validation-connection
+  (let [accepted (function-view!) url (:jdbc-url *profile*) checkouts (atom 0) connections (atom [])
+        entered (CountDownLatch. 1)
+        pool (data-source
+               #(let [validation? (= 2 (swap! checkouts inc))
+                      connection (intercepted-connection url
+                                   (fn [sql]
+                                     (if (and validation? (.contains ^String sql "p.xmin::text"))
+                                       (do (.countDown entered) "SELECT pg_sleep(30)") sql)))]
+                  (swap! connections conj connection) connection))
+        profile (-> *profile* (dissoc :jdbc-url) (assoc :data-source pool))
+        provider (pg/source accepted profile) ordinary (pg/source *accepted* profile)
+        ctl (control/create) invocation (assoc (request provider ctl) :source-descriptors
+                                             [(spi/-source-info provider) (spi/-source-info ordinary)])
+        result (future (try (let [session (spi/-open-session provider invocation)]
+                              (spi/-close-session! session) :unexpected-success)
+                            (catch clojure.lang.ExceptionInfo e (:error (ex-data e)))))]
+    (try
+      (is (.await entered 5 TimeUnit/SECONDS))
+      (control/cancel! ctl {:error :query-source/cancelled :phase :execution})
+      (is (= :query-source/cancelled (deref result 5000 :blocked)))
+      (is (= 2 @checkouts))
+      (is (every? #(.isClosed ^Connection %) @connections))
+      (is (released? ctl))
+      (is (zero? (:live-sessions (pg/statistics provider))))
+      (finally (control/close! ctl) (future-cancel result)))))
+
+(deftest mixed-function-validation-obeys-the-retained-memory-budget
+  (let [accepted (function-view!) url (:jdbc-url *profile*) checkouts (atom 0) connections (atom [])
+        pool (data-source #(let [connection (DriverManager/getConnection url)]
+                             (swap! checkouts inc) (swap! connections conj connection) connection))
+        profile (-> *profile* (dissoc :jdbc-url) (assoc :data-source pool))
+        provider (pg/source accepted profile) ordinary (pg/source *accepted* profile)
+        ctl (control/create {:limits {:retained-bytes (* 16 1024 1024)}})
+        invocation (assoc (request provider ctl) :source-descriptors
+                          [(spi/-source-info provider) (spi/-source-info ordinary)])]
+    (try
+      (is (= :query-source/limit (category #(spi/-open-session provider invocation))))
+      (is (= 1 @checkouts))
+      (is (every? #(.isClosed ^Connection %) @connections))
+      (is (released? ctl))
+      (is (zero? (:live-sessions (pg/statistics provider))))
+      (finally (control/close! ctl)))))
 
 (deftest captured-lookups-preserve-binding-ids-without-further-sql
   (sql! (str "CREATE VIEW " (table "lookup_view") " AS SELECT id,title AS v FROM " (table "orders")))

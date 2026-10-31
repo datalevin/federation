@@ -135,6 +135,52 @@
       {:sql (str "(VALUES " (str/join "," rows) ") AS b(ok," (str/join "," names) ")")
        :params @params :variables variables})))
 
+(defn- window-sql [window outputs output-fields max-row-bytes]
+  (let [{:keys [order limit offset]} window
+        _ (require! (and (= #{:order :limit :offset} (set (keys window))) (vector? order)
+                         (integer? limit) (<= 1 limit Long/MAX_VALUE)
+                         (integer? offset) (<= 0 offset Long/MAX_VALUE)))
+        fields (mapv (fn [[start output]] (subvec output-fields start (+ start (count (:types output)))))
+                     (map vector (reductions + 0 (map #(count (:types %)) outputs)) outputs))
+        requested (mapcat (fn [{:keys [column direction] :as entry}]
+                            (require! (and (= #{:column :direction} (set (keys entry)))
+                                           (integer? column) (<= 0 column) (< column (count outputs))
+                                           (#{:asc :desc} direction)))
+                            (let [output (nth outputs column)]
+                              ;; Java String order uses UTF-16, UUID order uses
+                              ;; signed halves, and nominal references have an
+                              ;; encoded comparator. Leave those orders in core.
+                              (require! (and (= :scalar (:shape output))
+                                             (#{"int2" "int4" "int8" "numeric" "bool" "timestamptz"}
+                                               (first (:types output)))))
+                              [(str (first (nth fields column)) (if (= :asc direction) " ASC NULLS FIRST" " DESC NULLS LAST"))])) order)
+        _ (require! (every? #(or (not= :ref (:shape %))
+                                 (every? #{"int2" "int4" "int8" "uuid" "timestamptz"} (:types %))) outputs))
+        scales (vec (keep (fn [[field type]] (when (= type "numeric") (str "scale(" field ")")))
+                          (map vector output-fields (mapcat :types outputs))))
+        scale-names (mapv #(str "w" %) (range (count scales)))
+        projection (concat output-fields (map #(str %1 " AS " %2) scales scale-names))
+        size (str/join " + " (map #(str "COALESCE(octet_length(" % "::text)::bigint,0)") output-fields))
+        overflow (keep (fn [[field type]] (when (= type "int8")
+                                          (str field " < -9223372036854775808::numeric OR " field " > 9223372036854775807::numeric")))
+                       (map vector output-fields (mapcat :types outputs)))
+        invalid (str/join " OR " (cons "invalid" overflow))
+        flags ["g.oversized" "g.invalid"]
+        safe "NOT g.oversized AND NOT g.invalid"
+        ;; Validate the full result, including conversion/size failures outside
+        ;; the selected window. PostgreSQL owns sorting/materialization/spill;
+        ;; only the final distinct window crosses the adapter boundary.
+        sql (str ", window_guard AS (SELECT COALESCE(bool_or(oversized OR (" size ") > " (long max-row-bytes)
+                 "),FALSE) AS oversized, COALESCE(bool_or(" invalid "),FALSE) AS invalid FROM result), "
+                 "window_rows AS (SELECT DISTINCT " (str/join ", " projection) " FROM result), "
+                 "selected AS (SELECT * FROM window_rows ORDER BY "
+                 (str/join ", " (concat requested output-fields scale-names)) " LIMIT ?::bigint OFFSET ?::bigint) SELECT "
+                 (str/join ", " (concat flags (map #(str "CASE WHEN " safe " THEN " % " END") output-fields)))
+                 " FROM selected CROSS JOIN window_guard AS g UNION ALL SELECT "
+                 (str/join ", " (concat flags (repeat (count output-fields) "NULL")))
+                 " FROM window_guard AS g WHERE (g.oversized OR g.invalid) AND NOT EXISTS (SELECT 1 FROM selected)")]
+    {:sql sql :params [(long limit) (long offset)]}))
+
 (defn compile-query
   "Return a parameterized exact plan, or nil for a shape whose semantics have
   not been established. Views are accepted mappings indexed by source alias."
@@ -239,15 +285,22 @@
                       (when aggregate? " HAVING count(*) > 0"))
           size (str/join " + " (map #(str "COALESCE(octet_length(" % "::text)::bigint,0)") output-fields))
           too-large (str "oversized OR (" size ") > " (long max-row-bytes))
-          safe (str "NOT (" too-large ") AND NOT invalid")]
-      {:sql (str "WITH matched AS (" matched "), result AS (" result ") SELECT " too-large ", invalid, "
-                 (str/join ", " (map #(str "CASE WHEN " safe " THEN " % " END") output-fields)) " FROM result")
-       :params params :layout (mapv #(dissoc % :sql :modifier) outputs) :columns (:columns request)
+          safe (str "NOT (" too-large ") AND NOT invalid")
+          window (when (:window request) (window-sql (:window request) outputs output-fields max-row-bytes))]
+      {:sql (str "WITH matched AS (" matched "), result AS (" result ")"
+                 (if window (:sql window)
+                   (str " SELECT " too-large ", invalid, "
+                        (str/join ", " (map #(str "CASE WHEN " safe " THEN " % " END") output-fields)) " FROM result")))
+       :params (into params (:params window)) :layout (mapv #(dissoc % :sql :modifier) outputs) :columns (:columns request)
        :physical-columns (count output-fields)})
     (catch clojure.lang.ExceptionInfo e (if (::unsupported (ex-data e)) nil (throw e)))))
 
 (defn compile-fragment [views request max-row-bytes]
   (when (= :relational-fragment (:mode request))
+    (compile-query views (assoc request :mode :relational) max-row-bytes)))
+
+(defn compile-window [views request max-row-bytes]
+  (when (and (= :relational-window (:mode request)) (:window request) (not (:inputs request)))
     (compile-query views (assoc request :mode :relational) max-row-bytes)))
 
 (defn read-row [query ^ResultSet rs]

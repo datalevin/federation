@@ -1,6 +1,7 @@
 (ns datalevin.federation.postgres
   "Read-only PostgreSQL relations with validated keys and replayable snapshot sessions."
-  (:require [datalevin.federation.mapping :as mapping]
+  (:require [clojure.string :as str]
+            [datalevin.federation.mapping :as mapping]
             [datalevin.federation.postgres.captured :as captured]
             [datalevin.federation.postgres.jdbc :as jdbc :refer [ensure! fail!]]
             [datalevin.federation.postgres.mapping :as pm]
@@ -190,7 +191,8 @@
                          (when-not (and decline-on-limit? (= :query-source/limit (:error (ex-data e)))
                                         (= :retained-bytes (:category (ex-data e)))) (throw e))))]
         (when token
-          (try ((if (= :relational-fragment (:mode request)) relational/compile-fragment relational/compile-query)
+          (try ((case (:mode request) :relational-fragment relational/compile-fragment
+                                     :relational-window relational/compile-window relational/compile-query)
                  views request max-row-bytes)
                (finally (spi/release! token))))))))
 
@@ -326,6 +328,39 @@
           (if (= n (count rows)) (recur out) out)))
       (finally (close-portal! context state) (spi/release! workspace)))))
 
+(defn- verify-acquisition! [context views oids before columns]
+  (when (or columns (pos? (or (:count before) 0)))
+    (let [verify! (fn [context]
+                    (when columns
+                      (doseq [accepted (:relations columns)]
+                        (pm/verify! accepted (jdbc/catalog! context (get-in accepted [:requirements :table]))))
+                      (when-not (= (:fingerprint columns) (jdbc/column-snapshot! context (:relations columns)))
+                        (fail! :query-source/snapshot-lost :acquisition)))
+                    (when (pos? (or (:count before) 0))
+                      (when-not (= before (jdbc/function-snapshot! context oids))
+                        (fail! :query-source/stale-definition :acquisition))))]
+      (if (every? :snapshot (vals views))
+        ;; All data is now owned locally. Reuse this connection (including a
+        ;; single-connection pool) for the fresh metadata checks.
+        (do (jdbc/restart! context) (verify! context))
+        ;; Ordinary SQL cursors still need the original data snapshot. Keep it
+        ;; pinned while a temporary, equally authorized connection checks versions.
+        (let [ctl (:control context) token (spi/reserve! ctl {:retained-bytes 8388608})
+              connection (atom nil) registration (volatile! nil)]
+          (try
+            (vreset! registration (spi/register-cancel! ctl (fn [_] (jdbc/abort! @connection))))
+            (let [conn (jdbc/request! context :acquisition
+                         #(let [conn (jdbc/connect! context)] (reset! connection conn) conn))
+                  context (assoc context :connection conn)]
+              (jdbc/begin! context)
+              (verify! context))
+            (finally
+              (when-let [r @registration] (spi/unregister-cancel! r))
+              (when-let [conn @connection]
+                (try (.rollback ^Connection conn) (catch Exception _ nil))
+                (jdbc/close! conn))
+              (spi/release! token))))))))
+
 (defn- acquire [source request]
   (let [{:keys [profile stats]} source
         ctl (:control request)
@@ -355,21 +390,39 @@
             context (assoc context :connection conn)]
         (jdbc/check! context)
         (jdbc/begin! context)
-        ;; Lock every relation before the first catalog SELECT pins the snapshot.
-        (doseq [view (sort-by #(pr-str (get-in % [:accepted :requirements :table])) (vals views))]
-          (let [kind (get-in view [:accepted :requirements :kind])
-                table (jdbc/relation (get-in view [:accepted :requirements :table]))]
-            (if (= "m" kind)
-              ;; PostgreSQL rejects LOCK TABLE for materialized views. A zero-row
-              ;; SELECT holds ACCESS SHARE without transferring relation data.
-              (jdbc/query! context :acquisition (str "SELECT 1 FROM " table " LIMIT 0") [] (constantly nil))
-              (jdbc/execute! context :acquisition
-                             (str "LOCK TABLE " (when (= "r" kind) "ONLY ") table " IN ACCESS SHARE MODE") []))))
-        (doseq [view (vals views)]
-          (pm/verify! (:accepted view) (jdbc/catalog! context (get-in view [:accepted :requirements :table]))))
-        (doseq [view (vals views)]
-          (when-let [snapshot (:snapshot view)]
-            (reset! snapshot (capture! context (:accepted view) reservations))))
+        ;; LOCK is snapshot-free, but a materialized-view SELECT is not. Finish
+        ;; all ordinary locks before any SELECT can freeze the transaction view.
+        ;; Column grants do not authorize LOCK TABLE. Recover its permission
+        ;; error in a savepoint and use zero-row mapped reads for that group.
+        (let [ordered (sort-by #(pr-str (get-in % [:accepted :requirements :table])) (vals views))
+              narrow? (not (jdbc/try-lock! context (into [] (comp (map #(get-in % [:accepted :requirements]))
+                                                                  (remove #(= "m" (:kind %)))) ordered)))]
+          (doseq [view ordered
+                  :let [requirements (get-in view [:accepted :requirements]) kind (:kind requirements)]
+                  :when (or narrow? (#{"v" "m"} kind))]
+            ;; SELECT checks only these mapped/key columns, including for views
+            ;; whose underlying relations have narrower invoker grants.
+            (jdbc/query! context :acquisition
+                         (str "SELECT " (if narrow? (str/join "," (map jdbc/identifier (keys (:columns requirements)))) "1")
+                              " FROM " (when (and narrow? (= "r" kind)) "ONLY ")
+                              (jdbc/relation (:table requirements)) " LIMIT 0") [] (constantly nil)))
+          (doseq [view (vals views)]
+            (pm/verify! (:accepted view) (jdbc/catalog! context (get-in view [:accepted :requirements :table]))))
+          (when (or narrow? (some #(#{"v" "m"} (get-in % [:accepted :requirements :kind])) (vals views)))
+            (jdbc/verify-snapshot! context (mapv #(get-in % [:accepted :requirements :oid]) (vals views)) narrow?))
+          (let [columns (when narrow?
+                          (let [relations (mapv :accepted ordered)]
+                            {:relations relations :fingerprint (jdbc/column-snapshot! context relations)}))
+                function-oids (into [] (keep #(when (get-in % [:accepted :requirements :security])
+                                              (get-in % [:accepted :requirements :oid]))) (vals views))
+                functions (when (seq function-oids) (jdbc/function-snapshot! context function-oids))]
+            (doseq [view (vals views)]
+              (when-let [snapshot (:snapshot view)]
+                (reset! snapshot (capture! context (:accepted view) reservations))))
+            ;; SQL catalog reads in the data transaction see old pg_proc rows,
+            ;; while function execution can use replacements from the catalog cache.
+            ;; Validate fresh tuple versions after every capture, before publication.
+            (verify-acquisition! context views function-oids functions columns)))
         (let [session (->Session views request context
                         (merge (select-keys (:descriptor source) [:source-instance-id :compute-context-id])
                                {:spi-version 2 :features #{} :consistency :snapshot :session-id (UUID/randomUUID)
@@ -389,6 +442,17 @@
           (throw e))))))
 
 (defrecord PostgresSource [descriptor accepted profile stats]
+  spi/IRelationalWindowSource
+  (-plan-relational-window [_ request]
+    (when (and (:relational? profile) (= :relational-window (:mode request)))
+      (let [sources (:sources request)
+            views (into {} (map (fn [{:keys [symbol descriptor]}] [symbol (::accepted descriptor)])) sources)]
+        (when (and (= descriptor (:descriptor (first sources))) (every? some? (vals views))
+                   (compile-relational! (:control request) views request (:max-row-bytes profile) true))
+          {:columns (:columns request)
+           :plan {:sources (mapv (fn [{:keys [symbol descriptor]}]
+                                  {:symbol symbol :definition-fingerprint (:definition-fingerprint descriptor)}) sources)
+                  :query (select-keys request [:mode :semantics-version :clauses :bindings :find :with :columns :window])}}))))
   spi/IRelationalQuerySource
   (-plan-relational [_ request]
     (when (:relational? profile)

@@ -172,7 +172,102 @@
     (execute! context :acquisition
               (str "SET LOCAL " (identifier k) " = '" (str/replace v "'" "''") "'") [])))
 
+(defn try-lock! [context relations]
+  ;; A permission error aborts the transaction. Recover only that error, without
+  ;; losing the authorized transaction or hiding timeouts/definition failures.
+  (if (empty? relations) true
+    (do
+      (execute! context :acquisition "SAVEPOINT dtlv_relation_locks" [])
+      (try
+        (doseq [{:keys [kind table]} relations]
+          (execute! context :acquisition
+                    (str "LOCK TABLE " (when (= "r" kind) "ONLY ") (relation table) " IN ACCESS SHARE MODE") []))
+        (execute! context :acquisition "RELEASE SAVEPOINT dtlv_relation_locks" [])
+        true
+        (catch clojure.lang.ExceptionInfo e
+          (if (= :query-source/unauthorized (:error (ex-data e)))
+            (do (execute! context :acquisition "ROLLBACK TO SAVEPOINT dtlv_relation_locks" [])
+                (execute! context :acquisition "RELEASE SAVEPOINT dtlv_relation_locks" [])
+                false)
+            (throw e)))))))
+
+(defn column-snapshot!
+  "Fingerprint mapped column identity and storage expressions in this snapshot.
+  Attribute numbers detect a same-name drop/add that has unchanged public types."
+  [context relations]
+  (let [columns (vec (distinct (mapcat (fn [accepted]
+                                       (map #(vector (get-in accepted [:requirements :oid]) %)
+                                            (keys (get-in accepted [:requirements :columns])))) relations)))
+        _ (when (> (* 2 (count columns)) 65535) (fail! :query-source/limit :acquisition))]
+    (first
+      (query! context :acquisition
+        (str "WITH used(oid,name) AS (VALUES " (str/join "," (repeat (count columns) "(?::oid,?::text)")) ") "
+             "SELECT encode(sha256(convert_to(COALESCE(jsonb_agg(jsonb_build_array("
+             "u.oid,u.name,a.attnum,a.atttypid,a.atttypmod,a.attnotnull,a.attcollation,d.adbin::text) "
+             "ORDER BY u.oid,u.name COLLATE pg_catalog.\"C\")::text,'[]'),'UTF8')),'hex') FROM used u "
+             "LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid=u.oid AND a.attname::text=u.name COLLATE pg_catalog.\"C\" AND a.attnum>0 AND NOT a.attisdropped "
+             "LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum")
+        (vec (mapcat identity columns)) #(.getString ^ResultSet % 1)))))
+
 (declare relation-dependencies!)
+
+(defn verify-snapshot!
+  "Reject physical rewrites that committed after the read snapshot but before
+  all read relations were locked. Call only after relation locks and catalog
+  verification; an ordinary view can read a materialized-view dependency."
+  ([context oids] (verify-snapshot! context oids false))
+  ([context oids include-tables?]
+  (let [changed? (first
+                   (query! context :acquisition
+                     (str "WITH RECURSIVE reads(oid) AS (VALUES "
+                          (str/join "," (repeat (count oids) "(?::oid)")) " UNION "
+                          "SELECT d.oid FROM reads r JOIN pg_catalog.pg_class c ON c.oid=r.oid "
+                          "CROSS JOIN LATERAL ("
+                          "SELECT dep.refobjid AS oid FROM pg_catalog.pg_rewrite w "
+                          "JOIN pg_catalog.pg_depend dep ON dep.classid='pg_rewrite'::regclass AND dep.objid=w.oid "
+                          "AND dep.refclassid='pg_class'::regclass WHERE c.relkind='v' AND w.ev_class=c.oid "
+                          "UNION SELECT inhrelid FROM pg_catalog.pg_inherits WHERE c.relkind='p' AND inhparent=c.oid"
+                          ") d) SELECT EXISTS (SELECT 1 FROM reads JOIN pg_catalog.pg_class c USING(oid) "
+                          "WHERE " (if include-tables? "c.relkind IN ('r','m') AND c.relfilenode<>0" "c.relkind='m'")
+                          " AND c.relfilenode IS DISTINCT FROM pg_catalog.pg_relation_filenode(c.oid))")
+                     oids #(.getBoolean ^ResultSet % 1)))]
+    ;; pg_class obeys the transaction's MVCC snapshot; pg_relation_filenode
+    ;; consults the current catalog cache. Held ACCESS SHARE locks stabilize
+    ;; storage now. Column-grant fallback reads can freeze a snapshot before
+    ;; later ordinary locks, so include those tables in that case. Mapped system
+    ;; catalogs have no snapshot-visible file number to compare this way.
+    (when changed? (fail! :query-source/snapshot-lost :acquisition)))))
+
+(defn- dependency-ctes [roots]
+  (str "WITH RECURSIVE rels(oid) AS (" roots " UNION "
+       "SELECT d.refobjid FROM rels r JOIN pg_catalog.pg_rewrite w ON w.ev_class=r.oid "
+       "JOIN pg_catalog.pg_depend d ON d.classid='pg_rewrite'::regclass AND d.objid=w.oid "
+       "AND d.refclassid='pg_class'::regclass), "
+       "functions(oid) AS (SELECT DISTINCT d.refobjid FROM pg_catalog.pg_depend d "
+       "WHERE d.refclassid='pg_proc'::regclass "
+       "AND ((d.classid='pg_rewrite'::regclass AND d.objid IN (SELECT w.oid FROM pg_catalog.pg_rewrite w JOIN rels r ON r.oid=w.ev_class)) "
+       "OR (d.classid='pg_policy'::regclass AND d.objid IN (SELECT q.oid FROM pg_catalog.pg_policy q JOIN rels r ON r.oid=q.polrelid)))) "))
+
+(defn function-snapshot!
+  "Fingerprint the function catalog rows covered by accepted dependency checks,
+  including tuple versions so replacing then restoring a body cannot pass.
+  Bodies and object names remain inside PostgreSQL."
+  [context oids]
+  (first
+    (query! context :acquisition
+      (str (dependency-ctes (str "VALUES " (str/join "," (repeat (count oids) "(?::oid)"))))
+           "SELECT count(*), encode(sha256(convert_to(COALESCE(jsonb_agg("
+           "jsonb_build_array(p.oid,p.xmin::text,p.ctid::text,to_jsonb(p)) ORDER BY p.oid)::text,'[]'),'UTF8')),'hex') "
+           "FROM functions f JOIN pg_catalog.pg_proc p ON p.oid=f.oid")
+      oids (fn [^ResultSet r] {:count (.getLong r 1) :fingerprint (.getString r 2)}))))
+
+(defn restart!
+  "Finish a fully captured data snapshot and start fresh catalog verification.
+  Never call while any relation still needs SQL reads from the old snapshot."
+  [{:keys [connection] :as context}]
+  (request! context :acquisition #(.rollback ^Connection connection))
+  (.setAutoCommit ^Connection connection true)
+  (begin! context))
 
 (defn- security! [context oid]
   (let [names (vec (sort (keys (get-in context [:profile :session-settings]))))
@@ -200,21 +295,15 @@
   ;; and directly referenced functions. SQL text stays inside PostgreSQL.
   (first
     (query! context :discovery
-      (str "WITH RECURSIVE rels(oid) AS (SELECT ?::oid UNION "
-           "SELECT d.refobjid FROM rels r JOIN pg_catalog.pg_rewrite w ON w.ev_class=r.oid "
-           "JOIN pg_catalog.pg_depend d ON d.classid='pg_rewrite'::regclass AND d.objid=w.oid "
-           "AND d.refclassid='pg_class'::regclass), "
-           "objects AS (SELECT 'r' AS kind,c.oid::bigint AS oid, "
+      (str (dependency-ctes "SELECT ?::oid")
+           ", objects AS (SELECT 'r' AS kind,c.oid::bigint AS oid, "
            "jsonb_build_array(c.relkind,c.relowner,c.reloptions,c.relrowsecurity,c.relforcerowsecurity, "
            "CASE WHEN c.relkind IN ('v','m') THEN pg_get_viewdef(c.oid,true) END, "
            "(SELECT jsonb_agg(jsonb_build_array(a.attnum,a.attname,a.atttypid,a.atttypmod,a.attnotnull,a.attisdropped) ORDER BY a.attnum) "
            "FROM pg_catalog.pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0), "
            "(SELECT jsonb_agg(to_jsonb(p) ORDER BY p.polname) FROM pg_catalog.pg_policy p WHERE p.polrelid=c.oid)) AS definition "
            "FROM rels JOIN pg_catalog.pg_class c USING(oid) UNION "
-           "SELECT 'f',p.oid::bigint,to_jsonb(p) FROM pg_catalog.pg_proc p "
-           "WHERE p.oid IN (SELECT d.refobjid FROM pg_catalog.pg_depend d WHERE d.refclassid='pg_proc'::regclass "
-           "AND ((d.classid='pg_rewrite'::regclass AND d.objid IN (SELECT w.oid FROM pg_catalog.pg_rewrite w JOIN rels r ON r.oid=w.ev_class)) "
-           "OR (d.classid='pg_policy'::regclass AND d.objid IN (SELECT q.oid FROM pg_catalog.pg_policy q JOIN rels r ON r.oid=q.polrelid))))) "
+           "SELECT 'f',p.oid::bigint,to_jsonb(p) FROM functions f JOIN pg_catalog.pg_proc p ON p.oid=f.oid) "
            "SELECT encode(sha256(convert_to(jsonb_agg(jsonb_build_array(kind,oid,definition) ORDER BY kind,oid)::text,'UTF8')),'hex') FROM objects")
       [oid] (fn [^ResultSet r] (.getString r 1)))))
 

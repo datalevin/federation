@@ -32,10 +32,10 @@ application schema or a larger reporting query:
 | Use case | Current gap | Effect on the workload |
 | --- | --- | --- |
 | Enrich large key sets | Batches accept at most 256 keys and 256 KiB of bindings; matches arrive in bounded fetch pages | Request and memory budgets apply across all batches. Network latency and nonunique value matches can still dominate. |
-| Filter orders by amount or events by time | Matching integral, `BigDecimal`, and `Instant` comparisons are pushed down; mixed representations and arbitrary functions stay local | Eligible ranges and equality reduce transfer. Bounds outside the supported timestamp parameter range and unsupported comparisons can still require a broad read. |
+| Filter orders by amount or events by time | Matching integral, `BigDecimal`, and `Instant` comparisons are pushed down; mixed representations and supported scalar functions stay local | Eligible ranges and equality reduce transfer. Bounds outside the supported timestamp parameter range and unsupported comparisons can still require a broad read. |
 | Read an existing application schema | Temporal types and enums are supported; domains, `char`, `citext`, arrays, and JSON/JSONB remain unmapped | Supported columns can be selected independently. Collection-valued attributes are not implemented. |
 | Read reporting views, partitioned datasets, or tenant tables with RLS | Views need declared keys; partitioned parents need primary keys; RLS needs an enforced authorization profile | These relations capture all mapped columns at acquisition under shared row, request, and retention limits. Subsequent accesses use the captured rows; SQL predicate, join, and aggregate delegation is unavailable for these captures. |
-| Aggregate, sort, or join large PostgreSQL relations | Whole-query and mixed-source fragment delegation cover eligible flat joins and aggregates; SQL ordering/limit, arbitrary reducers, and scoped fragments stay in core | Mixed native/SQL spending queries can return customer totals instead of every order. Complete aggregate groups must fit a binding batch; unsupported shapes retain fact accesses. Backend work remains subject to timeouts; no index discovery or cost-based access choice is implemented. |
+| Aggregate, sort, or join large PostgreSQL relations | Whole-query and mixed-source fragment delegation cover eligible flat joins and aggregates; eligible whole-query ordering/limit windows execute in SQL | Mixed native/SQL spending queries can return customer totals instead of every order. Complete aggregate groups must fit a binding batch; unsupported shapes retain fact accesses. Backend work remains subject to timeouts; no index discovery or cost-based access choice is implemented. |
 | Read large text or binary fields | The default payload-row cap is 16 KiB, measured using SQL text representations | `_` existence checks use presence flags and do not fetch the payload. Values needed for output or local matching remain capped; delegated SQL applies the cap to its final returned row. |
 | Discover relationships | Discovery covers one named relation, its columns, key, enum labels, and applicable view/security contracts; foreign-key discovery is absent | Define references manually. Use PostgreSQL policies and explicit runtime role/settings for authorization; query filters do not establish an authorization boundary. |
 
@@ -250,6 +250,46 @@ requires explicit rediscovery and acceptance. Dependencies hidden inside dynamic
 SQL or function bodies remain the profile owner's compatibility responsibility.
 Materialized views must be populated.
 
+With table-level privileges, acquisition first locks ordinary tables, partitioned
+parents, and regular views without taking a data snapshot. It then issues zero-row
+reads to lock materialized views, including dependencies reached through regular views, before checking the
+accepted catalog. A column-type change committed before its table lock is acquired
+fails as `:query-source/stale-definition`. A physical rewrite between snapshot
+creation and a later materialized-view lock fails as `:query-source/snapshot-lost`
+before any capture is published. The guard compares snapshot-visible storage
+generations with the current locked relations. A refresh completed before the
+snapshot, or an MVCC-safe concurrent refresh, does not trigger that guard. Lock
+acquisition and storage checks share the original authorized transaction.
+
+Column-level `SELECT` grants on mapped attributes and identity columns are also
+sufficient. If explicit locking lacks permission, acquisition rolls back its
+lock attempts to a savepoint and locks the group through zero-row reads of just
+those columns. Unmapped columns require no grant. Missing access to a mapped
+column still fails as `:query-source/unauthorized`; underlying privileges for
+security-invoker views follow PostgreSQL's normal rules.
+
+This fallback checks ordinary-table storage generations too, then validates the
+accepted schema and mapped column identities against a fresh snapshot before
+publishing the session. Rewrites, type changes, and a drop/add of a same-name
+column cannot silently use an older catalog snapshot. It retains the original
+data snapshot for SQL cursors.
+
+Before publishing a session, acquisition also checks referenced function catalog
+row versions against a fresh snapshot taken after every capture. Changes during
+capture fail as `:query-source/stale-definition`, including a replacement restored
+to its original body before verification. SQL text and function bodies stay in
+PostgreSQL. The version check uses the same catalog-visible dependency set as the
+accepted function fingerprint, including functions in nested views and policies.
+
+When all relations are captured, the adapter reuses its connection for this fresh
+metadata check; captured rows retain their original data snapshot. Sessions that
+still require SQL reads use a second read-only connection for function or
+column-grant fallback verification, keeping their original transaction. Their
+pool must permit that simultaneous checkout. The validation connection reserves another 8 MiB
+from the shared memory budget, obeys query/connection deadlines and request limits,
+and closes before session publication. Cancellation or verification failure
+releases the connections and retained capture reservations.
+
 Views, materialized views, partitioned parents, and RLS tables capture the
 accepted projection once per session, before planning fact accesses. Each
 non-key column contributes its value when it fits the cap, or an exact
@@ -329,6 +369,25 @@ PostgreSQL's microsecond values by adjusting the bound and strictness before
 binding. No rounding through `java.util.Date` occurs. Pattern and batched-key
 equality also support eligible `Instant` values.
 
+Flat scalar arithmetic (`+`, `-`, `*`, `/`, `quot`, `rem`, `mod`, `inc`, and
+`dec`), `like`/`not-like`, and `in`/`not-in` execute locally when SQL delegation
+does not cover them. They support predicates and scalar output bindings and can
+feed later filters, joins, and aggregates, including in mixed native/PostgreSQL
+queries. Decimal results keep native scale and math-context behavior; membership
+uses native Clojure set semantics. For example:
+
+```clojure
+[:find ?order ?adjusted :in $p :where
+ [$p ?order :order/status ?status] [(in ?status ["paid" "held"])]
+ [$p ?order :order/amount ?amount] [(+ ?amount 1M) ?adjusted]]
+```
+
+Arithmetic scratch, compiled patterns, and membership indexes use the shared
+memory budget. Constant patterns and collections are prepared once per scalar
+step; dynamic ones release scratch after each call. These expressions can still
+require fetching matching fact values. Nested calls, arbitrary host functions,
+and collection output bindings remain outside this bounded scalar path.
+
 The optional relational path delegates a complete flat conjunction when every
 source belongs to one acquired PostgreSQL session and all expressions have
 proven SQL semantics. It supports self joins, cross-table joins, and typed
@@ -350,8 +409,44 @@ wire payload cap.
 The initial relational contract accepts up to 32 patterns and 128 physical
 output components. Rules, unions, negation, functions, `:having`, collection
 inputs, and queries spanning independent sessions retain core execution.
-Public result shaping, ordering, offset, and limit use the shared result
-processor; ordering combined with return maps currently retains core execution.
+Public result shaping uses the shared result processor; ordering combined with
+return maps currently retains core execution. Finite relational windows use a
+distinct top-k collector that retains at most `offset + limit` candidate rows,
+charges their memory, and releases replaced candidates. The same collector
+bounds finite mixed-fragment results. An offset increases the retained prefix.
+Unlimited results still require full collection under the shared memory ledger;
+this path does not spill core rows to disk.
+
+The optional `IRelationalWindowSource` extension lets PostgreSQL apply a final
+distinct projection, ordering, offset, and limit before returning rows. It
+also covers eligible single-entity queries such as:
+
+```clojure
+(d/q '[:find ?id ?stamp
+       :in $orders
+       :where [$orders ?e :order/id ?id]
+              [$orders ?e :order/stamp ?stamp]
+       :order-by [?stamp :desc ?id :desc]
+       :limit 20]
+     orders)
+```
+
+Integral, decimal, boolean, and `Instant` sort keys have established SQL ordering.
+String, UUID, byte-array, and nominal-reference ordering stays in core; for
+example, PostgreSQL C collation orders UTF-8 while Java strings compare UTF-16.
+For those orders the bounded collector reduces retained memory but still reads
+the delegated result. Dynamic scalar limits/offsets resolve before planning.
+SQL windows preserve find/with distinctness, original decimal scales, grouping,
+and conversion/row-size errors even outside the returned window. Ties can select
+any matching boundary rows; include a unique final sort key for a unique window.
+
+The 50,000-row latest-orders regression returns and decodes only 20 rows within
+a 16 MiB query budget. This bounds client transfer and retained result rows;
+PostgreSQL can still scan, group, validate, and sort a larger input, using its
+own memory/spill policy and statement timeout. `d/explain` includes a structural
+`:result-window` on accepted whole-query window plans: column positions,
+directions, offset, and limit, without SQL or data values.
+
 Set `:relational? false` on participating runtime profiles to compare the
 fact-access path. `d/explain` identifies selected relational plans with
 `:policy :relational-v1`; raw SQL and parameters remain private.
