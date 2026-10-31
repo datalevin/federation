@@ -417,6 +417,24 @@ bounds finite mixed-fragment results. An offset increases the retained prefix.
 Unlimited results still require full collection under the shared memory ledger;
 this path does not spill core rows to disk.
 
+Core fallback supports relational `:order-by` and `:having` for captured views,
+mixed native/PostgreSQL queries, and other shapes that decline delegation.
+HAVING evaluates the supported scalar predicates over projected aggregates
+after grouping, before sorting, offset, and limit. The fallback also supports
+`count-distinct`; return maps sort using their projected column values.
+For example, a mixed-source spending query can add:
+
+```clojure
+:having [(> (sum ?amount) 100M)]
+:order-by [1 :desc ?name :asc]
+:limit 20
+```
+
+Fallback joins and aggregation still materialize their inputs under the shared
+memory budget. A small result limit does not bound those upstream rows or
+PostgreSQL transfer. Sorting and HAVING honor cancellation and deadlines, and
+exceeding a quota fails the query instead of returning a partial ranking.
+
 The optional `IRelationalWindowSource` extension lets PostgreSQL apply a final
 distinct projection, ordering, offset, and limit before returning rows. It
 also covers eligible single-entity queries such as:

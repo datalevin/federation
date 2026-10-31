@@ -927,6 +927,29 @@
     (merge {:source-instance-id unit/source-id :relation-id :test/schema
             :identity-attribute :row/id :attributes attrs} options)))
 
+(deftest captured-views-support-core-ranking-and-having
+  (sql! (str "CREATE VIEW " (table "ranked_view") " AS SELECT id,title,status,amount FROM " (table "orders")))
+  (sql! (str "CREATE MATERIALIZED VIEW " (table "ranked_materialized") " AS SELECT id,title,status,amount FROM " (table "orders")))
+  (doseq [name ["ranked_view" "ranked_materialized"]
+          :let [accepted (accept-relation name {:row/title "title" :row/status "status" :row/amount "amount"}
+                           {:key-columns ["id"]})
+                provider (pg/source accepted *profile*)
+                ranking {:find '[?id ?title] :in '[$p]
+                         :where '[[$p ?e :row/id ?id] [$p ?e :row/title ?title]]
+                         :order-by '[[?id :desc]] :limit 2}
+                spending {:find '[?status (sum ?amount)] :with '[?e] :in '[$p]
+                          :where '[[$p ?e :row/status ?status] [$p ?e :row/amount ?amount]]
+                          :having '[[(< (sum ?amount) 25M)]] :order-by '[[1 :desc]] :limit 1}]]
+    (is (= [[3 "x'; DROP TABLE orders; --"] [2 "βeta"]] (d/q ranking provider)))
+    (is (= [{:id 3 :title "x'; DROP TABLE orders; --"} {:id 2 :title "βeta"}]
+           (d/q (assoc ranking :keys '[id title]) provider)))
+    (is (= [["paid" 20.5000M]] (d/q spending provider))
+        "HAVING excludes the highest spending group before applying limit")
+    (let [plan (d/explain {:run? false} spending provider)]
+      (is (zero? (read-rows plan)))
+      (is (not (relational-plan? plan))))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
 (deftest column-level-select-grants-authorize-mapped-reads
   (let [role (str "federation_columns_" (.replace (str (random-uuid)) "-" ""))
         quoted (jdbc/identifier role) profile (assoc *profile* :role role)
@@ -1809,6 +1832,29 @@
     :where [?c :customer/id ?id] [?c :customer/name ?name]
     [$orders ?order :order/customer ?id] [$orders ?order :row/id ?order-id]
     [$items ?item :item/order ?order-id] [$items ?item :item/price ?price]])
+
+(deftest mixed-spending-falls-back-for-ranking-and-having
+  (fragment-fixture! 3 4
+    (fn [conn orders items]
+      (sql! (str "UPDATE " (table "fragment_items")
+                 " SET price=CASE WHEN order_id<=4 THEN 1 WHEN order_id<=8 THEN 2 ELSE 3 END"))
+      (let [queries [[(into fragment-spending-query '[:order-by [1 :desc ?name :asc] :limit 1 :offset 1])
+                      [["customer-2" 8.0000M]]]
+                     [(into fragment-spending-query '[:having [(< (sum ?price) 10M)] :order-by [1 :desc] :limit 1])
+                      [["customer-2" 8.0000M]]]
+                     [(into fragment-spending-query '[:having [(> (sum ?price) 5M)] [(< (sum ?price) 10M)]
+                                                     :keys name total :order-by [1 :desc] :limit 1])
+                      [{:name "customer-2" :total 8.0000M}]]]]
+        (doseq [relational? [true false] fusion? [true false]
+                :let [p #(pg/source % (assoc *profile* :relational? relational? :fusion? fusion?))
+                      order-source (p orders) item-source (p items)]
+                [q expected] queries]
+          (is (= expected (d/q q @conn order-source item-source)) (pr-str [relational? fusion? q]))
+          (is (zero? (:live-sessions (pg/statistics order-source))))
+          (is (zero? (:live-sessions (pg/statistics item-source)))))
+        (let [plan (d/explain {:run? false} (ffirst queries) @conn (pg/source orders *profile*) (pg/source items *profile*))]
+          (is (zero? (read-rows plan)))
+          (is (not (fragment-plan? plan))))))))
 
 (deftest mixed-native-queries-delegate-sql-joins-and-grouped-spending
   (fragment-fixture! 2 100
