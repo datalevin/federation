@@ -274,18 +274,26 @@ publishing the session. Rewrites, type changes, and a drop/add of a same-name
 column cannot silently use an older catalog snapshot. It retains the original
 data snapshot for SQL cursors.
 
-Before publishing a session, acquisition also checks referenced function catalog
-row versions against a fresh snapshot taken after every capture. Changes during
-capture fail as `:query-source/stale-definition`, including a replacement restored
-to its original body before verification. SQL text and function bodies stay in
-PostgreSQL. The version check uses the same catalog-visible dependency set as the
-accepted function fingerprint, including functions in nested views and policies.
+Before publishing a session, acquisition revalidates every accepted security
+scope against a fresh catalog snapshot taken after all captures. Mismatches in
+the effective role, inherited memberships, or RLS enforcement fail as
+`:query-source/unauthorized`, including grants of `BYPASSRLS` during acquisition.
+This check also runs for policies and views with no referenced functions and
+readers with full table SELECT permission.
+
+Acquisition also checks referenced function catalog row versions in that fresh
+snapshot. Function changes during capture fail as `:query-source/stale-definition`,
+including a replacement restored to its original body before verification. SQL
+text and function bodies stay in PostgreSQL. The version check uses the same
+catalog-visible dependency set as the accepted function fingerprint, including
+functions in nested views and policies.
 
 When all relations are captured, the adapter reuses its connection for this fresh
 metadata check; captured rows retain their original data snapshot. Sessions that
-still require SQL reads use a second read-only connection for function or
-column-grant fallback verification, keeping their original transaction. Their
-pool must permit that simultaneous checkout. The validation connection reserves another 8 MiB
+still require SQL reads use a second read-only connection for security-scope,
+function, or column-grant fallback verification, keeping their original
+transaction. Their pool must permit that simultaneous checkout. The validation
+connection reserves another 8 MiB
 from the shared memory budget, obeys query/connection deadlines and request limits,
 and closes before session publication. Cancellation or verification failure
 releases the connections and retained capture reservations.

@@ -329,37 +329,43 @@
       (finally (close-portal! context state) (spi/release! workspace)))))
 
 (defn- verify-acquisition! [context views oids before columns]
-  (when (or columns (pos? (or (:count before) 0)))
-    (let [verify! (fn [context]
-                    (when columns
-                      (doseq [accepted (:relations columns)]
+  (let [relations (or (:relations columns)
+                      (into [] (comp (filter #(get-in % [:accepted :requirements :security]))
+                                     (map :accepted)) (vals views)))]
+    (when (or (seq relations) (pos? (or (:count before) 0)))
+      (let [verify! (fn [context]
+                      ;; Role attributes and memberships can change without a
+                      ;; relation lock or a referenced function changing. Recheck
+                      ;; every accepted security scope after data capture.
+                      (doseq [accepted relations]
                         (pm/verify! accepted (jdbc/catalog! context (get-in accepted [:requirements :table]))))
-                      (when-not (= (:fingerprint columns) (jdbc/column-snapshot! context (:relations columns)))
-                        (fail! :query-source/snapshot-lost :acquisition)))
-                    (when (pos? (or (:count before) 0))
-                      (when-not (= before (jdbc/function-snapshot! context oids))
-                        (fail! :query-source/stale-definition :acquisition))))]
-      (if (every? :snapshot (vals views))
-        ;; All data is now owned locally. Reuse this connection (including a
-        ;; single-connection pool) for the fresh metadata checks.
-        (do (jdbc/restart! context) (verify! context))
-        ;; Ordinary SQL cursors still need the original data snapshot. Keep it
-        ;; pinned while a temporary, equally authorized connection checks versions.
-        (let [ctl (:control context) token (spi/reserve! ctl {:retained-bytes 8388608})
-              connection (atom nil) registration (volatile! nil)]
-          (try
-            (vreset! registration (spi/register-cancel! ctl (fn [_] (jdbc/abort! @connection))))
-            (let [conn (jdbc/request! context :acquisition
-                         #(let [conn (jdbc/connect! context)] (reset! connection conn) conn))
-                  context (assoc context :connection conn)]
-              (jdbc/begin! context)
-              (verify! context))
-            (finally
-              (when-let [r @registration] (spi/unregister-cancel! r))
-              (when-let [conn @connection]
-                (try (.rollback ^Connection conn) (catch Exception _ nil))
-                (jdbc/close! conn))
-              (spi/release! token))))))))
+                      (when columns
+                        (when-not (= (:fingerprint columns) (jdbc/column-snapshot! context (:relations columns)))
+                          (fail! :query-source/snapshot-lost :acquisition)))
+                      (when (pos? (or (:count before) 0))
+                        (when-not (= before (jdbc/function-snapshot! context oids))
+                          (fail! :query-source/stale-definition :acquisition))))]
+        (if (every? :snapshot (vals views))
+          ;; All data is now owned locally. Reuse this connection (including a
+          ;; single-connection pool) for the fresh metadata checks.
+          (do (jdbc/restart! context) (verify! context))
+          ;; Ordinary SQL cursors still need the original data snapshot. Keep it
+          ;; pinned while a temporary, equally authorized connection checks versions.
+          (let [ctl (:control context) token (spi/reserve! ctl {:retained-bytes 8388608})
+                connection (atom nil) registration (volatile! nil)]
+            (try
+              (vreset! registration (spi/register-cancel! ctl (fn [_] (jdbc/abort! @connection))))
+              (let [conn (jdbc/request! context :acquisition
+                           #(let [conn (jdbc/connect! context)] (reset! connection conn) conn))
+                    context (assoc context :connection conn)]
+                (jdbc/begin! context)
+                (verify! context))
+              (finally
+                (when-let [r @registration] (spi/unregister-cancel! r))
+                (when-let [conn @connection]
+                  (try (.rollback ^Connection conn) (catch Exception _ nil))
+                  (jdbc/close! conn))
+                (spi/release! token)))))))))
 
 (defn- acquire [source request]
   (let [{:keys [profile stats]} source
@@ -419,9 +425,9 @@
             (doseq [view (vals views)]
               (when-let [snapshot (:snapshot view)]
                 (reset! snapshot (capture! context (:accepted view) reservations))))
-            ;; SQL catalog reads in the data transaction see old pg_proc rows,
-            ;; while function execution can use replacements from the catalog cache.
-            ;; Validate fresh tuple versions after every capture, before publication.
+            ;; Data-transaction catalogs can hide concurrent role/function
+            ;; changes that affected execution. Validate security scopes and
+            ;; fresh function versions after all captures, before publication.
             (verify-acquisition! context views function-oids functions columns)))
         (let [session (->Session views request context
                         (merge (select-keys (:descriptor source) [:source-instance-id :compute-context-id])

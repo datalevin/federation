@@ -927,6 +927,61 @@
     (merge {:source-instance-id unit/source-id :relation-id :test/schema
             :identity-attribute :row/id :attributes attrs} options)))
 
+(deftest count-distinct-agrees-between-delegated-tables-and-captured-views
+  (sql! (str "CREATE TABLE " (table "distinct_table")
+             " (id bigint PRIMARY KEY, g text, amount numeric, payload bytea, title text)"))
+  (sql! (str "INSERT INTO " (table "distinct_table") " VALUES "
+             "(1,'a',1.0,decode('00ff','hex'),'repeat'),"
+             "(2,'a',1.00,decode('00ff','hex'),'repeat'),"
+             "(3,'a',1.0,decode('01','hex'),'different'),"
+             "(4,'b',2.0,decode('00ff','hex'),'repeat'),"
+             "(5,'b',NULL,NULL,NULL),(6,'b',2.00,decode('','hex'),'repeat')"))
+  (sql! (str "CREATE VIEW " (table "distinct_view") " AS SELECT * FROM " (table "distinct_table")))
+  (sql! (str "CREATE MATERIALIZED VIEW " (table "distinct_materialized") " AS SELECT * FROM " (table "distinct_table")))
+  (let [attrs {:row/group "g" :row/amount "amount" :row/payload "payload" :row/title "title"}
+        accepted (accept-relation "distinct_table" attrs)
+        compiled (mapping/compile-logical-mapping accepted)
+        bytes #(byte-array (map unchecked-byte %))
+        facts (vec (mapcat (fn [[id g amount payload title]]
+                            (mapping/project-facts compiled [id]
+                              {:row/group g :row/amount amount :row/payload payload :row/title title}))
+                          [[1 "a" 1.0M (bytes [0 255]) "repeat"]
+                           [2 "a" 1.00M (bytes [0 255]) "repeat"]
+                           [3 "a" 1.0M (bytes [1]) "different"]
+                           [4 "b" 2.0M (bytes [0 255]) "repeat"]
+                           [5 "b" nil nil nil] [6 "b" 2.00M (bytes []) "repeat"]]))
+        queries ['[:find (count-distinct ?v) :in $p :where [$p _ :row/title ?v]]
+                 '[:find (count-distinct ?v) :in $p :where [$p _ :row/amount ?v]]
+                 '[:find (count-distinct ?v) :in $p :where [$p _ :row/payload ?v]]
+                 '[:find (count ?v) (count-distinct ?v) :with ?e :in $p :where [$p ?e :row/amount ?v]]
+                 '[:find ?g (count-distinct ?v) :with ?e :in $p
+                   :where [$p ?e :row/group ?g] [$p ?e :row/title ?v]]
+                 '[:find ?g (count-distinct ?amount) (count-distinct ?payload) :in $p
+                   :where [$p ?e :row/group ?g] [$p ?e :row/amount ?amount] [$p ?e :row/payload ?payload]]
+                 '[:find (count-distinct ?v) . :in $p :where [$p _ :row/amount ?v]]
+                 '[:find [(count-distinct ?v)] :in $p :where [$p _ :row/amount ?v]]
+                 '[:find [(count-distinct ?v) ...] :in $p :where [$p _ :row/amount ?v]]
+                 '[:find (count-distinct ?v) :in $p
+                   :where [$p ?e :row/id ?id] [$p ?e :row/amount ?v] [(> ?id 100)]]
+                 '[:find ?g (count-distinct ?v) :in $p
+                   :where [$p ?e :row/group ?g] [$p ?e :row/title ?v]
+                   :having [(> (count-distinct ?v) 1)] :order-by [1 :desc ?g :asc] :limit 1]]]
+    (is (= #{[2]} (set (d/q (nth queries 0) facts))))
+    (is (= #{[2]} (set (d/q (nth queries 1) facts))) "native count-distinct equates decimal scales")
+    (is (= #{[3]} (set (d/q (nth queries 2) facts))) "byte arrays compare by content")
+    (doseq [[name relational?] [["distinct_table" true] ["distinct_table" false]
+                              ["distinct_view" true] ["distinct_materialized" true]]
+            :let [provider (pg/source (if (= name "distinct_table") accepted
+                                         (accept-relation name attrs {:key-columns ["id"]}))
+                                      (assoc *profile* :relational? relational?))]]
+      (doseq [[index q] (map-indexed vector queries)
+              :let [expected (d/q q facts) actual (d/q q provider)
+                    normalize (if (#{6 7 8 10} index) identity frequencies)]]
+        (is (= (normalize expected) (normalize actual)) (pr-str [name relational? q])))
+      (is (= (and (= name "distinct_table") relational?)
+             (boolean (relational-plan? (d/explain {:run? false} (first queries) provider)))))
+      (is (zero? (:live-sessions (pg/statistics provider)))))))
+
 (deftest captured-views-support-core-ranking-and-having
   (sql! (str "CREATE VIEW " (table "ranked_view") " AS SELECT id,title,status,amount FROM " (table "orders")))
   (sql! (str "CREATE MATERIALIZED VIEW " (table "ranked_materialized") " AS SELECT id,title,status,amount FROM " (table "orders")))
@@ -1321,6 +1376,121 @@
       (finally
         (sql! (str "DROP OWNED BY " quoted))
         (sql! (str "DROP ROLE " quoted))))))
+
+(defn rls-authorization-fixture! [{:keys [function? view? columns?]} f]
+  (let [role (str "federation_authorization_" (.replace (str (random-uuid)) "-" ""))
+        group (str role "_other") quoted (jdbc/identifier role) quoted-group (jdbc/identifier group)
+        profile (assoc *profile* :role role)]
+    (sql! (str "CREATE ROLE " quoted " NOLOGIN INHERIT"))
+    (sql! (str "CREATE ROLE " quoted-group " NOLOGIN"))
+    (try
+      (sql! (str "CREATE TABLE " (table "authorization_rows") " (id bigint PRIMARY KEY,tenant text,v text)"))
+      (sql! (str "INSERT INTO " (table "authorization_rows") " VALUES (1,'a','A'),(2,'b','B')"))
+      (sql! (str "ALTER TABLE " (table "authorization_rows") " ENABLE ROW LEVEL SECURITY"))
+      (when function?
+        (sql! (str "CREATE FUNCTION " (table "authorization_tenant")
+                   "(t text) RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT t='a' $$")))
+      (sql! (str "CREATE POLICY tenant_a ON " (table "authorization_rows") " TO " quoted
+                 " USING (" (if function? (str (table "authorization_tenant") "(tenant)") "tenant='a'") ")"))
+      (sql! (str "CREATE POLICY tenant_b ON " (table "authorization_rows") " TO " quoted-group " USING (tenant='b')"))
+      (sql! (str "GRANT USAGE ON SCHEMA " (jdbc/identifier *schema*) " TO " quoted))
+      (sql! (str "GRANT " (if columns? "SELECT(id,v)" "SELECT") " ON " (table "authorization_rows") " TO " quoted))
+      (when view?
+        (sql! (str "CREATE VIEW " (table "authorization_view")
+                   " WITH (security_invoker=true) AS SELECT id,v FROM " (table "authorization_rows")))
+        (sql! (str "GRANT SELECT ON " (table "authorization_view") " TO " quoted)))
+      (let [accepted (accept-relation (if view? "authorization_view" "authorization_rows") {:row/value "v"}
+                                     (when view? {:key-columns ["id"]}) profile)]
+        (f {:role quoted :group quoted-group :profile profile :accepted accepted}))
+      (finally
+        (sql! (str "DROP OWNED BY " quoted))
+        (sql! (str "DROP OWNED BY " quoted-group))
+        (sql! (str "DROP ROLE " quoted))
+        (sql! (str "DROP ROLE " quoted-group))))))
+
+(defn assert-rls-acquisition-race! [{:keys [profile accepted]} mutate mixed?]
+  (let [changed? (atom false) connections (atom []) url (:jdbc-url profile)
+        pool (data-source
+               #(let [connection (intercepted-connection url
+                                    (fn [sql]
+                                      (when (and (.startsWith ^String sql "DECLARE ")
+                                                 (compare-and-set! changed? false true))
+                                        (mutate))
+                                      sql))]
+                  (swap! connections conj connection) connection))
+        provider (pg/source accepted (-> profile (dissoc :jdbc-url) (assoc :data-source pool)))
+        ctl (control/create)
+        invocation (cond-> (request provider ctl)
+                     mixed? (update :source-descriptors conj
+                              (spi/-source-info (pg/source *accepted* (-> profile (dissoc :jdbc-url) (assoc :data-source pool))))))]
+    (try
+      (let [outcome (try
+                      (let [session (spi/-open-session provider invocation)]
+                        (try
+                          (let [clauses [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :row/value] [:var ?v]]}]
+                                alt (first (alternatives provider session invocation clauses []))
+                                cursor (open provider session invocation alt nil)]
+                            (try {:rows (:rows (consume cursor ctl alt false))}
+                                 (finally (spi/-close-cursor! cursor))))
+                          (finally (spi/-close-session! session))))
+                      (catch clojure.lang.ExceptionInfo e (select-keys (ex-data e) [:error])))]
+        (is (= {:error :query-source/unauthorized} outcome)))
+      (is @changed?)
+      (is (= (if mixed? 2 1) (count @connections)))
+      (is (released? ctl))
+      (is (every? #(.isClosed ^Connection %) @connections))
+      (is (zero? (:live-sessions (pg/statistics provider))))
+      ;; The same accepted mapping must continue to fail on the next query.
+      (is (= :query-source/unauthorized
+             (category #(d/q '[:find ?v :in $p :where [$p _ :row/value ?v]] (pg/source accepted profile)))))
+      (finally (control/close! ctl)))))
+
+(deftest rls-bypass-grants-during-acquisition-are-unauthorized
+  (rls-authorization-fixture! {}
+    (fn [{:keys [role] :as fixture}]
+      (assert-rls-acquisition-race! fixture #(sql! (str "ALTER ROLE " role " BYPASSRLS")) false))))
+
+(deftest rls-authorization-is-rechecked-with-policy-functions-and-column-grants
+  (doseq [options [{:function? true} {:columns? true} {:view? true}]]
+    (rls-authorization-fixture! options
+      (fn [{:keys [role] :as fixture}]
+        (assert-rls-acquisition-race! fixture #(sql! (str "ALTER ROLE " role " BYPASSRLS")) false)
+        ;; Each case gets separate relation objects inside this test's schema.
+        (sql! (str "DROP TABLE " (table "authorization_rows") " CASCADE"))
+        (when (:function? options)
+          (sql! (str "DROP FUNCTION " (table "authorization_tenant") "(text)")))))))
+
+(deftest rls-membership-grants-during-acquisition-are-unauthorized
+  (rls-authorization-fixture! {}
+    (fn [{:keys [role group] :as fixture}]
+      (assert-rls-acquisition-race! fixture #(sql! (str "GRANT " group " TO " role)) false))))
+
+(deftest mixed-sessions-check-captured-rls-authorization-with-a-fresh-connection
+  (rls-authorization-fixture! {}
+    (fn [{:keys [role] :as fixture}]
+      (sql! (str "GRANT SELECT ON " (table "orders") " TO " role))
+      (assert-rls-acquisition-race! fixture #(sql! (str "ALTER ROLE " role " BYPASSRLS")) true))))
+
+(deftest unchanged-rls-authorization-is-checked-on-the-same-connection
+  (rls-authorization-fixture! {}
+    (fn [{:keys [accepted profile]}]
+      (let [checkouts (atom 0) verifications (atom 0) connections (atom [])
+            pool (data-source
+                   #(do
+                      (when (> (swap! checkouts inc) 1)
+                        (throw (java.sql.SQLException. "single-connection pool exhausted")))
+                      (let [connection (intercepted-connection (:jdbc-url profile)
+                                         (fn [sql]
+                                           (when (.startsWith ^String sql "SELECT current_user, session_user, row_security_active")
+                                             (swap! verifications inc))
+                                           sql))]
+                        (swap! connections conj connection) connection)))
+            provider (pg/source accepted (-> profile (dissoc :jdbc-url) (assoc :data-source pool)))]
+        (is (= #{["A"]} (set (d/q '[:find ?v :in $p :where [$p _ :row/value ?v]] provider))))
+        (is (= 2 @verifications) "authorization is checked before and after capture even without policy functions")
+        (is (= 1 @checkouts))
+        (is (every? #(.isClosed ^Connection %) @connections))
+        (is (zero? (:live-sessions (pg/statistics provider))))))))
 
 (deftest nested-view-function-drift-is-detected
   (sql! (str "CREATE FUNCTION " (table "view_value") "() RETURNS text LANGUAGE sql AS $$ SELECT 'before'::text $$"))
