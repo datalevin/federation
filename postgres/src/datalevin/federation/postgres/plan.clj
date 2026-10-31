@@ -354,15 +354,15 @@
                                         (when (.getBoolean rs (int (+ i offset 3))) true)
                                         (decode accepted column rs (+ i offset 3)))]) columns))))))
 
-(defn- match-term [bound bindings term x]
+(defn- match-term [bound term x]
   (when bound
     (case (first term)
       :ignore bound
       :const (when (QueryKey/equiv (second term) x) bound)
       :var (let [sym (second term)]
+             ;; Reusing a variable is a join, including within a fused row.
              (if (contains? bound sym)
-               (when (if (contains? bindings sym) (QueryKey/equals (bound sym) x)
-                         (QueryKey/equiv (bound sym) x)) bound)
+               (when (QueryKey/equals (bound sym) x) bound)
                (assoc bound sym x))))))
 
 (defn match-row [accepted plan bindings row]
@@ -372,7 +372,7 @@
         (reduce
           (fn [bound clause]
             (let [[entity-term _ term] (:terms clause)
-                  bound (match-term bound bindings entity-term entity)]
+                  bound (match-term bound entity-term entity)]
               (when bound
                 (let [attribute (second (second (:terms clause)))
                       raw (mapv row (pm/attribute-columns accepted attribute))]
@@ -382,7 +382,7 @@
                         (when (some #{::oversized} raw) (jdbc/fail! :query-source/limit :decode))
                         (let [x (if-let [type (get-in accepted [:attributes attribute :reference :type])]
                                   (ref/entity-ref type raw) (if (= 1 (count raw)) (first raw) raw))]
-                          (match-term bound bindings term x))))))))) bindings (:clauses plan))]
+                          (match-term bound term x))))))))) bindings (:clauses plan))]
     (when matched
       (when-let [sizes (::sizes (meta row))]
         (when (> (reduce + 0 (map sizes (value-columns accepted plan))) (::max-row-bytes (meta row)))

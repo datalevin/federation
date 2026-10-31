@@ -11,7 +11,7 @@ can execute in PostgreSQL, including joins between accepted mappings and
 supported aggregates.
 
 This development snapshot requires the matching **Datalevin 1.2.10** build
-with the optional relational SPI extension. The module declares `1.2.10` as a
+with the optional whole-query and mixed-source fragment SPI extensions. The module declares `1.2.10` as a
 provided dependency; the development workspace uses the sibling checkout.
 SPI revision 2 alone does not establish availability of the new protocols.
 
@@ -21,8 +21,10 @@ The current fit is selective enrichment of a small set of keys from ordinary
 primary-key tables, including joins with native data and other adapters.
 Same-entity fusion avoids reading each scalar attribute separately. Flat joins
 and supported aggregates within one database snapshot can be delegated as a
-single relational access. Queries involving other adapters, native sources,
-or unsupported expressions use ordinary fact accesses and core joins.
+single relational access. A flat query joining native or local customer data
+to one PostgreSQL session can also delegate its PostgreSQL portion through a
+parameterized fragment. Unsupported expressions and independent adapter/session
+combinations use ordinary fact accesses and core joins.
 
 The following gaps matter when moving from that workflow to a typical
 application schema or a larger reporting query:
@@ -33,7 +35,7 @@ application schema or a larger reporting query:
 | Filter orders by amount or events by time | Matching integral, `BigDecimal`, and `Instant` comparisons are pushed down; mixed representations and arbitrary functions stay local | Eligible ranges and equality reduce transfer. Bounds outside the supported timestamp parameter range and unsupported comparisons can still require a broad read. |
 | Read an existing application schema | Temporal types and enums are supported; domains, `char`, `citext`, arrays, and JSON/JSONB remain unmapped | Supported columns can be selected independently. Collection-valued attributes are not implemented. |
 | Read reporting views, partitioned datasets, or tenant tables with RLS | Views need declared keys; partitioned parents need primary keys; RLS needs an enforced authorization profile | These relations capture all mapped columns at acquisition under shared row, request, and retention limits. Subsequent accesses use the captured rows; SQL predicate, join, and aggregate delegation is unavailable for these captures. |
-| Aggregate, sort, or join large PostgreSQL relations | Relational delegation covers flat single-snapshot conjunctions and selected aggregates; SQL ordering/limit, arbitrary aggregates, and scoped programs are not delegated | Eligible counts transfer one row per group. Unsupported shapes retain core execution. Backend work remains subject to statement/query timeouts; there is no index discovery or cost-based access choice. |
+| Aggregate, sort, or join large PostgreSQL relations | Whole-query and mixed-source fragment delegation cover eligible flat joins and aggregates; SQL ordering/limit, arbitrary reducers, and scoped fragments stay in core | Mixed native/SQL spending queries can return customer totals instead of every order. Complete aggregate groups must fit a binding batch; unsupported shapes retain fact accesses. Backend work remains subject to timeouts; no index discovery or cost-based access choice is implemented. |
 | Read large text or binary fields | The default payload-row cap is 16 KiB, measured using SQL text representations | `_` existence checks use presence flags and do not fetch the payload. Values needed for output or local matching remain capped; delegated SQL applies the cap to its final returned row. |
 | Discover relationships | Discovery covers one named relation, its columns, key, enum labels, and applicable view/security contracts; foreign-key discovery is absent | Define references manually. Use PostgreSQL policies and explicit runtime role/settings for authorization; query filters do not establish an authorization boundary. |
 
@@ -217,6 +219,9 @@ a superset filter and recheck Datalevin equality, including decimal scale and
 byte content. Eligible integral, decimal, and temporal comparisons can be
 pushed down. Unsupported predicates and scoped programs run in Datalevin. Fusion preserves
 existence guards, repeated variables, and the identities needed by `:with`.
+Repeated variables use join-key equality: `1.0M` and `1.00M` remain distinct
+with or without fusion. Literal constants and explicit `=` predicates retain
+numeric equivalence.
 
 Ordinary tables use `ONLY`, excluding inheritance children. Partitioned parents
 include all attached partitions. Arrays, JSON mapping, arbitrary SQL declarations,
@@ -260,9 +265,22 @@ and deadline budgets. No session is returned after a partial capture or failed
 key/conversion check. Capture freezes volatile view expressions and policy
 results for identical replay, including presence and size markers. It can
 transfer and retain substantially more data than a selective query returns.
-Lookups scan the capture locally; predicates, cross-entity joins, and aggregates
-over these captures run in core. Closing the session drops captured rows and
-releases reservations.
+Captured lookups build lazy hash indexes for bound entity, identity, and attribute
+values, then reuse them across input batches and cursor opens in that session.
+Each index scans the captured rows once; subsequent probes visit matching buckets
+instead of rescanning every row for each key. Variable joins use query-key
+equality, including decimal scale and byte-array contents; literal lookups use
+constant equivalence. Every candidate still passes through the ordinary matcher.
+Size markers remain residual candidates and cannot hide a payload-limit failure.
+
+Index keys, table growth, buckets, row references, and bookkeeping reserve shared
+retained memory before insertion. Admission also leaves 1 MiB for output pages.
+If a complete index cannot fit, its partial state is released and that lookup
+shape uses the scan path for the rest of the session. Index build visits and
+candidate visits contribute to cursor `:read-rows`; a reused index has no build
+visits. Predicates, cross-entity joins, and aggregates over captures still run in
+core. Closing the session drops captured rows and indexes and releases their
+reservations. Capture itself remains a full bounded read of the accepted projection.
 
 For RLS, discover and reopen with the same authorization context:
 
@@ -337,6 +355,62 @@ processor; ordering combined with return maps currently retains core execution.
 Set `:relational? false` on participating runtime profiles to compare the
 fact-access path. `d/explain` identifies selected relational plans with
 `:policy :relational-v1`; raw SQL and parameters remain private.
+
+## Delegation inside mixed-source queries
+
+The shared compiler can isolate a flat PostgreSQL portion when the other
+patterns read native Datalevin databases or owned local facts. For example:
+
+```clojure
+(d/q '[:find ?name (sum ?amount)
+       :with ?order
+       :in $customers $orders
+       :where [$customers ?customer :customer/id ?id]
+              [$customers ?customer :customer/name ?name]
+              [$orders ?order :order/customer-id ?id]
+              [$orders ?order :order/amount ?amount]]
+     native-customers orders)
+```
+
+Core compiles the native prefix through its ordinary shared operators and pins
+its native views for the invocation. It exports distinct typed boundary keys to
+PostgreSQL in bounded `VALUES` batches. The SQL portion can join multiple accepted
+mappings in the same session and apply its supported predicates and aggregates.
+Opaque group/witness IDs carry native grouping and `:with` multiplicity; native
+names and unrelated payloads do not need to enter SQL. Repeated amounts, duplicate
+native witnesses, and customers sharing a name retain the ordinary find/with
+distinctness rules. As with ordinary Datalog aggregation, `:with ?order` is needed
+when equal spending amounts from different orders should contribute separately.
+
+A spending fixture with 300 selected customers and 30,000 order/item rows returns
+300 totals through two cursor opens under the default binding limits. This is a
+transfer/count regression, not a production throughput benchmark.
+
+Every SQL batch shares the single acquired authorization context and repeatable
+read snapshot. Boundary equality uses query-key semantics, including original
+decimal scale, rather than PostgreSQL's numeric equivalence alone. All inputs,
+pages, native intermediate rows, and public results use the shared resource
+ledger. Cursor closure drops owned binding buffers. Plan-only explain compiles
+the prefix and validates the SQL session without opening a data cursor.
+`d/explain` marks the path with `:policy :relational-fragment-v1`; it reports typed
+boundaries and counts without exposing SQL or parameter values.
+
+This first fragment path accepts one PostgreSQL session group plus native/local
+sources, a shared boundary variable, and a flat conjunction of patterns and
+supported predicates. Aggregate arguments must belong to the SQL portion.
+Selectors support integral, string, decimal, UUID, boolean, and byte-array values;
+unsupported types, functions, scopes, cross-boundary residual expressions, or
+incompatible sessions retain the existing compiler path. Captured views,
+partitioned parents, and RLS sources continue to use their local captures.
+
+A fragment open admits at most 256 bindings and 256 KiB, further limited by the
+query's `:binding-rows`/`:binding-bytes`. Core packs complete native aggregate
+groups into batches; it never splits a group and combines partial aggregates.
+If a complete group cannot fit, execution falls back before SQL acquisition.
+This can happen for a global total over more than 256 selected keys or many
+customers sharing one projected name. Plan-only explanations mark the choice
+`:conditional-inputs true` because actual group sizes are checked at execution.
+Set `:relational? false` on participating profiles to compare ordinary fact reads.
 
 ## Bounds and lifecycle
 

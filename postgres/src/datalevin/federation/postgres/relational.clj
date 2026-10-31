@@ -30,7 +30,8 @@
     (mapcat (fn [x y type other]
               (require! (= (pm/types type) (pm/types other)))
               (cond-> [(str x " = " y)]
-                (and strict? (= type "numeric")) (conj (str "scale(" x ") = scale(" y ")"))))
+                (and strict? (= type "numeric")) (conj (str (or (get (:scales a) (.indexOf ^java.util.List (:sql a) x)) (str "scale(" x ")"))
+                                                                   " = " (or (get (:scales b) (.indexOf ^java.util.List (:sql b) y)) (str "scale(" y ")"))))))
             (:sql a) (:sql b) (:types a) (:types b))))
 
 (defn- literal [expr x strict?]
@@ -48,7 +49,7 @@
                                      [(str sql " = ?::" type) [x]]))]
                     (require! filter)
                     (if (and strict? (= type "numeric"))
-                      [(str "(" (first filter) ") AND scale(" sql ") = " (.scale ^BigDecimal x)) (second filter)]
+                      [(str "(" (first filter) ") AND " (or (first (:scales expr)) (str "scale(" sql ")")) " = " (.scale ^BigDecimal x)) (second filter)]
                       filter))) (:sql expr) (:types expr) xs)]
       [(conjunction (map first filters)) (vec (mapcat second filters))])))
 
@@ -101,6 +102,39 @@
           {:sql [(str (name operator) "(" field ")")] :types [type] :shape :scalar :type :data})
       (unsupported!))))
 
+(def ^:private input-types {:long "int8" :string "text" :bigdec "numeric" :uuid "uuid" :boolean "bool" :bytes "bytea"})
+
+(defn- input-relation [request]
+  (when-let [columns (:inputs request)]
+    (require! (and (vector? columns) (<= 1 (count columns) 18)
+                   (= (count columns) (count (set (map :variable columns))))
+                   (every? #(and (input-types (:type %)) (false? (:nullable? %))) columns)))
+    (let [bindings (or (:input-bindings request)
+                       [{:binding-id 0 :values (mapv #(case (:type %) :long 0 :string "" :bigdec 0M
+                                                       :uuid (java.util.UUID. 0 0) :boolean false :bytes (byte-array 0)) columns)}])
+          _ (require! (<= 1 (count bindings) 256))
+          names (vec (mapcat (fn [i c] (cond-> [(str "k" i)] (= :bigdec (:type c)) (conj (str "s" i)))) (range) columns))
+          params (atom [])
+          rows (mapv (fn [{:keys [values]}]
+                       (require! (= (count columns) (count values)))
+                       (let [valid? (every? true? (map (fn [c x]
+                                                       (and (value/matches-type? (:type c) x)
+                                                            (case (:type c)
+                                                              :string (text-value? x)
+                                                              :bigdec (boolean (plan/comparison-filter "numeric" "x" := x))
+                                                              true))) columns values))
+                             fields (mapcat (fn [c x]
+                                              (swap! params conj (when valid? x))
+                                              (cond-> [(str "?::" (input-types (:type c)))]
+                                                (= :bigdec (:type c)) (conj (str (if valid? (.scale ^BigDecimal x) 0))))) columns values)]
+                         (str "(" (if valid? "TRUE" "FALSE") "," (str/join "," fields) ")"))) bindings)
+          variables (into {} (map-indexed (fn [i c]
+                                            [(:variable c) (cond-> {:sql [(text-column (str "b.k" i) (input-types (:type c)))]
+                                                                   :types [(input-types (:type c))] :type (:type c) :shape :scalar}
+                                                            (= :bigdec (:type c)) (assoc :scales [(str "b.s" i)]))]) columns))]
+      {:sql (str "(VALUES " (str/join "," rows) ") AS b(ok," (str/join "," names) ")")
+       :params @params :variables variables})))
+
 (defn compile-query
   "Return a parameterized exact plan, or nil for a shape whose semantics have
   not been established. Views are accepted mappings indexed by source alias."
@@ -110,7 +144,8 @@
     (require! (and (= :relational (:mode request)) (= 1 (:semantics-version request)) (seq (:find request))
                    (= (count views) (count (:sources request)))
                    (= (set (keys views)) (set (map :symbol (:sources request))))))
-    (let [patterns (filterv #(= :pattern (:kind %)) (:clauses request))
+    (let [input (input-relation request)
+          patterns (filterv #(= :pattern (:kind %)) (:clauses request))
           _ (require! (<= 1 (count patterns) 32))
           _ (require! (and (every? #(and (integer? (:id %)) (not (neg? (:id %)))) patterns)
                            (= (count patterns) (count (set (map :id patterns))))))
@@ -148,7 +183,7 @@
                                      (let [[sql params] (literal expr (get-in request [:bindings v]) true)]
                                        (-> state (update :conditions conj sql) (update :params into params))) state))
                             (unsupported!))) state (map vector [entity val] expressions))))
-            {:tables (array-map) :variables {} :conditions [] :params []} patterns)
+            {:tables (array-map) :variables (:variables input {}) :conditions (if input ["b.ok"] []) :params (:params input [])} patterns)
           variables (:variables state)
           filters (mapv #(predicate-filter variables %) predicates)
           conditions (into (:conditions state) (map first filters))
@@ -174,8 +209,8 @@
                             (mapcat (fn [v]
                                       (map #(str "CASE WHEN " bad " THEN NULL ELSE " %1 " END AS " %2)
                                            (:sql (variables v)) (fields v))) used)
-                            (map (fn [[v name]] (str "CASE WHEN " bad " THEN NULL ELSE scale("
-                                                   (first (:sql (variables v))) ") END AS " name)) scale-fields)
+                            (map (fn [[v name]] (str "CASE WHEN " bad " THEN NULL ELSE "
+                                                   (or (first (:scales (variables v))) (str "scale(" (first (:sql (variables v))) ")")) " END AS " name)) scale-fields)
                             [(str "(" oversized ") AS oversized") (str "(" invalid ") AS invalid")])
           aggregate? (some #(= :aggregate (:kind %)) (:find request))
           outputs (mapv (fn [{:keys [kind variable] :as find}]
@@ -194,7 +229,8 @@
           grouping (vec (distinct (mapcat (fn [{:keys [kind variable]}]
                                           (when (= :variable kind) (cond-> (fields variable)
                                                                     (scale-fields variable) (conj (scale-fields variable))))) (:find request))))
-          from (str/join " CROSS JOIN " (map #(str "ONLY " (jdbc/relation (get-in % [:accepted :requirements :table])) " AS " (:alias %)) tables))
+          from (str/join " CROSS JOIN " (cond-> (mapv #(str "ONLY " (jdbc/relation (get-in % [:accepted :requirements :table])) " AS " (:alias %)) tables)
+                                           input (conj (:sql input))))
           matched (str "SELECT DISTINCT " (str/join ", " distinct-select) " FROM " from " WHERE " (conjunction conditions))
           result (str "SELECT " (str/join ", " (map #(str %1 " AS " %2) output-expressions output-fields))
                       ", " (if aggregate? "bool_or(oversized)" "oversized") " AS oversized, "
@@ -209,6 +245,10 @@
        :params params :layout (mapv #(dissoc % :sql :modifier) outputs) :columns (:columns request)
        :physical-columns (count output-fields)})
     (catch clojure.lang.ExceptionInfo e (if (::unsupported (ex-data e)) nil (throw e)))))
+
+(defn compile-fragment [views request max-row-bytes]
+  (when (= :relational-fragment (:mode request))
+    (compile-query views (assoc request :mode :relational) max-row-bytes)))
 
 (defn read-row [query ^ResultSet rs]
   (when (.getBoolean rs 1) (jdbc/fail! :query-source/limit :decode))

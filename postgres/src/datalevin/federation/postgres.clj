@@ -1,6 +1,7 @@
 (ns datalevin.federation.postgres
   "Read-only PostgreSQL relations with validated keys and replayable snapshot sessions."
   (:require [datalevin.federation.mapping :as mapping]
+            [datalevin.federation.postgres.captured :as captured]
             [datalevin.federation.postgres.jdbc :as jdbc :refer [ensure! fail!]]
             [datalevin.federation.postgres.mapping :as pm]
             [datalevin.federation.postgres.plan :as plan]
@@ -68,7 +69,7 @@
   (loop []
     (jdbc/check! context)
     (when (:closed? @state) (fail! :query-source/invalid :fetch))
-    (let [inputs @inputs
+    (let [inputs @inputs candidate @candidate
           {:keys [pending remaining portal more? input-index input-start projection snapshot?]} @state]
       (cond
         pending pending
@@ -111,8 +112,8 @@
   spi/IQuerySourceCursor
   (-next-batch! [this {:keys [control max-rows max-bytes]}]
     (ensure! (and (identical? control (:control context)) (pos-int? max-rows) (pos-int? max-bytes)) :fetch)
-    (let [started (System/nanoTime) columns (:columns candidate)
-          dependent? (boolean (seq (:requires candidate)))
+    (let [started (System/nanoTime) columns (:columns @candidate)
+          dependent? (boolean (seq (:requires @candidate)))
           charge (fn [rows ids] (if dependent? (spi/batch-charge-bytes columns rows ids)
                                    (spi/batch-charge-bytes columns rows)))]
       (locking state
@@ -150,24 +151,31 @@
       (when-not (:closed? @state)
         (close-portal! context state)
         (reset! inputs nil)
+        (reset! candidate nil)
         (reset! state {:closed? true})
         (spi/release! reservation)
         (swap! session-state update :cursors disj this)))
     nil))
 
-(defn- cursor! [session accepted candidate bindings snapshot]
+(defn- cursor! [session accepted candidate bindings capture]
   (let [{:keys [context state request]} session
         [token fetch-size] (reserve-cursor! (:control request) accepted candidate bindings
-                                            (cond-> (:profile context) snapshot (assoc :fetch-size 1)))]
+                                            (cond-> (:profile context) capture (assoc :fetch-size 1)))]
     (try
       (let [metrics (atom {:batches 0 :rows 0 :charged-bytes 0 :read-rows 0 :read-bytes nil
                            :external-requests 0 :elapsed-ns 0})
             owned-inputs (when bindings (value/owned-copy bindings))
-            cursor (->Cursor accepted candidate (atom owned-inputs)
-                             (-> context (assoc :metrics metrics) (assoc-in [:profile :fetch-size] fetch-size))
-                             (atom (if snapshot
+            owned-candidate (value/owned-copy candidate)
+            context (-> context (assoc :metrics metrics) (assoc-in [:profile :fetch-size] fetch-size))
+            row-source (when capture (captured/row-source! context accepted capture owned-candidate))
+            cursor (->Cursor accepted (atom owned-candidate) (atom owned-inputs) context
+                             (atom (if capture
                                      {:snapshot? true :input-start 0 :input-index (if owned-inputs (count owned-inputs) 1)
-                                      :remaining (mapcat (fn [i] (map #(vector i %) @snapshot))
+                                      :remaining (mapcat (fn [i]
+                                                           (let [bindings (merge (:bindings owned-candidate)
+                                                                            (zipmap (map :variable (:requires owned-candidate))
+                                                                                    (:values (when owned-inputs (nth owned-inputs i)))))]
+                                                             (map #(vector i %) (row-source bindings))))
                                                          (range (if owned-inputs (count owned-inputs) 1)))}
                                      {:input-index 0})) metrics token state)]
         (swap! state update :cursors conj cursor)
@@ -182,8 +190,37 @@
                          (when-not (and decline-on-limit? (= :query-source/limit (:error (ex-data e)))
                                         (= :retained-bytes (:category (ex-data e)))) (throw e))))]
         (when token
-          (try (relational/compile-query views request max-row-bytes)
+          (try ((if (= :relational-fragment (:mode request)) relational/compile-fragment relational/compile-query)
+                 views request max-row-bytes)
                (finally (spi/release! token))))))))
+
+(defn- open-fragment! [session open]
+  (let [{:keys [state request views context]} session]
+    (locking state
+      (active! session)
+      (let [plan (:plan open) sources (:sources plan)
+            query (assoc (:query plan) :sources sources)
+            inputs (:inputs query)
+            accepted (into {} (map (fn [{:keys [symbol definition-fingerprint]}]
+                                     (let [view (views definition-fingerprint)]
+                                       (ensure! view :open) [symbol (:accepted view)]))) sources)
+            descriptor (get-in views [(:definition-fingerprint open) :descriptor])]
+        (ensure! (and (= (select-keys request common) (select-keys open common))
+                      (= "relational-fragment" (:alternative-id open)) (empty? (:cursors @state))
+                      (= :relational-fragment (:mode query)) descriptor
+                      (= (:source-symbol open) (:symbol (first sources)))
+                      (= (:definition-fingerprint open) (:definition-fingerprint (first sources)))
+                      (= (:scope-id open) (get-in descriptor [:scope :id])) (= 0 (:region-id open))
+                      (vector? inputs) (seq inputs) (vector? (:bindings open))
+                      (<= 1 (count (:bindings open)) (min 256 (get-in request [:limits :binding-rows])))) :open)
+        (when (> (spi/binding-charge-bytes inputs (:bindings open))
+                 (min 262144 (get-in request [:limits :binding-bytes])))
+          (fail! :query-source/limit :open))
+        (let [compiled (compile-relational! (:control request) accepted (assoc query :input-bindings (:bindings open))
+                                           (get-in context [:profile :max-row-bytes]) false)]
+          (ensure! (and compiled (= (:columns open) (:columns compiled))) :open)
+          (cursor! session (accepted (:symbol (first sources)))
+                   {:relational? true :query compiled :columns (:columns compiled) :requires [] :bindings {}} nil nil))))))
 
 (defrecord Session [views request context info state reservations registration stats]
   spi/IQuerySourceSession
@@ -209,24 +246,29 @@
                        (min 262144 (get-in request [:limits :binding-bytes])))
                 (fail! :query-source/limit :open)))
           (ensure! (not (contains? open :bindings)) :open))
-        (cursor! this (:accepted view) candidate (when dependent? (:bindings open)) (:snapshot view)))))
+        (cursor! this (:accepted view) candidate (when dependent? (:bindings open))
+                 (when (:snapshot view) view)))))
   (-cancel-session! [_ _]
     (reset! (:cancelled context) true)
     (jdbc/abort! (:connection context))
     nil)
   (-close-session! [_]
-    (let [[before _] (swap-vals! state assoc :closed? true)]
-      (when-not (:closed? before)
-        (run! spi/-close-cursor! (:cursors before))
-        (spi/unregister-cancel! registration)
-        (try (.rollback ^Connection (:connection context)) (catch Exception _ nil))
-        (jdbc/close! (:connection context))
-        (jdbc/close! (:limiter context))
-        (doseq [view (vals views)] (when-let [snapshot (:snapshot view)] (reset! snapshot nil)))
-        (run! spi/release! @reservations)
-        (reset! reservations [])
-        (reset! state {:closed? true})
-        (swap! stats update :live-sessions dec)))
+    (locking state
+      (let [[before _] (swap-vals! state assoc :closed? true)]
+        (when-not (:closed? before)
+          (run! spi/-close-cursor! (:cursors before))
+          (spi/unregister-cancel! registration)
+          (try (.rollback ^Connection (:connection context)) (catch Exception _ nil))
+          (jdbc/close! (:connection context))
+          (jdbc/close! (:limiter context))
+          (doseq [view (vals views)]
+            (when-let [snapshot (:snapshot view)]
+              (captured/close! (:indexes view))
+              (reset! snapshot nil)))
+          (run! spi/release! @reservations)
+          (reset! reservations [])
+          (reset! state {:closed? true})
+          (swap! stats update :live-sessions dec))))
     nil)
   spi/IRelationalQuerySession
   (-open-relational-cursor [this open]
@@ -249,7 +291,9 @@
                       (= (:scope-id open) (get-in descriptor [:scope :id])) (= 0 (:region-id open))
                       compiled (= (:columns open) (:columns compiled))) :open)
         (cursor! this (accepted (:symbol (first sources)))
-                 {:relational? true :query compiled :columns (:columns compiled) :requires [] :bindings {}} nil nil)))))
+                 {:relational? true :query compiled :columns (:columns compiled) :requires [] :bindings {}} nil nil))))
+  spi/IRelationalFragmentSession
+  (-open-relational-fragment-cursor [this open] (open-fragment! this open)))
 
 (defn- descriptor [accepted profile]
   (assoc (mapping/source-info accepted (:compute-context-id profile))
@@ -303,7 +347,7 @@
                                            (= (:source-instance-id d) (get-in source [:descriptor :source-instance-id])))
                                       :acquisition)
                              [(:definition-fingerprint d) (cond-> {:descriptor d :accepted accepted}
-                                                         (pm/spooled? accepted) (assoc :snapshot (atom nil)))])))
+                                                         (pm/spooled? accepted) (assoc :snapshot (atom nil) :indexes (atom {})))])))
                     (:source-descriptors request))
             context {:profile profile :control ctl :cancelled cancelled :limiter @limiter :metrics stats}
             conn (jdbc/request! context :acquisition #(let [conn (jdbc/connect! context)]
@@ -356,6 +400,17 @@
            :plan {:sources (mapv (fn [{:keys [symbol descriptor]}]
                                   {:symbol symbol :definition-fingerprint (:definition-fingerprint descriptor)}) sources)
                   :query (select-keys request [:mode :semantics-version :clauses :bindings :find :with :columns])}}))))
+  spi/IRelationalFragmentSource
+  (-plan-relational-fragment [_ request]
+    (when (and (:relational? profile) (= :relational-fragment (:mode request)) (seq (:inputs request)))
+      (let [sources (:sources request)
+            views (into {} (map (fn [{:keys [symbol descriptor]}] [symbol (::accepted descriptor)])) sources)]
+        (when (and (= descriptor (:descriptor (first sources))) (every? some? (vals views))
+                   (compile-relational! (:control request) views request (:max-row-bytes profile) true))
+          {:columns (:columns request) :constraints {:max-binding-rows 256 :max-binding-bytes 262144}
+           :plan {:sources (mapv (fn [{:keys [symbol descriptor]}]
+                                  {:symbol symbol :definition-fingerprint (:definition-fingerprint descriptor)}) sources)
+                  :query (select-keys request [:mode :semantics-version :clauses :bindings :find :with :columns :inputs])}}))))
   spi/IQuerySource
   (-source-info [_] descriptor)
   (-open-session [this request] (acquire this request))

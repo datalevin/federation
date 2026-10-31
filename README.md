@@ -46,7 +46,9 @@ supporting snapshot scans and entity/value lookups.
 PostgreSQL's current fit is selective enrichment: use native records or another
 source to identify a small set of rows, then retrieve their scalar attributes.
 Eligible decimal/time filters, flat same-snapshot joins, and supported
-aggregates can execute in PostgreSQL. Broader reporting workloads still face
+aggregates can execute in PostgreSQL. Mixed native/SQL queries can export bounded
+customer bindings and return SQL-side joins and totals through the shared
+[fragment compiler](postgres/README.md#delegation-inside-mixed-source-queries). Broader reporting workloads still face
 significant gaps: arbitrary aggregates and scoped programs remain in core.
 Views, partitioned parents, and RLS-protected tables use bounded captures of all
 mapped columns, which can increase acquisition transfer and retained memory.

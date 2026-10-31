@@ -3,12 +3,14 @@
             [datalevin.federation.entity-ref :as ref]
             [datalevin.federation.mapping :as mapping]
             [datalevin.federation.postgres :as pg]
+            [datalevin.federation.postgres.captured :as captured]
             [datalevin.federation.postgres.jdbc :as jdbc]
             [datalevin.federation.postgres.plan :as plan]
             [datalevin.federation.postgres.mapping :as pm]
             [datalevin.federation.postgres.temporal :as temporal]
             [datalevin.query.access.dependency :as dependency]
             [datalevin.query.source :as spi]
+            [datalevin.query.source.control :as control]
             [datalevin.query.source.value :as value]))
 
 (deftest exact-interval-fields-and-immutable-calendar-keys
@@ -77,6 +79,67 @@
 (def patterns
   [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :order/title] [:var ?title]]}
    {:id 1 :kind :pattern :terms '[[:var ?e] [:const :order/amount] [:ignore]]}])
+
+(defn captured-amount-candidate [term]
+  (let [descriptor (spi/-source-info (pg/source accepted profile))
+        clause {:id 0 :kind :pattern :terms [[:var '?e] [:const :order/amount] term]}]
+    (assoc (first (filter #(= :value-lookup (:kind %))
+                         (plan/choices descriptor
+                           (assoc (request [clause]) :available-inputs [{:variable '?v :type :bigdec :nullable? false}]) true)))
+           :bindings {})))
+
+(deftest captured-indexes-preserve-decimal-join-and-constant-equality
+  (let [rows [{"id" 1 "amount" 1.0M} {"id" 2 "amount" 1.00M} {"id" 3 "amount" nil}]
+        capture {:snapshot (atom rows) :indexes (atom {})}
+        ctl (control/create) context {:control ctl :cancelled (atom false) :metrics (atom {:read-rows 0})}]
+    (try
+      (doseq [[term bindings expected] [[[:var '?v] {'?v 1.0M} [1]]
+                                       [[:var '?v] {'?v 1.00M} [2]]
+                                       [[:const 1.000M] {} [1 2]]]]
+        (let [candidate (captured-amount-candidate term)
+              selected ((captured/row-source! context accepted capture candidate) bindings)]
+          (is (= expected (mapv #(get % "id") selected)))
+          (is (= (vec (keep #(plan/match-row accepted candidate bindings %) rows))
+                 (vec (keep #(plan/match-row accepted candidate bindings %) selected))))))
+      ;; Each equality mode is built once, even across different lookup values.
+      (is (= 6 (:read-rows @(:metrics context))))
+      (is (pos? (:retained-bytes (control/usage ctl))))
+      (finally (captured/close! (:indexes capture))))
+    (is (nil? @(:indexes capture)))
+    (is (every? zero? (vals (control/usage ctl))))
+    (control/close! ctl)))
+
+(deftest incomplete-captured-indexes-release-their-budget-and-fall-back-once
+  (let [rows (mapv #(hash-map "id" % "amount" (bigdec %)) (range 100))
+        capture {:snapshot (atom rows) :indexes (atom {})}
+        ctl (control/create {:limits {:retained-bytes (+ 1048576 10000)}})
+        metrics (atom {:read-rows 0}) context {:control ctl :cancelled (atom false) :metrics metrics}
+        candidate (captured-amount-candidate [:var '?v])]
+    (try
+      (is (= rows ((captured/row-source! context accepted capture candidate) {'?v 2M})))
+      (is (< 0 (:read-rows @metrics) (count rows)))
+      (is (zero? (:retained-bytes (control/usage ctl))))
+      (let [before @metrics]
+        (is (= rows ((captured/row-source! context accepted capture candidate) {'?v 3M})))
+        (is (= before @metrics)))
+      (finally (captured/close! (:indexes capture))))
+    (is (every? zero? (vals (control/usage ctl))))
+    (control/close! ctl)))
+
+(deftest cancelled-captured-index-builds-do-not-publish-or-leak
+  (let [rows (mapv #(hash-map "id" % "amount" (bigdec %)) (range 100))
+        capture {:snapshot (atom rows) :indexes (atom {})}
+        ctl (control/create) metrics (atom {:read-rows 0})
+        context {:control ctl :cancelled (atom false) :metrics metrics}]
+    (add-watch metrics :cancel (fn [_ _ _ after]
+                                (when (= 3 (:read-rows after))
+                                  (control/cancel! ctl {:error :query-source/cancelled :phase :execution}))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (captured/row-source! context accepted capture (captured-amount-candidate [:var '?v]))))
+    (is (empty? @(:indexes capture)))
+    (is (every? zero? (vals (control/usage ctl))))
+    (captured/close! (:indexes capture))
+    (control/close! ctl)))
 
 (deftest fusion-keeps-existence-and-entity-boundaries
   (let [d (spi/-source-info (pg/source accepted profile))
@@ -230,3 +293,24 @@
         clauses [{:id 0 :kind :pattern :terms '[[:ignore] [:const :order/parent] [:ignore]]}]
         choice (first (plan/choices d (request clauses) true))]
     (is (= [] (plan/match-row accepted choice {} {"id" 1})))))
+
+(deftest fused-repeated-variables-use-join-key-equality
+  (let [catalog (assoc-in catalog [:columns "other"] (get-in catalog [:columns "amount"]))
+        accepted (pg/accept-mapping catalog
+                   (assoc declaration :attributes {:order/a "amount" :order/b "other"}))
+        descriptor (spi/-source-info (pg/source accepted profile))
+        entity (ref/entity-ref (get-in accepted [:identity :type]) [1])]
+    (doseq [attributes [[:order/a :order/b] [:order/b :order/a]]
+            :let [clauses (mapv (fn [id a] {:id id :kind :pattern :terms [[:var '?e] [:const a] [:var '?v]]})
+                               (range) attributes)
+                  candidate (first (plan/choices descriptor (request clauses) true))]]
+      (is (nil? (plan/match-row accepted candidate {} {"id" 1 "amount" 1.0M "other" 1.00M})))
+      (is (nil? (plan/match-row accepted candidate {} {"id" 1 "amount" 1.00M "other" 1.0M})))
+      (doseq [x [1.0M 1.00M]
+              bindings [{} {'?e entity} {'?v x}]]
+        (is (= [entity x] (plan/match-row accepted candidate bindings {"id" 1 "amount" x "other" x}))))
+      (is (nil? (plan/match-row accepted candidate {'?v 1.0M} {"id" 1 "amount" 1.00M "other" 1.00M}))))
+    (let [clauses [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :order/a] [:const 1.0M]]}
+                   {:id 1 :kind :pattern :terms '[[:var ?e] [:const :order/b] [:const 1.0M]]}]
+          candidate (first (plan/choices descriptor (request clauses) true))]
+      (is (= [entity] (plan/match-row accepted candidate {} {"id" 1 "amount" 1.0M "other" 1.00M}))))))

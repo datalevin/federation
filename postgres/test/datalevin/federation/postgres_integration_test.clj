@@ -962,6 +962,161 @@
     (is (released? ctl))
     (control/close! ctl)))
 
+(deftest captured-key-and-value-lookups-build-once-and-reuse-session-indexes
+  (sql! (str "CREATE TABLE " (table "indexed_parent") " (id bigint PRIMARY KEY, v bigint) PARTITION BY RANGE(id)"))
+  (sql! (str "CREATE TABLE " (table "indexed_child") " PARTITION OF " (table "indexed_parent") " FOR VALUES FROM (0) TO (2000)"))
+  (sql! (str "INSERT INTO " (table "indexed_parent") " SELECT i,i*10 FROM generate_series(1,1200) i"))
+  (sql! (str "CREATE VIEW " (table "indexed_view") " AS SELECT * FROM " (table "indexed_parent")))
+  (sql! (str "CREATE MATERIALIZED VIEW " (table "indexed_materialized") " AS SELECT * FROM " (table "indexed_parent")))
+  (sql! (str "CREATE TABLE " (table "indexed_rls") " (id bigint PRIMARY KEY, v bigint)"))
+  (sql! (str "INSERT INTO " (table "indexed_rls") " SELECT * FROM " (table "indexed_parent")))
+  (sql! (str "ALTER TABLE " (table "indexed_rls") " ENABLE ROW LEVEL SECURITY"))
+  (sql! (str "CREATE POLICY visible ON " (table "indexed_rls") " USING (true)"))
+  (let [role (str "federation_index_" (.replace (str (random-uuid)) "-" ""))
+        quoted (jdbc/identifier role)]
+    (sql! (str "CREATE ROLE " quoted " NOLOGIN"))
+    (try
+      (sql! (str "GRANT USAGE ON SCHEMA " (jdbc/identifier *schema*) " TO " quoted))
+      (sql! (str "GRANT SELECT ON " (table "indexed_rls") " TO " quoted))
+      (doseq [name ["indexed_parent" "indexed_view" "indexed_materialized" "indexed_rls"]]
+        (let [profile (cond-> (dissoc *profile* :fetch-size) (= name "indexed_rls") (assoc :role role))
+              accepted (accept-relation name {:row/value "v"}
+                         (when (#{"indexed_view" "indexed_materialized"} name) {:key-columns ["id"]}) profile)
+              provider (pg/source accepted profile) ctl (control/create) request (request provider ctl)
+              session (spi/-open-session provider request)
+              descriptor (spi/-source-info provider)
+              entity-type (get-in accepted [:identity :type])
+              keys (mapv #(* 17 %) (range 1 65))]
+          (try
+            (doseq [[kind variable attribute type key-value]
+                    [[:entity-lookup '?e :row/value entity-type #(ref/entity-ref entity-type [%])]
+                     [:value-lookup '?v :row/id :long identity]
+                     [:value-lookup '?v :row/value :long #(* 10 %)]]]
+              (let [clauses [{:id 0 :kind :pattern :terms [[:var '?e] [:const attribute] [:var '?v]]}]
+                    alt (first (filter #(= kind (get-in % [:access :kind]))
+                                 (alternatives provider session request clauses [{:variable variable :type type :nullable? false}])))
+                    keys (if (= kind :entity-lookup) (subvec keys 0 8) keys)
+                    inputs (mapv (fn [i k] {:binding-id (+ 100 i) :values [(key-value k)]}) (range) (conj keys 999999))
+                    before (:external-requests (control/usage ctl))]
+                (is (some? alt))
+                (doseq [replay (range 2)]
+                  (let [cursor (open provider session request alt inputs)]
+                    (try
+                      (let [result (consume cursor ctl alt true)
+                            actual (mapv (fn [id row]
+                                           (let [values (zipmap (map :variable (:columns alt)) row)]
+                                             [id (first (ref/key-tuple (values '?e))) (values '?v)]))
+                                         (:ids result) (:rows result))]
+                        (is (= (mapv (fn [i k] [(+ 100 i) k (if (= attribute :row/id) k (* k 10))]) (range) keys) actual))
+                        ;; First open scans once to build. Later opens inspect
+                        ;; only bucket matches, including the missing-key case.
+                        (is (= (+ (if (zero? replay) 1200 0) (count keys))
+                               (:read-rows (spi/-cursor-metrics cursor))) (str name " " kind " " attribute))
+                        (is (= before (:external-requests (control/usage ctl)))))
+                      (finally (spi/-close-cursor! cursor)))))))
+            (is (= 3 (count @(get-in session [:views (:definition-fingerprint descriptor) :indexes]))))
+            (finally (spi/-close-session! session)))
+          (is (every? #(and (nil? @(:snapshot %)) (nil? @(:indexes %))) (vals (:views session))))
+          (is (released? ctl))
+          (control/close! ctl)))
+      (finally
+        (sql! (str "DROP OWNED BY " quoted))
+        (sql! (str "DROP ROLE " quoted))))))
+
+(deftest captured-lookups-remain-correct-when-index-admission-is-denied
+  (sql! (str "CREATE VIEW " (table "tight_lookup") " AS SELECT id,title AS v FROM " (table "orders")))
+  (let [provider (pg/source (accept-relation "tight_lookup" {:row/value "v"} {:key-columns ["id"]}) *profile*)
+        ctl (control/create) request (request provider ctl) session (spi/-open-session provider request)
+        clauses [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :row/value] [:var ?v]]}]]
+    (try
+      (let [alt (first (filter #(= :value-lookup (get-in % [:access :kind]))
+                         (alternatives provider session request clauses [{:variable '?v :type :string :nullable? false}])))
+            before (:retained-bytes (control/usage ctl))
+            ;; The cursor and one owned page fit; optional index admission
+            ;; cannot also leave its promised output headroom.
+            pressure (control/reserve! ctl {:retained-bytes (- (:retained-bytes (control/limits ctl)) before 786432)})]
+        (try
+          (dotimes [_ 2]
+            (let [cursor (open provider session request alt [{:binding-id 11 :values ["Alpha"]}
+                                                            {:binding-id 12 :values ["missing"]}])]
+              (try
+                (is (= [11] (:ids (consume cursor ctl alt true))))
+                (is (= 8 (:read-rows (spi/-cursor-metrics cursor))))
+                (finally (spi/-close-cursor! cursor)))))
+          (finally (control/release! pressure)))
+        (is (= before (:retained-bytes (control/usage ctl)))))
+      (finally (spi/-close-session! session)))
+    (is (released? ctl))
+    (control/close! ctl)))
+
+(deftest captured-indexes-preserve-typed-keys-and-native-witnesses
+  (sql! (str "CREATE VIEW " (table "typed_lookup") " AS SELECT * FROM (VALUES "
+             "(DATE '2024-02-29',1::bigint,false,decode('ab','hex'),1.0::numeric,'NaN'::float8,DATE '2024-02-29',2::bigint),"
+             "(DATE '2024-02-29',2,true,decode('ab','hex'),1.00::numeric,'-0'::float8,DATE '2024-02-29',1),"
+             "(DATE '2025-02-28',3,false,NULL,NULL,'0'::float8,NULL,1)"
+             ") AS t(day,id,flag,bytes,amount,f,parent_day,parent_id)"))
+  (let [options {:key-columns ["day" "id"]}
+        provisional (accept-relation "typed_lookup" {} options)
+        entity-type (get-in provisional [:identity :type])
+        day (java.time.LocalDate/parse "2024-02-29") later (java.time.LocalDate/parse "2025-02-28")
+        entity #(ref/entity-ref entity-type [day %])
+        accepted (accept-relation "typed_lookup"
+                   {:row/flag "flag" :row/bytes "bytes" :row/amount "amount" :row/float "f"
+                    :row/reference {:columns ["parent_day" "parent_id"]
+                                    :reference {:domain (get-in entity-type [:parameters :identity-domain-id]) :type entity-type}}} options)
+        compiled (mapping/compile-logical-mapping accepted)
+        facts (vec (mapcat (fn [[key attrs]] (mapping/project-facts compiled key attrs))
+                     [[[day 1] {:row/flag false :row/bytes (byte-array [(unchecked-byte 171)]) :row/amount 1.0M
+                                :row/float Double/NaN :row/reference (entity 2)}]
+                      [[day 2] {:row/flag true :row/bytes (byte-array [(unchecked-byte 171)]) :row/amount 1.00M
+                                :row/float -0.0 :row/reference (entity 1)}]
+                      [[later 3] {:row/flag false :row/float 0.0}]]))]
+    (doseq [fusion? [true false]
+            :let [provider (pg/source accepted (assoc *profile* :fusion? fusion?))]]
+      (doseq [[attribute values]
+              [[:row/flag [false true]]
+               [:row/bytes [(byte-array [(unchecked-byte 171)]) (byte-array [0])]]
+               [:row/amount [1.0M 1.00M 1.000M]]
+               [:row/float [Double/NaN -0.0 0.0]]
+               [:row/reference [(entity 1) (entity 2) (entity 99)]]
+               [:row/id [[day 1] [day 2] [later 3] [day 99]]]]]
+        (let [query {:find '[?key ?witness] :in '[$p [[?v ?witness]]]
+                     :where [['$p '?e attribute '?v] '[$p ?e :row/id ?key]]}
+              witnesses (into [] (mapcat #(vector [% :first] [% :again])) values)]
+          (is (= (set (d/q query facts witnesses)) (set (d/q query provider witnesses))) (str attribute " " fusion?))))
+      (is (= #{[[day 1]] [[day 2]]}
+             (set (d/q '[:find ?key :in $p :where [$p ?e :row/amount 1.000M] [$p ?e :row/id ?key]] provider))))
+      (doseq [[attribute x] [[:row/flag false] [:row/bytes (byte-array [(unchecked-byte 171)])] [:row/float -0.0]]]
+        (let [query {:find '[?key] :in '[$p] :where [['$p '?e attribute x] '[$p ?e :row/id ?key]]}]
+          (is (= (set (d/q query facts)) (set (d/q query provider))))))
+      (is (zero? (:live-sessions (pg/statistics provider)))))
+    (let [provider (pg/source accepted *profile*) ctl (control/create) request (request provider ctl)
+          session (spi/-open-session provider request)
+          clauses [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :row/bytes] [:var ?v]]}]
+          alt (first (filter #(= :value-lookup (get-in % [:access :kind]))
+                       (alternatives provider session request clauses [{:variable '?v :type :bytes :nullable? false}])))]
+      (try
+        (let [input (byte-array [(unchecked-byte 171)])
+              cursor (open provider session request alt [{:binding-id 17 :values [input]}])]
+          ;; Both caller inputs and returned batches may be mutable; neither
+          ;; may change the session's cached byte keys or captured rows.
+          (aset-byte input 0 (byte 0))
+          (try
+            (let [result (consume cursor ctl alt true)]
+              (is (= [17 17] (:ids result)))
+              (aset-byte ^bytes (second (first (:rows result))) 0 (byte 0)))
+            (finally (spi/-close-cursor! cursor))))
+        (let [cursor (open provider session request alt [{:binding-id 18 :values [(byte-array [(unchecked-byte 171)])]}])]
+          (try
+            (let [result (consume cursor ctl alt true)]
+              (is (= [18 18] (:ids result)))
+              (is (every? #(= [(unchecked-byte 171)] (vec (second %))) (:rows result)))
+              (is (= 2 (:read-rows (spi/-cursor-metrics cursor)))))
+            (finally (spi/-close-cursor! cursor))))
+        (finally (spi/-close-session! session)))
+      (is (released? ctl))
+      (control/close! ctl))))
+
 (defn large-fields! []
   (sql! (str "CREATE TABLE " (table "large_fields") " (id bigint PRIMARY KEY, title text, payload text, bytes bytea, parent bigint)"))
   (sql! (str "INSERT INTO " (table "large_fields") " VALUES "
@@ -1035,6 +1190,11 @@
     (doseq [attribute [:row/payload :row/bytes]]
       (is (= :query-source/limit
              (category #(d/q {:find '[?v] :in '[$p] :where [['$p '_ attribute '?v]]} provider)))))
+    (doseq [[attribute key] [[:row/payload "missing"] [:row/bytes (byte-array [0])]]]
+      (is (= :query-source/limit
+             (category #(d/q {:find '[?e] :in '[$p ?v] :where [['$p '?e attribute '?v]]} provider key))))
+      (is (= :query-source/limit
+             (category #(d/q {:find '[?e] :in '[$p] :where [['$p '?e attribute key]]} provider)))))
     (let [ctl (control/create) request (request provider ctl) session (spi/-open-session provider request)
           clauses [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :row/id] [:var ?id]]}
                    {:id 1 :kind :pattern :terms '[[:var ?e] [:const :row/payload] [:ignore]]}
@@ -1064,3 +1224,191 @@
            (set (d/q '[:find ?a :in $p :where [$p ?e :row/a ?a] [$p ?e :row/b _]] provider))))
     (is (= :query-source/limit
            (category #(d/q '[:find ?a ?b :in $p :where [$p ?e :row/a ?a] [$p ?e :row/b ?b]] provider))))))
+
+(deftest decimal-repeated-variables-agree-between-fusion-and-separate-accesses
+  (sql! (str "CREATE TABLE " (table "fusion_decimals") " (id bigint PRIMARY KEY, a numeric, b numeric)"))
+  (sql! (str "INSERT INTO " (table "fusion_decimals") " VALUES (1,1.0,1.00),(2,2.0,2.0)"))
+  (sql! (str "CREATE VIEW " (table "fusion_decimal_view") " AS SELECT * FROM " (table "fusion_decimals")))
+  (doseq [[name options] [["fusion_decimals" {}] ["fusion_decimal_view" {:key-columns ["id"]}]]
+          :let [accepted (accept-relation name {:row/a "a" :row/b "b"} options)
+                compiled (mapping/compile-logical-mapping accepted)
+                facts (vec (mapcat (fn [[id a b]] (mapping/project-facts compiled [id] {:row/a a :row/b b}))
+                                   [[1 1.0M 1.00M] [2 2.0M 2.0M]]))
+                entities (mapv #(ref/entity-ref (get-in accepted [:identity :type]) [%]) [1 2])]
+          attributes [[:row/a :row/b] [:row/b :row/a]]
+          :let [[a b] attributes
+                q {:find '[?id ?v] :in '[$p]
+                   :where ['[$p ?e :row/id ?id] ['$p '?e a '?v] ['$p '?e b '?v]]}]]
+    (is (= #{[2 2.0M]} (set (d/q q facts))))
+    (doseq [fusion? [false true]
+            :let [provider (pg/source accepted (assoc *profile* :fusion? fusion? :relational? false))
+                  explained (d/explain {:run? true} q provider)]]
+      (is (= #{[2 2.0M]} (set (d/q q provider))) (pr-str [name attributes fusion?]))
+      (is (= 1 (:result-rows explained)))
+      (is (= (if fusion? [3] [1 1 1])
+             (sort (map #(count (:covers %)) (mapcat :steps (:regions explained))))))
+      (is (not (relational-plan? explained)))
+      (is (= #{[2 2.0M]} (set (d/q (assoc q :in '[$p [?e ...]]) provider entities))))
+      (doseq [[v expected] [[1.0M #{}] [2.0M #{[2 2.0M]}] [2.00M #{}]]]
+        (is (= expected (set (d/q (assoc q :in '[$p ?v]) provider v)))))
+      ;; Constants and explicit predicates keep Clojure numeric equivalence.
+      (is (= #{[1]} (set (d/q '[:find ?id :in $p :where [$p ?e :row/id ?id]
+                                [$p ?e :row/a 1.0M] [$p ?e :row/b 1.0M]] provider))))
+      (is (= #{[1] [2]} (set (d/q '[:find ?id :in $p :where [$p ?e :row/id ?id]
+                                    [$p ?e :row/a ?a] [$p ?e :row/b ?b] [(= ?a ?b)]] provider))))
+      (is (zero? (:live-sessions (pg/statistics provider)))))))
+
+(defn fragment-plan? [explanation]
+  (some #(= :relational-fragment-v1 (:policy %)) (:regions explanation)))
+
+(defn fragment-fixture! [customers orders-per-customer f]
+  (sql! (str "CREATE TABLE " (table "fragment_orders") " (id bigint PRIMARY KEY, customer bigint)"))
+  (sql! (str "CREATE TABLE " (table "fragment_items") " (id bigint PRIMARY KEY, order_id bigint, price numeric(18,4))"))
+  (sql! (str "INSERT INTO " (table "fragment_orders")
+             " SELECT i, 1+(i-1)/" orders-per-customer " FROM generate_series(1," (* customers orders-per-customer) ") i"))
+  (sql! (str "INSERT INTO " (table "fragment_items") " SELECT id,id,1.2500 FROM " (table "fragment_orders")))
+  (let [declaration {:source-instance-id unit/source-id :identity-attribute :row/id}
+        orders (pg/accept-mapping (pg/discover *profile* [*schema* "fragment_orders"])
+                 (assoc declaration :relation-id :test/fragment-orders :attributes {:order/customer "customer"}))
+        items (pg/accept-mapping (pg/discover *profile* [*schema* "fragment_items"])
+                (assoc declaration :relation-id :test/fragment-items :attributes {:item/order "order_id" :item/price "price"}))
+        conn (d/create-conn nil {:customer/id {:db/valueType :db.type/long}
+                                :customer/name {:db/valueType :db.type/string}}
+                           {:kv-opts {:inmemory? true} :background-sampling? false})]
+    (try
+      (d/transact! conn (mapv #(hash-map :customer/id % :customer/name (str "customer-" %)) (range 1 (inc customers))))
+      (f conn orders items)
+      (finally (d/close conn)))))
+
+(def fragment-spending-query
+  '[:find ?name (sum ?price) :with ?item :in $ $orders $items
+    :where [?c :customer/id ?id] [?c :customer/name ?name]
+    [$orders ?order :order/customer ?id] [$orders ?order :row/id ?order-id]
+    [$items ?item :item/order ?order-id] [$items ?item :item/price ?price]])
+
+(deftest mixed-native-queries-delegate-sql-joins-and-grouped-spending
+  (fragment-fixture! 2 100
+    (fn [conn orders items]
+      (let [p (fn [accepted enabled?] (pg/source accepted (assoc *profile* :relational? enabled?)))
+            query fragment-spending-query
+            expected #{["customer-1" 125.0000M] ["customer-2" 125.0000M]}
+            actual (d/q query @conn (p orders true) (p items true))
+            baseline (d/q query @conn (p orders false) (p items false))
+            explained (d/explain {:run? true} query @conn (p orders true) (p items true))]
+        (is (= expected (set actual) (set baseline)))
+        (is (fragment-plan? explained))
+        (is (= 2 (read-rows explained)))
+        (is (= 1 (count (:cursors explained))))))))
+
+(deftest mixed-fragment-aggregation-preserves-native-witnesses-and-find-with
+  (fragment-fixture! 2 3
+    (fn [conn orders items]
+      (let [ids (d/q '[:find [?e ...] :where [?e :customer/id _]] @conn)]
+        (d/transact! conn (conj (mapv #(hash-map :db/id % :customer/name "shared") ids)
+                               {:customer/id 1 :customer/name "shared"})))
+      (let [base {:in '[$ $orders $items] :where '[ [?c :customer/id ?id] [?c :customer/name ?name]
+                                                  [$orders ?order :order/customer ?id] [$orders ?order :row/id ?order-id]
+                                                  [$items ?item :item/order ?order-id] [$items ?item :item/price ?price]]}
+            provider (fn [a enabled?] (pg/source a (assoc *profile* :relational? enabled?)))
+            cases [[(assoc base :find '[?name (sum ?price)] :with '[?item]) #{["shared" 7.5000M]}]
+                   [(assoc base :find '[?name (sum ?price)]) #{["shared" 1.2500M]}]
+                   [(assoc base :find '[?name (sum ?price)] :with '[?c]) #{["shared" 3.7500M]}]
+                   [(assoc base :find '[?name (sum ?price)] :with '[?c ?item]) #{["shared" 11.2500M]}]
+                   [(assoc base :find '[(sum ?price) .] :with '[?item]) 7.5000M]
+                   [(assoc base :find '[(count ?item) .] :with '[?c]) 9]
+                   [(assoc base :find '[?name (min ?price) (max ?price)]) #{["shared" 1.2500M 1.2500M]}]]]
+        (doseq [[query expected] cases]
+          (let [actual (d/q query @conn (provider orders true) (provider items true))
+                baseline (d/q query @conn (provider orders false) (provider items false))]
+            (is (= expected (if (coll? expected) (set actual) actual) (if (coll? expected) (set baseline) baseline)))
+            (is (fragment-plan? (d/explain {:run? false} query @conn (provider orders true) (provider items true))))))
+        (doseq [find ['[?name ?order-id] '[[?name ...]]]
+                :let [query (assoc base :find find :with '[?c ?item])
+                      actual (d/q query @conn (provider orders true) (provider items true))
+                      baseline (d/q query @conn (provider orders false) (provider items false))]]
+          (is (= (frequencies baseline) (frequencies actual))))
+        ;; Two different customer IDs contribute to the same native name group.
+        ;; A one-row binding budget cannot split that aggregate group safely.
+        (let [query (assoc-in (ffirst cases) [:query-source :limits :binding-rows] 1)
+              explained (d/explain {:run? true} query @conn (provider orders true) (provider items true))]
+          (is (not (fragment-plan? explained)))
+          (is (= #{["shared" 7.5000M]} (set (d/q query @conn (provider orders true) (provider items true))))))))))
+
+(deftest mixed-fragments-batch-many-customer-groups-without-transferring-orders
+  (fragment-fixture! 300 100
+    (fn [conn orders items]
+      (let [profile (assoc *profile* :fetch-size 128)
+            orders (pg/source orders profile) items (pg/source items profile)
+            explained (d/explain {:run? true} fragment-spending-query @conn orders items)]
+        (is (fragment-plan? explained))
+        (is (= 300 (:result-rows explained)))
+        (is (= 300 (read-rows explained)))
+        (is (= 2 (count (:cursors explained))))
+        (is (< (reduce + (map #(get-in % [:metrics :external-requests]) (:cursors explained))) 16))
+        (is (zero? (:live-sessions (pg/statistics orders))))))))
+
+(deftest mixed-fragments-honor-native-filters-empty-prefixes-and-plan-only
+  (fragment-fixture! 2 3
+    (fn [conn orders items]
+      (let [base {:find '[?name (sum ?price)] :with '[?item] :in '[$ $orders $items]
+                  :where '[ [?c :customer/id ?id] [?c :customer/name ?name]
+                            [$orders ?order :order/customer ?id] [$orders ?order :row/id ?order-id]
+                            [$items ?item :item/order ?order-id] [$items ?item :item/price ?price]]}
+            orders (pg/source orders *profile*) items (pg/source items *profile*)
+            query (update base :where conj '[(= ?name "customer-2")])
+            empty-query (update base :where conj '[(= ?name "absent")])
+            plan-only (d/explain {:run? false} query @conn orders items)]
+        (is (fragment-plan? plan-only))
+        (is (empty? (:cursors plan-only)))
+        (is (= #{["customer-2" 3.7500M]} (set (d/q query @conn orders items))))
+        (is (empty? (d/q empty-query @conn orders items)))
+        (is (empty? (:cursors (d/explain {:run? true} empty-query @conn orders items))))
+        (is (zero? (:live-sessions (pg/statistics orders))))))))
+
+(deftest mixed-fragment-selectors-preserve-decimal-scale
+  (sql! (str "CREATE TABLE " (table "decimal_selectors") " (id bigint PRIMARY KEY, customer numeric, amount numeric(18,4))"))
+  (sql! (str "INSERT INTO " (table "decimal_selectors") " VALUES (1,1.0,10),(2,1.00,20),(3,10,30)"))
+  (let [accepted (accept-relation "decimal_selectors" {:order/customer "customer" :order/amount "amount"})
+        native [[1 :customer/id 1.0M] [1 :customer/name "scale-one"]
+                [2 :customer/id 1.00M] [2 :customer/name "scale-two"]
+                [3 :customer/id 1E+1M] [3 :customer/name "negative-scale"]]
+        query '[:find ?name (sum ?amount) :with ?order :in $ $orders
+                :where [?c :customer/id ?id] [?c :customer/name ?name]
+                [$orders ?order :order/customer ?id] [$orders ?order :order/amount ?amount]]
+        provider (pg/source accepted *profile*)]
+    (is (= #{["scale-one" 10.0000M] ["scale-two" 20.0000M]}
+           (set (d/q query native provider))
+           (set (d/q query native (pg/source accepted (assoc *profile* :relational? false))))))
+    (is (fragment-plan? (d/explain {:run? true} query native provider)))))
+
+(deftest fragment-cursors-own-mutable-bindings-and-drop-them-on-close
+  (sql! (str "CREATE TABLE " (table "byte_selectors") " (id bigint PRIMARY KEY, value bytea)"))
+  (sql! (str "INSERT INTO " (table "byte_selectors") " VALUES (1,decode('01','hex')),(2,decode('02','hex'))"))
+  (let [provider (pg/source (accept-relation "byte_selectors" {:row/value "value"}) *profile*)
+        ctl (control/create) request (request provider ctl) descriptor (spi/-source-info provider)
+        columns [{:variable '?group :type :long :nullable? false} {:variable '?id :type :long :nullable? false}]
+        planned (spi/-plan-relational-fragment provider
+                  (merge request {:mode :relational-fragment :semantics-version 1
+                                  :sources [{:symbol '$p :descriptor descriptor}]
+                                  :bindings {} :with [] :columns columns
+                                  :inputs [{:variable '?key :type :bytes :nullable? false}
+                                           {:variable '?group :type :long :nullable? false}]
+                                  :find [{:kind :variable :variable '?group} {:kind :variable :variable '?id}]
+                                  :clauses [{:id 0 :kind :pattern :source-symbol '$p :terms '[[:var ?e] [:const :row/value] [:var ?key]]}
+                                            {:id 1 :kind :pattern :source-symbol '$p :terms '[[:var ?e] [:const :row/id] [:var ?id]]}]}))
+        _ (is (some? planned))
+        session (spi/-open-session provider request) key (byte-array [1])]
+    (try
+      (let [cursor (spi/-open-relational-fragment-cursor session
+                     (merge (select-keys request [:control :query-id :spi-version :features :authorization :consistency :limits])
+                            {:source-symbol '$p :region-id 0 :scope-id (get-in descriptor [:scope :id])
+                             :definition-fingerprint (:definition-fingerprint descriptor) :alternative-id "relational-fragment"
+                             :plan (:plan planned) :columns columns :bindings [{:binding-id 0 :values [key 0]}]}))]
+        (try
+          (aset-byte key 0 (byte 2))
+          (is (= [[0 1]] (:rows (consume cursor ctl {:columns columns} false))))
+          (finally (spi/-close-cursor! cursor)))
+        (is (nil? @(:candidate cursor))))
+      (finally (spi/-close-session! session)))
+    (is (released? ctl))
+    (control/close! ctl)))
