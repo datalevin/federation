@@ -103,7 +103,7 @@
 
 (defn- metadata-normalize
   ;; Complete type descriptors use Clojure map equality, including numeric and
-  ;; sequential equivalence. Keys retain their declared runtime scalar types.
+  ;; sequential equivalence. Key values follow QueryKey scalar equality below.
   ([x] (metadata-normalize x false))
   ([x hashed?]
    ;; Float and Double can be equivalent with different Clojure hash-trie
@@ -127,19 +127,25 @@
        (symbol? x) (with-meta x nil)
        :else x))))
 
-(defn- key-normalize [x]
-  ;; QueryKey uses Java leaf equality, with Clojure's ordinary hashed lookup
-  ;; semantics inside collections without bytes. Collections containing bytes
-  ;; instead recurse through QueryKey, including their keys/set members.
-  (cond
-    (value/plain-map? x)
-    (let [bytes? (QueryKey/containsBytes x)]
-      (into {} (map (fn [[k v]] [(if bytes? (key-normalize k) (metadata-normalize k true))
-                                 (key-normalize v)])) x))
-    (set? x) (into #{} (map (if (QueryKey/containsBytes x) key-normalize
-                               #(metadata-normalize % true))) x)
-    (or (vector? x) (list? x)) (mapv key-normalize x)
-    :else x))
+(defn- key-normalize
+  ;; QueryKey equates boxed fixed-width integers by their long value. Other
+  ;; leaves use Java equality, with ordinary hashed lookup semantics inside
+  ;; collections without bytes. Collections containing bytes instead recurse
+  ;; through QueryKey, including their keys/set members.
+  ([x] (key-normalize x true))
+  ([x query-key?]
+   (cond
+     (and query-key? (or (instance? Integer x) (instance? Short x) (instance? Byte x))) (long x)
+     (value/plain-map? x)
+     (let [recursive? (and query-key? (QueryKey/containsBytes x))]
+       (into {} (map (fn [[k v]] [(if recursive? (key-normalize k) (metadata-normalize k true))
+                                  ;; A byte-free map's Java equality preserves
+                                  ;; narrow scalar classes throughout values.
+                                  (key-normalize v recursive?)])) x))
+     (set? x) (into #{} (map (if (and query-key? (QueryKey/containsBytes x)) key-normalize
+                                #(metadata-normalize % true))) x)
+     (or (vector? x) (list? x)) (mapv #(key-normalize % query-key?) x)
+     :else x)))
 
 (declare encode-node decode-node entity-ref encode decode decode-reference)
 

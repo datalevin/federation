@@ -32,6 +32,102 @@
       (is (<= 64 (value/value-charge x)))
       (is (= [x] (ref/key-tuple (ref/decode (ref/encode entity))))))))
 
+(defn- admission-pool []
+  (reify javax.sql.DataSource
+    (getConnection [_] (throw (AssertionError. "admission must not check out a connection")))
+    (getConnection [_ _ _] (throw (AssertionError. "admission must not check out a connection")))
+    Object
+    (equals [_ other] (instance? javax.sql.DataSource other))
+    (hashCode [_] 0)))
+
+(defn- admission-context [pool options]
+  {:profile (jdbc/profile! {:data-source pool :connect-timeout-ms (get options :connect-timeout-ms 1000)})
+   :control (control/create (select-keys options [:timeout-ms :limits]))
+   :cancelled (atom false)})
+
+(defn- admission-result [context]
+  (try
+    (jdbc/close! (jdbc/admit-acquisition! context))
+    :admitted
+    (catch clojure.lang.ExceptionInfo e (:error (ex-data e)))))
+
+(deftest pool-admission-is-shared-across-contexts-and-released-once
+  (let [pool (admission-pool) a (admission-context pool {})
+        b (assoc-in (admission-context pool {}) [:profile :role] "another-reader")
+        owner (jdbc/admit-acquisition! a) started (java.util.concurrent.CountDownLatch. 1)
+        admitted (java.util.concurrent.CountDownLatch. 1) finish (java.util.concurrent.CountDownLatch. 1)
+        job (future
+              (.countDown started)
+              (let [lease (jdbc/admit-acquisition! b)]
+                (try (.countDown admitted) (.await finish) :admitted
+                     (finally (jdbc/close! lease)))))]
+    (try
+      (is (.await started 1 java.util.concurrent.TimeUnit/SECONDS))
+      (is (= ::waiting (deref job 30 ::waiting)))
+      (is (pos? (:retained-bytes (control/usage (:control a)))))
+      (is (zero? (:external-requests (control/usage (:control b)))))
+      (jdbc/close! owner)
+      (is (.await admitted 1 java.util.concurrent.TimeUnit/SECONDS))
+      (jdbc/close! owner)
+      ;; B still owns admission: a duplicate close of A must not let C pass.
+      (let [waiting (admission-context pool {:connect-timeout-ms 30})]
+        (try (is (= :query/timeout (admission-result waiting)))
+             (finally (control/close! (:control waiting)))))
+      (.countDown finish)
+      (is (= :admitted (deref job 2000 ::blocked)))
+      (doseq [context [a b]] (is (every? zero? (vals (control/usage (:control context))))))
+      (finally (.countDown finish) (jdbc/close! owner) (future-cancel job)
+               (doseq [context [a b]] (control/close! (:control context)))))))
+
+(deftest pool-admission-uses-identity-and-does-not-block-other-pools
+  (let [a (admission-context (admission-pool) {}) b (admission-context (admission-pool) {})
+        owner (jdbc/admit-acquisition! a)]
+    (try
+      (is (= (get-in a [:profile :data-source]) (get-in b [:profile :data-source])))
+      (is (= :admitted (admission-result b)))
+      (finally (jdbc/close! owner)
+               (doseq [context [a b]] (control/close! (:control context)))))))
+
+(deftest waiting-admission-honors-cancellation-and-interruption
+  (doseq [interrupt? [false true]]
+    (let [pool (admission-pool) a (admission-context pool {}) b (admission-context pool {})
+          owner (jdbc/admit-acquisition! a) thread (atom nil)
+          started (java.util.concurrent.CountDownLatch. 1)
+          job (future
+                (reset! thread (Thread/currentThread)) (.countDown started)
+                (try (admission-result b) (finally (Thread/interrupted))))]
+      (try
+        (is (.await started 1 java.util.concurrent.TimeUnit/SECONDS))
+        (is (= ::waiting (deref job 30 ::waiting)))
+        (if interrupt? (.interrupt ^Thread @thread)
+            (control/cancel! (:control b) {:error :query-source/cancelled :phase :acquisition}))
+        (is (= :query-source/cancelled (deref job 2000 ::blocked)))
+        (is (every? zero? (vals (control/usage (:control b)))))
+        (jdbc/close! owner)
+        (is (= :admitted (admission-result a)))
+        (finally (jdbc/close! owner) (future-cancel job)
+                 (doseq [context [a b]] (control/close! (:control context))))))))
+
+(deftest admission-and-primary-checkout-share-a-bounded-wait-budget
+  (doseq [options [{:connect-timeout-ms 30} {:timeout-ms 30} {:limits {:retained-bytes 0}}]]
+    (let [pool (admission-pool) a (admission-context pool {}) b (admission-context pool options)
+          owner (jdbc/admit-acquisition! a)]
+      (try
+        (is (= (if (:limits options) :query-source/limit :query/timeout) (admission-result b)))
+        (is (every? zero? (vals (control/usage (:control b)))))
+        (jdbc/close! owner)
+        (is (= :admitted (admission-result a)))
+        (finally (jdbc/close! owner)
+                 (doseq [context [a b]] (control/close! (:control context)))))))
+  (let [context (admission-context (admission-pool) {})
+        expired (assoc context :checkout-deadline (dec (System/nanoTime)))]
+    (try
+      (is (= :query/timeout (admission-result expired)))
+      (is (= :query/timeout (try (jdbc/connect! expired) :unexpected
+                                (catch clojure.lang.ExceptionInfo e (:error (ex-data e))))))
+      (is (every? zero? (vals (control/usage (:control context)))))
+      (finally (control/close! (:control context))))))
+
 (def source-id #uuid "e8d23d75-321f-4d88-a293-077ed468b8b1")
 (def catalog
   {:table ["public" "orders"] :oid 42 :kind "r" :row-security? false :database "example"

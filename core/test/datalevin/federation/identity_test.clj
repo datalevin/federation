@@ -10,6 +10,7 @@
             [datalevin.udf :as udf]
             [taoensso.nippy :as nippy])
   (:import [java.math BigInteger]
+           [java.nio ByteBuffer]
            [java.util Arrays Date]
            [datalevin.utl QueryKey QueryKey$KeySet]))
 
@@ -71,7 +72,8 @@
 
 (deftest exact-runtime-key-semantics
   (doseq [[t keys]
-          [[:bigdec [1M 1.00M 2M]]
+          [[:long [(byte 1) (short 1) (int 1) 1 2]]
+           [:bigdec [1M 1.00M 2M]]
            [:bigint [1N (BigInteger. "1") 2N]]
            [:double [0.0 -0.0 Double/NaN Double/POSITIVE_INFINITY]]
            [:bytes [(byte-array [1 2]) (byte-array [1 2]) (byte-array [1 3])]]
@@ -88,7 +90,7 @@
 
 (deftest data-key-equality-agrees-with-query-keys
   (let [t (type-for [:data])
-        leaves [1 1N (BigInteger. "1") (int 1) 1M 1.00M 1.0
+        leaves [1 1N (BigInteger. "1") (int 1) (short 1) (byte 1) 1M 1.00M 1.0
                 0.0 -0.0 nil "a" :a (byte-array [1]) (byte-array [1])]
         values (vec (concat (remove nil? leaves) (map vector leaves)
                             (map #(hash-map :value %) leaves) (map #(hash-set %) leaves)
@@ -96,6 +98,56 @@
     (doseq [a values b values]
       (let [x (ref/entity-ref t [a]) y (ref/entity-ref t [b])]
         (is (= (QueryKey/equals a b) (= x y)) (str (pr-str a) " " (pr-str b)))))))
+
+(deftest boxed-fixed-width-keys-have-one-canonical-identity
+  (doseq [coerce [byte short int long] n [-128 -1 0 1 127]
+          :let [type (type-for [:long])
+                expected (ref/entity-ref type [(long n)])
+                actual (ref/entity-ref type [(coerce n)])]]
+    (is (= expected actual))
+    (is (= (hash expected) (hash actual) (.hashCode actual)))
+    (is (zero? (compare expected actual)))
+    (is (Arrays/equals (ref/encode expected) (ref/encode actual)))
+    (is (instance? Long (first (ref/key-tuple actual))))
+    (is (= actual (ref/decode (ref/encode actual))))
+    (is (= expected (nippy/thaw (nippy/freeze actual)))))
+  (let [type (type-for [:string {:kind :tuple :elements [:long :long]}])
+        expected (ref/entity-ref type ["tenant" [1 2]])]
+    (doseq [coerce [byte short int long]
+            :let [actual (ref/entity-ref type ["tenant" [(coerce 1) (coerce 2)]])]]
+      (is (= expected actual))
+      (is (every? #(instance? Long %) (second (ref/key-tuple actual))))))
+  (doseq [n [1N (BigInteger. "1") 1.0 1M]]
+    (is (thrown? clojure.lang.ExceptionInfo (ref/entity-ref (type-for [:long]) [n])))))
+
+(deftest integral-normalization-follows-query-key-collection-equality
+  (let [type (type-for [:data])]
+    (doseq [coerce [byte short int]
+            [label wrap] [[:scalar identity] [:vector vector] [:list list]
+                          [:map #(hash-map :v %)] [:map-vector #(hash-map :v [%])]
+                          [:map-list #(hash-map :v (list %))] [:map-map #(hash-map :v {:child %})]
+                          [:vector-map #(vector {:v %})] [:map-set #(hash-map :v #{%})]
+                          [:map-key #(hash-map % :v)] [:set hash-set]
+                          [:bytes-map #(hash-map :v % :b (byte-array [1]))]
+                          [:bytes-map-map #(hash-map :v {:child %} :b (byte-array [1]))]]
+            :let [a (wrap 1) b (wrap (coerce 1))
+                  x (ref/entity-ref type [a]) y (ref/entity-ref type [b])
+                  same? (QueryKey/equals a b)]]
+      (is (= same? (= x y)) (pr-str [label coerce]))
+      (is (= same? (zero? (compare x y))))
+      (when same? (is (= (hash x) (hash y))))
+      (is (= y (ref/decode (ref/encode y)))))))
+
+(deftest long-key-wire-rejects-boxed-integer-aliases
+  (let [wire (ref/encode (ref/entity-ref (type-for [:long]) [1]))
+        key-offset (+ 8 (.getInt (ByteBuffer/wrap wire) 4))]
+    (doseq [[tag payload] [[22 [0 0 0 1]] [23 [0 1]] [24 [1]]]
+            :let [key (byte-array (concat [15 0 0 0 1 tag] payload))
+                  buffer (doto (ByteBuffer/allocate (+ key-offset 4 (alength key)))
+                           (.put wire 0 key-offset)
+                           (.putInt (alength key))
+                           (.put key))]]
+      (is (thrown? clojure.lang.ExceptionInfo (ref/decode (.array buffer)))))))
 
 (deftest hashed-descriptor-extras-preserve-complete-type-equality
   (let [a 1M b 1.00M

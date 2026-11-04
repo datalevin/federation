@@ -5,9 +5,9 @@
             [datalevin.federation.fingerprint :as fp])
   (:import [java.lang AutoCloseable]
            [java.sql Connection DriverManager PreparedStatement ResultSet SQLException]
-           [java.util Properties]
+           [java.util IdentityHashMap Properties]
            [java.util.concurrent ArrayBlockingQueue Callable Executor ExecutorService
-            Future ThreadFactory ThreadPoolExecutor TimeUnit TimeoutException]))
+            Future Semaphore ThreadFactory ThreadPoolExecutor TimeUnit TimeoutException]))
 
 (defn fail! [error phase]
   (throw (ex-info "PostgreSQL query source failed" {:error error :phase phase})))
@@ -70,9 +70,67 @@
   (when control (spi/check-active! control))
   (when @cancelled (fail! :query-source/cancelled :execution)))
 
-(defn connect! [{:keys [profile] :as context}]
+(defn checkout-deadline
+  "One deadline shared by admission and the primary checkout. A later validation
+  checkout starts its own wait budget, under the same invocation deadline."
+  [{:keys [profile] :as context}]
+  (or (:checkout-deadline context)
+      (+ (System/nanoTime) (* 1000000 (long (:connect-timeout-ms profile))))))
+
+(defn- check-checkout! [context deadline]
   (check! context)
-  (let [result (atom nil)
+  (when (>= (System/nanoTime) deadline) (fail! :query/timeout :acquisition)))
+
+;; Registry entries exist only while an acquisition owns or waits for the gate.
+;; Pool identity matters even when DataSource implementations override equals.
+(defonce ^:private ^IdentityHashMap pool-admissions (IdentityHashMap.))
+
+(defn admit-acquisition!
+  "Serialize acquisition phases sharing a DataSource before either can borrow
+  a data connection. A validator may then borrow the second slot without another
+  unvalidated acquisition holding it. Ready sessions execute outside this gate."
+  [{:keys [profile control] :as context}]
+  (when-let [pool (:data-source profile)]
+    (let [deadline (checkout-deadline context)
+          _ (check-checkout! context deadline)
+          token (spi/reserve! control {:retained-bytes 2048})
+          entry (try
+                  (locking pool-admissions
+                    (let [entry (or (.get pool-admissions pool)
+                                    (let [entry {:semaphore (Semaphore. 1 true) :users (volatile! 0)}]
+                                      (.put pool-admissions pool entry) entry))]
+                      (vswap! (:users entry) inc)
+                      entry))
+                  (catch Throwable e (spi/release! token) (throw e)))
+          ^Semaphore semaphore (:semaphore entry)
+          acquired? (volatile! false) closed? (atom false)
+          release! (fn []
+                     (when (compare-and-set! closed? false true)
+                       (try
+                         (when @acquired? (.release semaphore))
+                         (locking pool-admissions
+                           (when (zero? (vswap! (:users entry) dec))
+                             (.remove pool-admissions pool)))
+                         (finally (spi/release! token)))))]
+      (try
+        (loop []
+          (check-checkout! context deadline)
+          (if (.tryAcquire semaphore 20 TimeUnit/MILLISECONDS)
+            (do
+              (vreset! acquired? true)
+              (check-checkout! context deadline)
+              (reify AutoCloseable (close [_] (release!))))
+            (recur)))
+        (catch Throwable e
+          (release!)
+          (if (instance? InterruptedException e)
+            (do (.interrupt (Thread/currentThread)) (fail! :query-source/cancelled :acquisition))
+            (throw e)))))))
+
+(defn connect! [{:keys [profile] :as context}]
+  (let [deadline (checkout-deadline context)
+        _ (check-checkout! context deadline)
+        result (atom nil)
         task (try
                (.submit connector
                  ^Callable
@@ -88,16 +146,14 @@
                        (if (compare-and-set! result nil conn) conn
                            (do (close! conn) nil))))))
                (catch java.util.concurrent.RejectedExecutionException _
-                 (fail! :query-source/limit :acquisition)))
-        deadline (+ (System/nanoTime) (* 1000000 (long (:connect-timeout-ms profile))))]
+                 (fail! :query-source/limit :acquisition)))]
     (try
       (loop []
-        (check! context)
-        (when (>= (System/nanoTime) deadline) (fail! :query/timeout :acquisition))
+        (check-checkout! context deadline)
         (let [r (try [:done (.get ^Future task 20 TimeUnit/MILLISECONDS)]
                      (catch TimeoutException _ [:waiting]))]
           (if (= :waiting (first r)) (recur)
-              (do (check! context) (second r)))))
+              (do (check-checkout! context deadline) (second r)))))
       (catch Throwable e
         (let [old (first (swap-vals! result (constantly ::abandoned)))]
           (when (instance? Connection old) (close! old)))

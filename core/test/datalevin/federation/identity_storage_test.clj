@@ -26,12 +26,16 @@
         (d/open-dbi kv "references" {:key-type ref/type-name})
         (d/transact-kv kv "references" (mapv (fn [x] [:put x :owned]) values))
         (is (= :owned (d/get-value kv "references" (ref/entity-ref type ["tenant-a" 7]))))
+        (doseq [coerce [byte short int]]
+          (is (= :owned (d/get-value kv "references" (ref/entity-ref type ["tenant-a" (coerce 7)])))))
         (is (= (sort values) (mapv first (d/get-range kv "references" [:all]))))
         (finally (d/close-kv kv))))
     (let [kv (d/open-kv dir {:runtime-opts {:udf-registry (registry)}})]
       (try
         (d/open-dbi kv "references")
         (is (= :owned (d/get-value kv "references" (ref/entity-ref type ["tenant-a" 7]))))
+        (doseq [coerce [byte short int]]
+          (is (= :owned (d/get-value kv "references" (ref/entity-ref type ["tenant-a" (coerce 7)])))))
         (is (= (sort values) (mapv first (d/get-range kv "references" [:all]))))
         (is (nil? (d/get-value kv "references" (ref/entity-ref type ["tenant-b" 7]))))
         (finally (d/close-kv kv))))))

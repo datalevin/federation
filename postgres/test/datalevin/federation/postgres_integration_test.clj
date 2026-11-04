@@ -16,7 +16,7 @@
            [java.sql Connection DriverManager]
            [java.time Instant]
            [java.util UUID]
-           [java.util.concurrent CountDownLatch TimeUnit]
+           [java.util.concurrent ArrayBlockingQueue CountDownLatch TimeUnit]
            [javax.sql DataSource ConnectionEventListener]
            [org.postgresql.ds PGConnectionPoolDataSource]
            [datalevin.utl QueryKey]))
@@ -927,6 +927,45 @@
     (merge {:source-instance-id unit/source-id :relation-id :test/schema
             :identity-attribute :row/id :attributes attrs} options)))
 
+(deftest boxed-integral-entity-lookups-agree-with-and-without-delegation
+  (let [type (get-in *accepted* [:identity :type])
+        canonical (ref/entity-ref type [1])
+        q '[:find (count ?title) . :in $p ?order :where [$p ?order :order/title ?title]]]
+    (doseq [coerce [byte short int long] relational? [true false] fusion? [true false]
+            :let [provider (source {:relational? relational? :fusion? fusion?})
+                  entity (ref/entity-ref type [(coerce 1)])]]
+      (is (= 1 (d/q q provider entity)) (pr-str [(class (coerce 1)) relational? fusion?]))
+      (is (= 1 (d/q {:find '[(count ?title) .] :in '[$p]
+                     :where [['$p entity :order/title '?title]]} provider)))
+      (is (= #{[canonical 1 "Alpha"]}
+             (set (d/q '[:find ?order ?id ?title :in $p ?order
+                         :where [$p ?order :order/id ?id] [$p ?order :order/title ?title]] provider entity))))
+      (is (nil? (d/q q provider (ref/entity-ref type [(coerce 99)]))))
+      (is (zero? (:live-sessions (pg/statistics provider)))))))
+
+(deftest boxed-integral-keys-work-in-composite-captures-and-batches
+  (sql! (str "CREATE TABLE " (table "integral_composite")
+             " (a smallint,b integer,v text,PRIMARY KEY(a,b))"))
+  (sql! (str "INSERT INTO " (table "integral_composite") " VALUES (1,2,'one'),(2,1,'two')"))
+  (sql! (str "CREATE VIEW " (table "integral_view") " AS SELECT * FROM " (table "integral_composite")))
+  (doseq [name ["integral_composite" "integral_view"]
+          :let [accepted (accept-relation name {:row/value "v"}
+                           (when (= name "integral_view") {:key-columns ["a" "b"]}))
+                type (get-in accepted [:identity :type])
+                expected (ref/entity-ref type [1 2])]
+          relational? [true false] fusion? [true false]
+          :let [provider (pg/source accepted (assoc *profile* :relational? relational? :fusion? fusion?))]]
+    (doseq [coerce [byte short int long]
+            :let [entity (ref/entity-ref type [(coerce 1) (coerce 2)])]]
+      (is (= 1 (d/q '[:find (count ?v) . :in $p ?e :where [$p ?e :row/value ?v]] provider entity)))
+      (is (= #{[expected "one"]}
+             (set (d/q '[:find ?e ?v :in $p ?e :where [$p ?e :row/value ?v]] provider entity))))
+      (is (zero? (:live-sessions (pg/statistics provider)))))
+    (let [bindings (mapv #(ref/entity-ref type [(% 1) (% 2)]) [byte short int long])]
+      (is (= #{[expected "one"]}
+             (set (d/q '[:find ?e ?v :in $p [?e ...] :where [$p ?e :row/value ?v]] provider bindings)))))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
 (deftest count-distinct-agrees-between-delegated-tables-and-captured-views
   (sql! (str "CREATE TABLE " (table "distinct_table")
              " (id bigint PRIMARY KEY, g text, amount numeric, payload bytea, title text)"))
@@ -1506,6 +1545,125 @@
   (sql! (str "CREATE FUNCTION " (table "capture_value") "() RETURNS text LANGUAGE sql AS $$ SELECT 'before'::text $$"))
   (sql! (str "CREATE VIEW " (table "function_capture") " AS SELECT 1::bigint AS id," (table "capture_value") "() AS v"))
   (accept-relation "function_capture" {:row/value "v"} {:key-columns ["id"]}))
+
+(defn two-connection-pool! []
+  (let [factory (doto (PGConnectionPoolDataSource.) (.setURL (:jdbc-url *profile*)))
+        available (ArrayBlockingQueue. 2) borrowed (atom 0) peak (atom 0)
+        checkouts (atom 0) synchronize (atom nil) closed? (atom false)
+        first-begin (CountDownLatch. 1)
+        physical (mapv (fn [_] (.getPooledConnection factory)) (range 2))]
+    (doseq [slot physical]
+      (.addConnectionEventListener slot
+        (reify ConnectionEventListener
+          (connectionClosed [_ _]
+            (swap! borrowed dec)
+            (when-not @closed? (.offer available slot)))
+          (connectionErrorOccurred [_ _])))
+      (.add available slot))
+    {:data-source
+     (data-source
+       #(let [slot (.poll available 5 TimeUnit/SECONDS)]
+          (when-not slot (throw (java.sql.SQLTransientConnectionException. "test pool checkout timed out")))
+          (swap! checkouts inc)
+          (swap! peak max (swap! borrowed inc))
+          (let [connection (.getConnection ^javax.sql.PooledConnection slot)]
+            (Proxy/newProxyInstance (.getClassLoader Connection) (into-array Class [Connection])
+              (reify InvocationHandler
+                (invoke [_ _ method args]
+                  (let [^Method method method]
+                    (when (and (= "prepareStatement" (.getName method))
+                               (.startsWith ^String (aget ^objects args 0) "SET TRANSACTION"))
+                      (.countDown first-begin)
+                      (when-let [^CountDownLatch started @synchronize]
+                        (.countDown started)
+                        ;; Without admission both data checkouts meet here.
+                        ;; With admission the first proceeds after this grace
+                        ;; period and its validator can use the second slot.
+                        (.await started 500 TimeUnit/MILLISECONDS)))
+                    (try (.invoke method connection args)
+                         (catch InvocationTargetException e (throw (.getCause e)))))))))))
+     :borrowed borrowed :peak peak :checkouts checkouts :synchronize synchronize
+     :available available :first-begin first-begin
+     :close #(do (reset! closed? true) (run! (fn [slot] (.close ^javax.sql.PooledConnection slot)) physical))}))
+
+(deftest concurrent-mixed-queries-do-not-starve-a-two-connection-pool
+  (let [accepted (function-view!) pool (two-connection-pool!)
+        profile (-> *profile* (dissoc :jdbc-url)
+                    (assoc :data-source (:data-source pool) :connect-timeout-ms 1500))
+        query '[:find ?id ?v :in $v $p :where [$v _ :row/value ?v] [$p ?e :order/id ?id] :timeout 5000]
+        expected #{[1 "before"] [2 "before"] [3 "before"] [4 "before"]}
+        run-query! (fn [] (set (d/q query (pg/source accepted profile) (pg/source *accepted* profile))))
+        start (CountDownLatch. 1) jobs (atom [])]
+    (try
+      (is (= expected (run-query!)) "one query fits the same two-connection pool")
+      (reset! (:synchronize pool) (CountDownLatch. 2))
+      (reset! jobs
+        (mapv (fn [_]
+                (future
+                  (.await start)
+                  (try {:rows (run-query!)}
+                       (catch Throwable e {:error (:error (ex-data e))})))) (range 2)))
+      (.countDown start)
+      (doseq [job @jobs]
+        (let [outcome (deref job 7000 ::blocked)]
+          (is (= {:rows expected} outcome))))
+      (is (= 6 @(:checkouts pool)))
+      (is (= 2 @(:peak pool)))
+      (is (zero? @(:borrowed pool)))
+      (is (= 2 (.size ^ArrayBlockingQueue (:available pool))))
+      (finally
+        (.countDown start)
+        (run! future-cancel @jobs)
+        ((:close pool))))))
+
+(deftest waiting-pool-admission-times-out-without-checking-out-a-connection
+  (let [accepted (function-view!) pool (two-connection-pool!)
+        profile (-> *profile* (dissoc :jdbc-url)
+                    (assoc :data-source (:data-source pool) :connect-timeout-ms 1500))
+        provider (pg/source accepted profile) ordinary (pg/source *accepted* profile)
+        ctl (control/create)
+        invocation (assoc (request provider ctl) :source-descriptors
+                          [(spi/-source-info provider) (spi/-source-info ordinary)])
+        _ (reset! (:synchronize pool) (CountDownLatch. 2))
+        owner (future (let [session (spi/-open-session provider invocation)]
+                        (spi/-close-session! session) :completed))]
+    (try
+      (is (.await ^CountDownLatch (:first-begin pool) 5 TimeUnit/SECONDS))
+      (let [waiting (control/create {:timeout-ms 100})
+            request (assoc invocation :control waiting :query-id (random-uuid) :limits (control/limits waiting))]
+        (try
+          (is (= :query/timeout (category #(spi/-open-session provider request))))
+          (is (zero? (:external-requests (control/usage waiting))))
+          (is (released? waiting))
+          (finally (control/close! waiting))))
+      (is (= :completed (deref owner 5000 ::blocked)))
+      (is (= 2 @(:checkouts pool)))
+      (is (zero? @(:borrowed pool)))
+      (is (released? ctl))
+      ;; The timed-out waiter must not retain the gate or poison the pool.
+      (is (= #{["before"]}
+             (set (d/q '[:find ?v :in $p :where [$p _ :row/value ?v]] provider))))
+      (is (= 3 @(:checkouts pool)))
+      (finally (control/close! ctl) (future-cancel owner) ((:close pool))))))
+
+(deftest failed-verification-releases-pool-admission
+  (let [accepted (function-view!) changed? (atom false) connections (atom []) url (:jdbc-url *profile*)
+        pool (data-source
+               #(let [connection (intercepted-connection url
+                                    (fn [sql]
+                                      (when (and (.startsWith ^String sql "DECLARE ")
+                                                 (compare-and-set! changed? false true))
+                                        (sql! (str "CREATE OR REPLACE FUNCTION " (table "capture_value")
+                                                   "() RETURNS text LANGUAGE sql AS $$ SELECT 'after'::text $$")))
+                                      sql))]
+                  (swap! connections conj connection) connection))
+        profile (-> *profile* (dissoc :jdbc-url) (assoc :data-source pool :connect-timeout-ms 500))
+        q '[:find ?v :in $p :where [$p _ :row/value ?v]]]
+    (is (= :query-source/stale-definition (category #(d/q q (pg/source accepted profile)))))
+    (let [current (accept-relation "function_capture" {:row/value "v"} {:key-columns ["id"]})]
+      (is (= #{["after"]} (set (d/q q (pg/source current profile))))))
+    (is @changed?)
+    (is (every? #(.isClosed ^Connection %) @connections))))
 
 (deftest view-function-replacement-between-verification-and-capture-is-stale
   (let [accepted (function-view!)

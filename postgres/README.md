@@ -157,6 +157,13 @@ identify its domain. The identity attribute returns a scalar for one key column
 or a tuple in primary-key order for a composite key. Entity positions contain
 `EntityRef` values, distinct from native database entity IDs.
 
+Entity references normalize JVM `Byte`, `Short`, and `Integer` key values to
+`Long`, matching the shared `:long` query-key contract. This includes composite
+keys and reference attributes, so caller-created keys use the same identity as
+keys decoded from PostgreSQL in delegated and ordinary accesses. See the
+[experimental codec notes](../core/test/fixtures/README.md) for canonical wire
+encoding and previously encoded narrow-integer references.
+
 Allocate and persist your own source UUID for each PostgreSQL database.
 Increment the accepted identity version if a replacement table reuses keys
 for different entities. Acquisition detects a dropped/recreated table by its
@@ -297,6 +304,14 @@ connection reserves another 8 MiB
 from the shared memory budget, obeys query/connection deadlines and request limits,
 and closes before session publication. Cancellation or verification failure
 releases the connections and retained capture reservations.
+
+Acquisition phases sharing a DataSource instance use fair admission before the
+first data checkout, held through post-capture verification. Concurrent
+acquisitions cannot each occupy a data connection while waiting for another
+connection to validate. Ready sessions execute outside admission, and unrelated
+DataSources have independent admission. Reuse the same DataSource instance in
+profiles backed by the same pool. A mixed session still needs capacity for its
+data connection and a temporary validation connection.
 
 Views, materialized views, partitioned parents, and RLS tables capture the
 accepted projection once per session, before planning fact accesses. Each
@@ -540,10 +555,14 @@ or a caller-owned JDBC `:data-source`. Connections must be returned in
 autocommit mode; the adapter rolls back and closes each acquired connection,
 returning pooled connections without closing the pool. Pool checkout is
 bounded, and a connection arriving after cancellation is closed.
+Admission waits honor cancellation and query deadlines, perform no checkout or
+SQL, and share one `:connect-timeout-ms` budget with the initial checkout.
+Validation checkouts have their own bounded wait within the invocation deadline.
+Idle admission entries are removed rather than retaining caller-owned pools.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `:connect-timeout-ms` | `10000` | Maximum connection/checkout wait |
+| `:connect-timeout-ms` | `10000` | Maximum admission plus initial-checkout wait; also bounds each validation checkout |
 | `:statement-timeout-ms` | `10000` | PostgreSQL statement timeout |
 | `:fetch-size` | `128` | Maximum rows per explicit server-cursor fetch; up to 256, reduced when needed to admit cursor workspace |
 | `:max-row-bytes` | `16384` | Maximum combined SQL text size of materialized values and keys per fact-access row, or the final returned row for delegated SQL |

@@ -372,7 +372,7 @@
         ctl (:control request)
         cancelled (atom false) connection (atom nil)
         registration (spi/register-cancel! ctl (fn [_] (reset! cancelled true) (jdbc/abort! @connection)))
-        reservations (atom []) limiter (atom nil)]
+        reservations (atom []) limiter (atom nil) admission (atom nil)]
     (try
       (spi/check-active! ctl)
       (ensure! (and (= 2 (:spi-version request)) (= #{} (:features request))
@@ -391,7 +391,9 @@
                                                          (pm/spooled? accepted) (assoc :snapshot (atom nil) :indexes (atom {})))])))
                     (:source-descriptors request))
             context {:profile profile :control ctl :cancelled cancelled :limiter @limiter :metrics stats}
-            conn (jdbc/request! context :acquisition #(let [conn (jdbc/connect! context)]
+            checkout (assoc context :checkout-deadline (jdbc/checkout-deadline context))
+            _ (reset! admission (jdbc/admit-acquisition! checkout))
+            conn (jdbc/request! context :acquisition #(let [conn (jdbc/connect! checkout)]
                                                        (reset! connection conn) conn))
             context (assoc context :connection conn)]
         (jdbc/check! context)
@@ -445,7 +447,8 @@
         (run! spi/release! @reservations)
         (if (instance? SQLException e)
           (jdbc/translate! {:control ctl :cancelled cancelled} :acquisition e)
-          (throw e))))))
+          (throw e)))
+      (finally (jdbc/close! @admission)))))
 
 (defrecord PostgresSource [descriptor accepted profile stats]
   spi/IRelationalWindowSource

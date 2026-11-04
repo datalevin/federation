@@ -36,7 +36,7 @@ the two native 64-bit halves. Collection counts precede their nodes.
 | 17, 18 | map entries, set elements |
 | 19, 20 | UTF-16 character, ratio (framed numerator and denominator text) |
 | 21 | framed nested EntityRef |
-| 22, 23, 24 | signed Integer, Short, Byte |
+| 22, 23, 24 | Integer, Short, Byte nodes where Java map-value equality preserves their classes |
 | 25, 26 | Instant, Duration: signed seconds and signed 32-bit nanos |
 | 27 | Period: signed 32-bit years, months, days |
 | 28 | LocalDate: signed 64-bit epoch day |
@@ -47,9 +47,17 @@ the two native 64-bit halves. Collection counts precede their nodes.
 Map entries and set elements sort by encoded length, then unsigned bytes;
 equal encoded map keys tie-break by encoded value. Descriptor normalization
 preserves Clojure map equality, including numeric and sequential equivalence,
-and removes metadata. Key normalization follows existing QueryKey equality,
-including bytes by content and decimal scale. No physical column, relation
-alias, connection handle, or data-version token is added to nominal identity.
+and removes metadata. Key normalization follows existing QueryKey equality:
+Byte, Short, Integer, and Long values share the canonical signed 64-bit Long
+encoding in scalar and composite keys, including data positions that use
+QueryKey's recursive equality. Byte-free map values follow Java equality and
+retain their narrow scalar classes. Other numeric families retain their
+QueryKey distinctions, including decimal scale. Bytes compare by content.
+Previously encoded references using narrow-integer aliases in Long-equality
+positions must be reconstructed from their complete type and key; decoding
+rejects those aliases as noncanonical. The existing Long golden encodings are
+unchanged. No physical column, relation alias, connection handle, or data-version
+token is added to nominal identity.
 An export token is an ordinary, explicitly declared key component.
 
 Hash-sensitive Float values in descriptor map keys/set members or equivalent
