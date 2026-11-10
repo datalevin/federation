@@ -6,14 +6,90 @@ adapters. It supports table scans, entity and value lookups, and same-entity
 fusion: several scalar attributes of one entity can be read by one SQL cursor.
 Dependent lookups combine up to 256 input keys in a parameterized `VALUES`
 join, with results associated with their original binding IDs.
-Eligible decimal/time filters and complete same-snapshot relational queries
+Eligible decimal/time and `LIKE` filters and complete same-snapshot relational queries
 can execute in PostgreSQL, including joins between accepted mappings and
 supported aggregates.
 
 This development snapshot requires the matching **Datalevin 1.2.10** build
-with the optional whole-query and mixed-source fragment SPI extensions. The module declares `1.2.10` as a
+with the optional whole-query, mixed-source fragment, regional-join, and native-text extrema SPI
+extensions. The module declares `1.2.10` as a
 provided dependency; the development workspace uses the sibling checkout.
 SPI revision 2 alone does not establish availability of the new protocols.
+
+## JOB performance milestone
+
+The adapter's first performance goal is to beat native PostgreSQL on at least
+one Join Order Benchmark (JOB) query over the full IMDb dataset. Both paths
+must use the same PostgreSQL tables and indexes, return the same answer, and
+include query planning and execution in the comparison. Loading an additional
+Datalevin copy or retaining query answers does not satisfy this milestone.
+
+The development harness supports JOB **6a**, **6b**, and **6d** (five tables),
+**17c** and **17d** (seven tables), and **20b** (ten aliases over nine tables).
+They cover actor, keyword, company, character, and cast-completeness filters.
+It uses the production adapter through `d/q`, with explicitly accepted typed references.
+Point it at an already loaded, static JOB database:
+
+```sh
+export POSTGRES_JOB_URL='jdbc:postgresql://127.0.0.1:5432/postgres'
+export POSTGRES_JOB_USER="$USER"
+clojure -M:postgres-job '{:warmups 2 :samples 7}' /tmp/postgres-job-6a.edn
+```
+
+Federation queries now default to a 1 GiB retained-memory allowance, sized for
+a server workload. The JOB alias starts with a 1 GiB heap and allows it to grow
+to 8 GiB. The allowance is a conservative accounting cap, not a heap reservation;
+size the JVM for concurrent queries and other work. Override a query's allowance
+with `:limits {:retained-bytes ...}`. Reports include effective limits and the
+JVM's maximum heap size. Binding batches allow 2 MiB and at most 256 keys,
+including typed-reference ownership charges.
+
+Optional `POSTGRES_JOB_PASSWORD` supplies the password. Credentials stay out of
+the report. Set `:query` to select a supported query, for example `:17c` or `:20b`. `:schema`,
+`:timeout-ms`, `:fusion?`, `:relational?`, `:statistics?`, `:filtered-statistics?`, `:native-extrema?`, and explicit
+query-source `:limits` are also configurable. The harness performs reads only;
+it does not load data, create indexes, or run `ANALYZE`. Keep the dataset static
+throughout a run because the compared invocations acquire separate snapshots.
+
+Before timing, the harness checks every distinct matching output tuple against
+SQL and checks the final aggregate answer. It retains every original JOB output
+column, including 17c's duplicated minimum, and PostgreSQL's original text collation. A different text minimum
+fails the comparison, even when the matched tuples agree. Empty input cannot
+qualify as a win.
+
+The harness explicitly requests source-native text extrema so its minima use
+the original PostgreSQL column collations. Set `:native-extrema? false` to test
+ordinary Datalog extrema and reproduce earlier collation failures. The native
+SQL oracle is unchanged; reduction requests count toward adapter time and quotas.
+
+Samples alternate execution order. Both client wall times include a fresh
+connection, a read-only snapshot, planning, execution, result decoding, and
+cleanup. The adapter additionally pays its normal per-query schema validation
+and source planning costs. One-time discovery/acceptance is reported separately.
+Preflight checks warm the database; these are warm-cache measurements. Native
+`EXPLAIN (ANALYZE, BUFFERS, SETTINGS)` and adapter explanations are separate
+diagnostics, outside the timed samples. The report includes raw timings,
+median/p95 latency, relation estimates, indexes, effective budgets, and source
+fingerprints. Failures record the stage and budget category and retain any
+completed evidence.
+
+A run marks `:win? true` only with at least five successful sample pairs,
+at least 1.1x median speedup, and the adapter faster in at least 80% of pairs.
+Repeat a qualifying run in fresh JVMs before claiming the milestone. The
+harness defaults to 6a; this is the first candidate, not a commitment
+to that query as the eventual winner.
+
+Run its focused checks with:
+
+```sh
+clojure -M:test datalevin.federation.postgres-job-test
+POSTGRES_TEST_URL='jdbc:postgresql://127.0.0.1:5432/federation_test' \
+  clojure -M:test datalevin.federation.postgres-job-integration-test
+```
+
+The integration checks create and remove isolated fixture schemas in the
+disposable test database. They cover duplicate joins, absent references, nulls,
+filters, empty aggregates, incompatible text minima, and budget failures.
 
 ## Workload fit and current gaps
 
@@ -31,11 +107,11 @@ application schema or a larger reporting query:
 
 | Use case | Current gap | Effect on the workload |
 | --- | --- | --- |
-| Enrich large key sets | Batches accept at most 256 keys and 256 KiB of bindings; matches arrive in bounded fetch pages | Request and memory budgets apply across all batches. Network latency and nonunique value matches can still dominate. |
-| Filter orders by amount or events by time | Matching integral, `BigDecimal`, and `Instant` comparisons are pushed down; mixed representations and supported scalar functions stay local | Eligible ranges and equality reduce transfer. Bounds outside the supported timestamp parameter range and unsupported comparisons can still require a broad read. |
+| Enrich large key sets | Batches accept at most 256 keys and 2 MiB of bindings; matches arrive in bounded fetch pages | Request and memory budgets apply across all batches. Network latency and nonunique value matches can still dominate. |
+| Filter amounts, times, or names | Matching integral, `BigDecimal`, and `Instant` comparisons and eligible binary `like`/`not-like` calls are pushed down | Eligible filters reduce transfer. Mixed representations, unsupported patterns/call forms, and out-of-range timestamp bounds can still require a broad read. |
 | Read an existing application schema | Temporal types and enums are supported; domains, `char`, `citext`, arrays, and JSON/JSONB remain unmapped | Supported columns can be selected independently. Collection-valued attributes are not implemented. |
 | Read reporting views, partitioned datasets, or tenant tables with RLS | Views need declared keys; partitioned parents need primary keys; RLS needs an enforced authorization profile | These relations capture all mapped columns at acquisition under shared row, request, and retention limits. Subsequent accesses use the captured rows; SQL predicate, join, and aggregate delegation is unavailable for these captures. |
-| Aggregate, sort, or join large PostgreSQL relations | Whole-query and mixed-source fragment delegation cover eligible flat joins and aggregates; eligible whole-query ordering/limit windows execute in SQL | Mixed native/SQL spending queries can return customer totals instead of every order. Complete aggregate groups must fit a binding batch; unsupported shapes retain fact accesses. Backend work remains subject to timeouts; no index discovery or cost-based access choice is implemented. |
+| Aggregate, sort, or join large PostgreSQL relations | Whole-query and mixed-source fragment delegation cover eligible flat joins and aggregates; eligible whole-query ordering/limit windows execute in SQL | Mixed native/SQL spending queries can return customer totals instead of every order. Complete aggregate groups must fit a binding batch; unsupported shapes retain fact accesses. Catalog cardinalities guide fact-access ordering. Index discovery and a latency/cost model remain absent. |
 | Read large text or binary fields | The default payload-row cap is 16 KiB, measured using SQL text representations | `_` existence checks use presence flags and do not fetch the payload. Values needed for output or local matching remain capped; delegated SQL applies the cap to its final returned row. |
 | Discover relationships | Discovery covers one named relation, its columns, key, enum labels, and applicable view/security contracts; foreign-key discovery is absent | Define references manually. Use PostgreSQL policies and explicit runtime role/settings for authorization; query filters do not establish an authorization boundary. |
 
@@ -59,13 +135,185 @@ patterns with an ignored entity each need their own access. With fusion
 disabled, each pattern needs its own reserved access. Repeated entity-lookup
 anchors within one fused group share a single alternative.
 
+Root-conjunction plans can also consider filtered, dependent joins between two or three
+connected entity groups from different aliases in the acquired PostgreSQL session. These alternatives
+share the coordinator alias's remaining candidate quota and preserve the
+ordinary fact alternatives. Candidate construction considers at most 32 patterns
+and 128 attempted joins, with a 50 ms allowance checked between attempts. Rules,
+branches, captured relations, and unsupported expressions keep their existing
+paths. No provider reads occur during this construction.
+Selected dependent joins use parameterized `LATERAL` lookups with PostgreSQL
+planning fences, preserving the key-driven dependency order inside each batch.
+Subqueries select only accepted mapped/key columns; the original checks and
+parameter order remain in the outer query.
+
+The core first finds a complete typed plan, then compares up to 16 distinct
+starting sources using propagated `:rows`/`:rows-per-binding`. It estimates
+returned-row work across complete paths, with a 20 ms allowance and the remaining
+4096-state search budget. Unknown or expired counts, unmodeled local producers,
+and unknown selectivity for a second independent scan retain the original plan.
+This is a row-work heuristic; it does not model skew, CPU time, or network latency.
+Joined estimates use catalog distinct counts for equality and text membership
+filters, retaining the strongest local filter rather than multiplying correlated
+predicates. Acquired single-column reference-domain sizes refine sampled
+distinct counts under a low-confidence uniform-domain assumption; they never
+prove referential integrity or completeness. Fractional fan-out can reduce propagated tuple counts; a floor of
+one keeps costing from treating estimated emptiness as proof. Constant filters
+in patterns also qualify a connected pair for dependent join pushdown.
+Groups whose only live output is their bound key can become existence checks.
+PostgreSQL's distinct projection returns at most one match per binding, avoiding
+unused company fan-out. Explicit find/with witnesses remain exported and retain
+their multiplicity.
+Optional filter estimates distinguish tiny dimensions from selective lookups
+into large relations when pricing the opportunity to prepare metadata. The
+existing time, request, and latency-based preparation caps remain in effect.
+Explanations show `:join-cost`, `:cost-search`, and `:selection :join-cost` when
+lookahead changes the selected path. Planning time includes provider plan
+construction, capture, and scheduling; optional estimation is reported separately.
+
+Projection analysis retains final outputs, input keys, local operator variables,
+and cross-access join variables. Unused internal entity identities need not be
+constructed or returned. Physical decoding and conversion guards still run.
+Child-region contracts remain conservative across rule and branch boundaries.
+
+An explicit `:query-source` option can request PostgreSQL text ordering for
+selected `min`/`max` inputs:
+
+```clojure
+{:native-extrema {'?name {:source '$people :attribute :person/name}}}
+```
+
+The core reduces each complete aggregate group through the acquired source
+session in bounded batches, carrying forward each batch's winner. The provider
+inherits the accepted column's exact collation and rejects nondeterministic
+ordering. Values remain parameters; requests share the invocation deadline,
+authorization, memory, binding, and request budgets. Plan-only explains perform
+no extrema reductions. This option uses the optional `IQuerySourceTextExtrema`
+protocol in the matching development build. Ordinary extrema retain Datalog
+ordering, and unsupported explicit requests fail instead of silently changing it.
+
 Wide queries, including eleven attributes on one bound entity plus a second
 entity clause, retain complete coverage under the default cap. If the cap
 cannot hold even the reserved accesses, planning fails explicitly with
 `:query-source/limit`. Increase the cap for that query, for example with
 `{:query-source {:planning {:max-alternatives 64}}}`.
 
-The highest-value follow-ups for ordinary federation are:
+Ordinary tables supply advisory row counts by default. Each acquired mapping
+reads `pg_class.reltuples` and the mapped columns' null fractions and distinct
+counts from [`pg_stats`](https://www.postgresql.org/docs/current/view-pg-stats.html).
+These bounded scalars travel with the existing mapping validation reads during
+acquisition, adding no round trips. Pure access planning performs no provider
+reads. Catalog statistics fetch no row values or histograms. Statistics remain owned by
+the query session and outside accepted mapping fingerprints; running `ANALYZE`
+does not require accepting the mapping again. Captured views, partitioned
+parents, and RLS relations retain their existing planning behavior.
+
+The adapter estimates total rows for independent accesses and rows per binding
+for dependent lookups. Equality uses a uniform distinct-value estimate, null
+fractions account for absent facts, and primary-key equality caps the estimate
+at one. Correlated equality filters are not multiplied. Missing or unanalyzed
+statistics remain unknown; these are low-confidence counts, not exact answers.
+These baseline counts do not model ranges, skew, index availability, or transfer costs.
+
+Before pure access planning, an optional estimation phase can refine independent
+filtered accesses with `EXPLAIN (ANALYZE FALSE, FORMAT JSON)`. It never executes
+the SELECT. Identical filter projections share one probe; only bounded root row
+counts survive in the authorized session. SQL and plan text stay private.
+
+Estimation itself has a cost. Providers quote it without I/O; PostgreSQL prices
+each probe at twice the mean request latency observed in that session, including
+admission waits. The core spends at most one eighth of the cheapest known
+independent access's estimated fetch-request work. Only a more expensive source
+that could become the driver is probed. A single possible driver, incoming
+bindings, missing cost information, or a probe that cannot fit the allowance
+keeps the catalog plan. This is a conservative admission heuristic, not a model
+of expected savings or complete execution cost.
+
+The shared invocation caps are `:query-source :planning :estimate-budget-ms`
+(default `100`) and `:estimate-max-requests` (default `8`). Either set to zero
+disables optional probes. Time includes quote and preparation work and is
+checked between calls; an individual slow request remains subject to the normal
+query deadline and provider statement timeout. Explanations expose each region's
+`:estimation` decision, reason, actual requests, elapsed nanoseconds, quoted
+provider cost, and opportunity budget. Set `:filtered-statistics? false` on
+participating profiles to retain catalog counts without filtered probes.
+
+The matching Datalevin core ranks fresh cardinalities before its structural
+tie breaks while preserving dependency, type, coverage, and resource checks.
+Counts expire according to `:query-source :planning :estimate-max-age-ms`
+(default 300,000 ms) and any provider validity interval. Their observation time
+records the catalog read, not the last `ANALYZE`; stale database statistics can
+still give poor estimates. Unknown or expired counts follow fresh counts and
+use structural ordering among themselves.
+An estimated zero never proves a query empty. Set `:statistics? false` on the
+participating runtime profiles to compare the previous structural plan. The
+explanation reports `:selection :cardinality` when counts influence ordering;
+time estimates remain unknown.
+
+Full-data comparisons include connection, snapshot acquisition, planning,
+estimation, execution, source-native extrema, and cleanup. Every run checks all
+distinct matching output tuples and every original aggregate output. The
+[measurement summary](../doc/measurements/postgres-job-target-optimizations-2026-11-09.edn)
+verifies 21 current source fingerprints and closed sessions across all reports.
+
+All runs below use a 1 GiB retained allowance, 2 MiB binding allowance, and an
+8 GiB maximum heap. Queries 17c, 17d, 20b and 6d use two warmups and seven
+alternating sample pairs. The 6a/6b regression screens use one warmup and three
+pairs. Qualifying 17c and 6d runs are repeated in fresh JVMs.
+
+| Query | Adapter median | Native median | Median speedup | Evidence |
+| --- | --- | --- | --- | --- |
+| 17c, fresh JVM 1 | 2.53 s | 5.85 s | 2.31x | [Run 1](../doc/measurements/postgres-job-17c-optimized-run1-2026-11-09.edn) |
+| 17c, fresh JVM 2 | 2.54 s | 5.82 s | 2.29x | [Run 2](../doc/measurements/postgres-job-17c-optimized-run2-2026-11-09.edn) |
+| 17d | 5.82 s | 5.87 s | 1.01x | [Seven pairs](../doc/measurements/postgres-job-17d-optimized-run1-2026-11-09.edn) |
+| 20b | 1.70 s | 1.77 s | 1.04x | [Seven pairs](../doc/measurements/postgres-job-20b-optimized-run1-2026-11-09.edn) |
+| 6d, fresh JVM 1 | 0.879 s | 4.59 s | 5.21x | [Run 1](../doc/measurements/postgres-job-6d-optimized-run1-2026-11-09.edn) |
+| 6d, fresh JVM 2 | 0.877 s | 4.51 s | 5.15x | [Run 2](../doc/measurements/postgres-job-6d-optimized-run2-2026-11-09.edn) |
+| 6b regression screen | 1.05 s | 188 ms | 0.18x | [Three pairs](../doc/measurements/postgres-job-6b-optimized-run1-2026-11-09.edn) |
+| 6a regression screen | 1.31 s | 34.0 ms | 0.026x | [Three pairs](../doc/measurements/postgres-job-6a-optimized-run1-2026-11-09.edn) |
+
+**JOB 17c adds a verified win alongside 6d.** Each beats native in all fourteen
+timed pairs across two fresh JVMs. The 146 distinct 17c tuples and both original
+minima agree, including the locale-sensitive `X, Andie` result. The 68 distinct
+6d tuples and all three minima also agree. Native timings vary; raw samples and
+diagnostics are retained. No additional indexes, Datalevin copy of IMDb, or
+query-answer cache are used. Every invocation acquires a fresh read view.
+
+Queries 17d and 20b are faster in six of seven pairs, but neither reaches the
+required 1.1x median margin, so they do not qualify as wins. All 668 distinct
+17d tuples and all three distinct 20b titles agree with SQL. The earlier
+[screening](../doc/measurements/postgres-job-followups-summary-2026-11-09.edn)
+failed at memory, request or deadline gates even with 4 GiB retries; both now
+complete within the default 1 GiB allowance. The 6b adapter median improves from
+its earlier 2.57 s screen, while native remains substantially faster on 6a/6b.
+
+The 17c/17d paths apply the cast/movie-keyword/keyword filter before fetching
+company existence. Their executed diagnostics use 13/29 cursors and return
+3,074/8,718 rows. The 20b path starts with the two matching actors and probes
+complete-cast using known movie keys; it opens six cursors and returns 124 rows.
+Its executed explanation reports about 0.89 s of planning, a material remaining
+cost. The 6d path now uses three cursors, 129 returned rows and three batches,
+compared with four cursors and 369 rows in the
+[previous joined run](../doc/measurements/postgres-job-6d-joins-run2-2026-11-09.edn).
+
+The [collation diagnostic](../doc/measurements/postgres-job-17c-collation-2026-11-09.json)
+records why ordinary Datalog extrema could not satisfy 17c's original SQL:
+PostgreSQL's locale minimum is `X, Andie`, while its binary minimum is
+`X'Volaitis, John`. Explicit source-native extrema now preserve the column's
+ordering; the original SQL oracle remains unchanged.
+
+Earlier [JFR profiles](../doc/measurements/postgres-job-6d-optimization-profiles-2026-11-09.json)
+compare output batching alone with the initial joined implementation. Sampled
+application allocation weights fall from about 3.21 GB to 118 MB across three
+calls in each recording. These are profiler estimates from the earlier stage,
+separate from retained-memory accounting and the current paired comparisons.
+
+Earlier small-memory and cardinality baselines remain under
+[measurement artifacts](../doc/measurements/). Complete-path costing is still
+heuristic; skew, correlated filters, index-aware time estimates, and realistic
+network latency remain further work.
+
+Other follow-ups for ordinary federation are:
 
 1. Measure batched lookups and scans with realistic network latency and
    default query budgets.
@@ -130,7 +378,8 @@ Declare a stable source UUID and explicitly choose the attributes to expose:
 The three patterns can use one fused access. It checks `status = 'paid'` and
 requires a non-null amount, then returns the key and amount from the same row.
 Shared query equality is rechecked after decoding. `d/explain` shows the covered
-patterns and actual cursor requests; cost estimates remain unknown.
+patterns, advisory row counts, and actual cursor requests; time and transfer
+estimates remain unknown.
 
 Native records can supply selective keys to PostgreSQL. With a native database
 containing `:triage/order-id` and `:triage/priority` long attributes:
@@ -379,7 +628,7 @@ Both kinds capture under the configured profile and retain a restricted scope.
 
 ## Filter and relational delegation
 
-Ordinary binary `=`, `not=`, `<`, `<=`, `>`, and `>=` predicates are exported by
+Ordinary binary `=`, `not=`, `<`, `<=`, `>`, `>=`, `like`, `not-like`, `in`, and `not-in` predicates are exported by
 core only within their conjunction and source-variable scope. Captured scalar
 `:in` bounds may become constants; potential outputs from another operator do
 not become constants. The adapter accepts matching integral/decimal bounds
@@ -391,6 +640,45 @@ residual predicates. Temporal cutoffs retain nanosecond comparisons against
 PostgreSQL's microsecond values by adjusting the bound and strictness before
 binding. No rounding through `java.util.Date` occurs. Pattern and batched-key
 equality also support eligible `Instant` values.
+
+Ordinary `text` and `varchar` fact accesses push binary `like`/`not-like` calls
+when the pattern is a literal or captured scalar containing only ASCII
+characters. `%` and `_` still match Unicode input by code point, including
+newlines. SQL uses C collation and an explicit `!` escape to preserve the native
+case-sensitive matcher. Escaped `%`, `_`, and `!` keep their literal meaning;
+an unescaped trailing `!` is ignored, matching the native behavior. Patterns
+are bound parameters. The original core predicate remains a residual check.
+
+Non-ASCII or NUL-containing patterns, invalid escapes, custom escape/options
+arguments, dynamic patterns, reversed operands, and scalar output bindings
+retain local execution. Invalid patterns retain their existing local errors.
+Captured views, partitioned parents, and RLS sources retain their captured-row
+behavior. This is fact-access prefiltering; the complete relational compiler's
+eligibility rules remain unchanged. Budgeted EXPLAIN probes can estimate these
+filters before driver selection; declined probes retain catalog cardinalities.
+
+Text `in`/`not-in` filters can execute inside relational and dependent join
+plans. Constant or captured collections contain at most 256 text/nil members;
+SQL uses C collation and bound parameters. Nil members cannot match present text
+facts; empty collections retain their native membership behavior. Other
+collections stay local. Ordinary single-table fact alternatives do not yet
+apply membership prefilters.
+
+For example, an actor access can supply typed person references to a cast/title
+join, then supply movie references to a movie-keyword/keyword join with `IN`.
+Input ordinals preserve binding associations; original core predicates remain
+residual checks. Joined steps report their participating `:covered-sources`;
+their `:source` identifies the session coordinator. Current joined plans require
+an explicit boundary key and stay within the root conjunction.
+
+The full IMDb [actor-filter probe](../doc/measurements/postgres-like-actor-filter-2026-11-09.edn)
+for JOB 6d's `%Downey%Robert%` pattern returns exactly two rows through the
+adapter, matching SQL, at a 314 ms median across seven invocations. An equivalent
+local-only call with explicit nil options exceeded that run's 64 MiB budget.
+This measures the actor access, not the complete 6d query. The existing
+[6a regression](../doc/measurements/postgres-job-6a-like-256m-2026-11-09.edn)
+still verifies the complete answer at 256 MiB and takes about 2.18 s versus
+24.5 ms native; LIKE pushdown alone has not reached the performance milestone.
 
 Flat scalar arithmetic (`+`, `-`, `*`, `/`, `quot`, `rem`, `mod`, `inc`, and
 `dec`), `like`/`not-like`, and `in`/`not-in` execute locally when SQL delegation
@@ -539,7 +827,7 @@ unsupported types, functions, scopes, cross-boundary residual expressions, or
 incompatible sessions retain the existing compiler path. Captured views,
 partitioned parents, and RLS sources continue to use their local captures.
 
-A fragment open admits at most 256 bindings and 256 KiB, further limited by the
+A fragment open admits at most 256 bindings and 2 MiB, further limited by the
 query's `:binding-rows`/`:binding-bytes`. Core packs complete native aggregate
 groups into batches; it never splits a group and combines partial aggregates.
 If a complete group cannot fit, execution falls back before SQL acquisition.
@@ -568,6 +856,8 @@ Idle admission entries are removed rather than retaining caller-owned pools.
 | `:max-row-bytes` | `16384` | Maximum combined SQL text size of materialized values and keys per fact-access row, or the final returned row for delegated SQL |
 | `:fusion?` | `true` | Set false to compare separate EAV accesses |
 | `:relational?` | `true` | Allow eligible whole-conjunction joins and aggregation |
+| `:statistics?` | `true` | Read session-local catalog cardinalities for fact-access ordering |
+| `:filtered-statistics?` | `true` | Allow cost-budgeted EXPLAIN row estimates before pure access planning; requires `:statistics?` |
 | `:role` | unset | Transaction-local PostgreSQL role |
 | `:session-settings` | `{}` | Explicit policy/view context: custom dotted GUC names mapped to strings |
 
@@ -593,8 +883,16 @@ projection. Use `_` for an explicit existence-only pattern on any execution path
 Oversized payloads produce an error or size marker before their values cross
 the network; values are never silently truncated. Reserved workspace includes
 the fetch page, decoding, and pending row; returned batches have separate charges.
+Output batches use the requested byte allowance (1 MiB by default), shrinking
+when the shared retained-memory budget cannot admit it. They no longer have an
+additional 64 KiB window. Row limits, byte limits, cancellation, and ownership
+checks still apply to every batch.
 The query's `:timeout` and `:query-source :limits` apply across all accesses.
 Cancellation aborts blocked database I/O and releases owned resources.
+
+The default retained-memory allowance is 1 GiB per invocation. It includes
+provider state, intermediate joins, and results; callers can override it through
+`:query-source {:limits {:retained-bytes ...}}`.
 
 The default query budget allows 1,024 external requests. At 128 rows per fetch,
 a scan returning 100,000 rows needs 782 fetch requests, plus setup and cursor

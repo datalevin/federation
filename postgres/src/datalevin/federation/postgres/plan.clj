@@ -12,7 +12,7 @@
            [java.time Instant LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime]
            [java.time.temporal ChronoUnit]))
 
-(def constraints {:max-binding-rows 256 :max-binding-bytes 262144 :max-request-binding-rows 256})
+(def constraints {:max-binding-rows 256 :max-binding-bytes 2097152 :max-request-binding-rows 256})
 
 (defn columns [descriptor clauses]
   (reduce
@@ -172,8 +172,35 @@
         (concat (map #(vector (str (column-sql %) " IS NOT NULL") []) columns)
                 (keep identity [entity-filter (when vbound? (equality-filter accepted columns v))])))) clauses))
 
+(defn- like-pattern
+  "Translate default-escape ASCII patterns, preserving the native matcher's
+  ignored trailing escape. Invalid escapes and non-ASCII patterns stay local."
+  [pattern]
+  (when (string? pattern)
+    (let [^String pattern pattern n (.length pattern)]
+      (loop [i 0]
+        (if (= i n) pattern
+          (let [c (.charAt pattern i)]
+            (cond
+              (or (= c \u0000) (> (int c) 127)) nil
+              (= c \!) (if (= (inc i) n) (.substring pattern 0 i)
+                           (when (#{\! \% \_} (.charAt pattern (inc i)))
+                             (recur (+ i 2))))
+              :else (recur (inc i)))))))))
+
+(defn like-filter
+  "Compile case-sensitive LIKE/NOT LIKE for text/varchar with default ! escape.
+  Wildcards still match Unicode code points, including newlines. C collation
+  avoids case/punctuation equivalences of provider collations. Return nil for
+  a pattern whose transport or matcher semantics have not been established."
+  [type column operator pattern]
+  (when (and (#{"text" "varchar"} type) (#{:like :not-like} operator))
+    (when-let [pattern (like-pattern pattern)]
+      [(str column " COLLATE pg_catalog.\"C\" " (if (= :like operator) "LIKE" "NOT LIKE")
+            " ?::text ESCAPE '!'") [pattern]])))
+
 (defn predicates
-  "Push matching integral, decimal, and Instant comparisons as prefilters.
+  "Push matching scalar comparisons and supported LIKE calls as prefilters.
   Unsupported types and comparisons remain core residuals."
   [accepted candidate request]
   (let [vars (into {} (keep (fn [clause]
@@ -183,13 +210,30 @@
                                   [v (first cs)]))) (:clauses candidate)))]
     (vec (keep (fn [{:keys [kind operator args] :as predicate}]
                  (when (and (= kind :predicate) (= 2 (count args)))
-                   (let [[a b] args
-                         [a b op] (if (= :const (first a)) [b a (reverse-operator operator)] [a b operator])
+                   (let [[a b] args like? (#{:like :not-like} operator)
+                         [a b op] (if (and (not like?) (= :const (first a)))
+                                    [b a (reverse-operator operator)] [a b operator])
                          [tag v] a [ctag x] b column (vars v)]
                      (when (and (= :var tag) column (= :const ctag))
-                       (when-let [filter (comparison-filter (pm/storage-type (get-in accepted [:requirements :columns column]))
-                                                           (column-sql column) op x)]
+                       (when-let [filter ((if like? like-filter comparison-filter)
+                                          (pm/storage-type (get-in accepted [:requirements :columns column]))
+                                          (column-sql column) op x)]
                          (assoc predicate :column column :filter filter)))))) (:clauses request)))))
+
+(defn estimate-sql
+  "A single-table, filter-only projection for EXPLAIN, never ANALYZE. Only
+  independent accesses with pushed predicates need query-specific statistics."
+  [accepted candidate]
+  (when (and (empty? (:requires candidate)) (seq (:predicates candidate)))
+    (let [tautologies (into #{} (keep (fn [[column info]]
+                                       (when (:not-null? info) [(str (column-sql column) " IS NOT NULL") []])))
+                           (get-in accepted [:requirements :columns]))
+          filters (->> (concat (pattern-filters accepted (:clauses candidate) (:bindings candidate))
+                               (map :filter (:predicates candidate)))
+                       (remove tautologies) distinct (sort-by first))]
+      {:sql (str "SELECT 1 FROM ONLY " (jdbc/relation (get-in accepted [:requirements :table]))
+                 " AS r WHERE " (str/join " AND " (map first filters)))
+       :params (vec (mapcat second filters))})))
 
 (defn- selected-columns [accepted plan]
   (if (:snapshot? plan)
@@ -365,14 +409,34 @@
                (when (QueryKey/equals (bound sym) x) bound)
                (assoc bound sym x))))))
 
+(defn project
+  "Export only live variables or variables needed by another access/residual.
+  Preserve binding columns for the shared join operator. Physical decoding and
+  conversion guards remain unchanged."
+  [candidate request]
+  (let [covered (set (map :id (:clauses candidate)))
+        needed (into (or (:required-vars request) (set (map :variable (:columns candidate))))
+                     (mapcat (fn [clause]
+                               (keep #(when (= :var (first %)) (second %))
+                                     (or (:terms clause) (:args clause)))))
+                     (remove #(covered (:id %)) (:clauses request)))
+        needed (into needed (map :variable) (:requires candidate))]
+    (update candidate :columns #(filterv (comp needed :variable) %))))
+
 (defn match-row [accepted plan bindings row]
   (let [keys (mapv row (pm/key-columns accepted))
-        entity (ref/entity-ref (get-in accepted [:identity :type]) keys)
+        observed (into (set (clojure.core/keys bindings)) (map :variable) (:columns plan))
+        observed (into observed (keep (fn [clause]
+                                       (let [[tag x] (nth (:terms clause) 2)] (when (= :var tag) x)))) (:clauses plan))
+        entity (when (some (fn [clause]
+                            (let [[tag x] (first (:terms clause))]
+                              (or (= :const tag) (and (= :var tag) (observed x))))) (:clauses plan))
+                 (ref/entity-ref (get-in accepted [:identity :type]) keys))
         matched
         (reduce
           (fn [bound clause]
             (let [[entity-term _ term] (:terms clause)
-                  bound (match-term bound entity-term entity)]
+                  bound (if entity (match-term bound entity-term entity) bound)]
               (when bound
                 (let [attribute (second (second (:terms clause)))
                       raw (mapv row (pm/attribute-columns accepted attribute))]

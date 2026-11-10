@@ -57,6 +57,15 @@
                     :extra-paths ["test" "github/test"]
                     :main-opts ["-m" "datalevin.federation.test-runner"
                                 "datalevin.federation.github-test"]}
+           :postgres-job {:replace-paths ["core/src" "postgres/src" "dev/src"]
+                          :jvm-opts ["-Xms1g" "-Xmx8g"
+                                     "--add-opens=java.base/java.lang=ALL-UNNAMED"
+                                     "--add-opens=java.base/java.nio=ALL-UNNAMED"
+                                     "--add-opens=java.base/java.util=ALL-UNNAMED"
+                                     "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+                                     "--enable-native-access=ALL-UNNAMED"
+                                     "-Dclojure.compiler.direct-linking=true"]
+                          :main-opts ["-m" "datalevin.federation.postgres-job"]}
            :postgres {:replace-paths ["core/src" "postgres/src"]
                       :extra-paths ["test" "postgres/test"]
                       :main-opts ["-m" "datalevin.federation.test-runner"

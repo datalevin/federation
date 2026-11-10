@@ -20,11 +20,16 @@ Federated queries use bindings and filters to constrain external lookups. For
 example, a local priority filter can narrow the issue numbers sent to GitHub,
 reducing API requests and the data carried through later joins. The planner
 selects among each adapter's supported scans and lookups using the available
-bindings. Same-entity fusion can combine several PostgreSQL attribute patterns
-into one table access; cost-based ranking of external accesses is planned. You
-can inspect the plan and execution metrics with `d/explain`.
+bindings. Fresh cardinalities rank accesses, and bounded lookahead compares
+complete join paths and their expected fan-out. PostgreSQL supplies catalog
+counts and cost-budgeted filtered estimates. Same-entity fusion combines
+attribute patterns into one table access; dependent filtered joins can combine
+two accepted mappings. Elapsed-time and transfer-cost ranking remain planned.
+You can inspect the plan and execution metrics with `d/explain`.
 
 **Status:** federation adapters are development snapshots (`0.1.0-SNAPSHOT`).
+The PostgreSQL adapter has verified full-data JOB 6d and 17c wins; see its
+[benchmark results and methodology](postgres/README.md#planning-bounds-and-follow-up-priorities).
 Datalevin **1.2.8** introduced the query-source SPI. PostgreSQL's current
 pushdown paths require the matching **1.2.10** build with relational SPI support.
 
@@ -45,7 +50,7 @@ supporting snapshot scans and entity/value lookups.
 
 PostgreSQL's current fit is selective enrichment: use native records or another
 source to identify a small set of rows, then retrieve their scalar attributes.
-Eligible decimal/time filters, flat same-snapshot joins, and supported
+Eligible decimal/time and `LIKE` filters, flat same-snapshot joins, and supported
 aggregates can execute in PostgreSQL. Mixed native/SQL queries can export bounded
 customer bindings and return SQL-side joins and totals through the shared
 [fragment compiler](postgres/README.md#delegation-inside-mixed-source-queries). Broader reporting workloads still face

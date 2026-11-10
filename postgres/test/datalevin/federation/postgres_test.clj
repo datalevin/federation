@@ -8,6 +8,7 @@
             [datalevin.federation.postgres.plan :as plan]
             [datalevin.federation.postgres.mapping :as pm]
             [datalevin.federation.postgres.temporal :as temporal]
+            [datalevin.federation.postgres.statistics :as statistics]
             [datalevin.query.access.dependency :as dependency]
             [datalevin.query.source :as spi]
             [datalevin.query.source.control :as control]
@@ -175,6 +176,79 @@
 (def patterns
   [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :order/title] [:var ?title]]}
    {:id 1 :kind :pattern :terms '[[:var ?e] [:const :order/amount] [:ignore]]}])
+
+(deftest postgres-cardinalities-distinguish-scans-lookups-and-unknowns
+  (let [stats {:rows 1000.0 :observed-at-ms 1
+               :columns {"id" {:distinct -1.0 :null-fraction 0.0}
+                         "title" {:distinct 100.0 :null-fraction 0.2}
+                         "amount" {:distinct -0.5 :null-fraction 0.1}}}
+        candidate {:clauses patterns :bindings {} :requires []}
+        count! #(statistics/estimate accepted % stats)]
+    (is (= 800.0 (:rows (count! candidate))))
+    (is (= 8.0 (:rows (count! (assoc-in candidate [:clauses 0 :terms 2] [:const "paid"])))))
+    (let [dependent (assoc candidate :requires [{:variable '?title :type :string :nullable? false}])
+          estimate (count! dependent)]
+      (is (= 8.0 (:rows-per-binding estimate)))
+      (is (not (contains? estimate :rows)))
+      (is (nil? (:per-binding-ns estimate)))
+      (is (= :statistics (get-in estimate [:provenance :kind]))))
+    (is (= 1.0 (:rows-per-binding (count! (assoc candidate :requires [{:variable '?e}])))))
+    (is (= 1.0 (:rows (count! (assoc candidate :bindings {'?e :an-entity})))))
+    (doseq [rows [nil -1.0 Double/NaN Double/POSITIVE_INFINITY]]
+      (is (= :unknown (:confidence (statistics/estimate accepted candidate (assoc stats :rows rows))))))
+    (is (= 0.0 (:rows (statistics/estimate accepted candidate (assoc stats :rows 0.0)))))
+    (is (nil? (:rows (statistics/estimate accepted candidate nil))))))
+
+(deftest distinct-counts-handle-absolute-and-proportional-statistics
+  (is (= 100.0 (statistics/distinct-count 1000.0 100.0)))
+  (is (= 1000.0 (statistics/distinct-count 1000.0 -1.0)))
+  (is (= 500.0 (statistics/distinct-count 1000.0 -0.5)))
+  (doseq [n [nil 0 Double/NaN Double/POSITIVE_INFINITY]]
+    (is (nil? (statistics/distinct-count 1000.0 n)))))
+
+(deftest prepared-filter-counts-override-only-independent-cardinalities
+  (let [candidate {:clauses patterns :bindings {} :requires []}
+        catalog {:rows 1000.0 :observed-at-ms 1 :columns {}}
+        filtered {:rows 2.0 :observed-at-ms 2}
+        estimate (statistics/estimate accepted candidate catalog filtered)]
+    (is (= 2.0 (:rows estimate)))
+    (is (= "postgres-explain-filtered-cardinality-v1" (get-in estimate [:provenance :id])))
+    (is (= 2 (get-in estimate [:provenance :observed-at-ms])))
+    (is (= 0.0 (:rows (statistics/estimate accepted candidate catalog (assoc filtered :rows 0)))))
+    (doseq [rows [nil -1 Double/NaN Double/POSITIVE_INFINITY]]
+      (is (= 1000.0 (:rows (statistics/estimate accepted candidate catalog (assoc filtered :rows rows))))))
+    (let [dependent (assoc candidate :requires [{:variable '?e}])]
+      (is (= 1.0 (:rows-per-binding (statistics/estimate accepted dependent catalog filtered)))))
+    (is (= 2.0 (:rows (statistics/estimate accepted candidate nil filtered))))))
+
+(deftest joined-filters-price-selectivity-without-duplicating-bound-keys
+  (let [stats {:rows 1000.0 :columns {"title" {:distinct 100.0}}}
+        eq {:kind :predicate :operator := :args '[[:var ?title] [:const "paid"]]}
+        member {:kind :predicate :operator :in :args '[[:var ?title] [:const ["a" "b" "b" nil]]]}
+        c {:clauses patterns :bindings {} :requires [{:variable '?e}] :predicates [eq member]}]
+    (is (= 0.01 (statistics/filter-selectivity accepted c stats)))
+    (is (= 0.02 (statistics/filter-selectivity accepted (assoc c :predicates [member]) stats)))
+    (is (= 1.0 (statistics/filter-selectivity accepted (assoc c :requires [{:variable '?title}]) stats)))
+    (is (= 1.0 (statistics/filter-selectivity accepted c nil)))
+    (is (= 1.0 (statistics/filter-selectivity accepted c (assoc-in stats [:columns "title" :distinct] 0))))))
+
+(deftest acquired-reference-domains-refine-sampled-fanout-without-proving-completeness
+  (let [target accepted
+        domain (get-in target [:identity :type :parameters :identity-domain-id])
+        child (pg/accept-mapping (assoc-in (assoc-in catalog [:columns "amount" :type] "int8")
+                                          [:columns "amount" :type-id] 20)
+                (assoc declaration :relation-id :sales/child
+                       :attributes {:order/owner {:column "amount" :reference
+                                                   {:domain domain :type (get-in target [:identity :type])}}}))
+        stats {:rows 100000.0 :observed-at-ms 1 :columns {"amount" {:distinct 100.0}}}
+        candidate {:clauses [{:terms '[[:var ?e] [:const :order/owner] [:var ?owner]]}]
+                   :requires [{:variable '?owner}] :bindings {}}
+        refined (statistics/reference-statistics child stats [{:accepted target :statistics (atom {:rows 20000.0})}])]
+    (is (= 1000.0 (:rows-per-binding (statistics/estimate child candidate stats))))
+    (is (= 5.0 (:rows-per-binding (statistics/estimate child candidate refined))))
+    (is (= :low (:confidence (statistics/estimate child candidate refined))))
+    (is (= stats (statistics/reference-statistics child stats [])))
+    (is (= stats (statistics/reference-statistics child stats [{:accepted target :statistics (atom {:rows 0.0})}])))))
 
 (defn captured-amount-candidate [term]
   (let [descriptor (spi/-source-info (pg/source accepted profile))
@@ -361,6 +435,51 @@
   (doseq [bound [java.time.Instant/MIN java.time.Instant/MAX (java.util.Date.)]]
     (is (nil? (plan/comparison-filter "timestamptz" "x" :>= bound)))))
 
+
+(deftest like-prefilters-use-bound-parameters-and-native-escape-rules
+  (doseq [type ["text" "varchar"] operator [:like :not-like]
+          [pattern parameter] [["%Downey%Robert%" "%Downey%Robert%"]
+                               ["" ""] ["!" ""] ["abc!" "abc"]
+                               ["!!" "!!"] ["abc!!!" "abc!!"]
+                               ["!%!_" "!%!_"] ["a\\b%" "a\\b%"]
+                               ["%'; DROP TABLE x; --%" "%'; DROP TABLE x; --%"]]]
+    (let [[sql params] (plan/like-filter type "r.\"title\"" operator pattern)]
+      (is (= [parameter] params))
+      (is (= (str "r.\"title\" COLLATE pg_catalog.\"C\" " (if (= :like operator) "LIKE" "NOT LIKE")
+                  " ?::text ESCAPE '!'") sql))))
+  (doseq [pattern [nil 42 "!x" "%!x" "a!猫" "猫%" "\u0000" (str (char 0xD800))]]
+    (is (nil? (plan/like-filter "text" "r.x" :like pattern))))
+  (is (nil? (plan/like-filter "int8" "r.x" :like "%")))
+  (is (nil? (plan/like-filter "text" "r.x" :ilike "%"))))
+
+(deftest like-prefilters-keep-argument-direction-and-unsupported-calls-local
+  (let [descriptor (spi/-source-info (pg/source accepted profile))
+        candidate (assoc (first (plan/choices descriptor (request patterns) true)) :bindings {})
+        predicate {:id 2 :kind :predicate :operator :like :semantics-version 1
+                   :args '[[:var ?title] [:const "%Alpha%"]]}
+        predicates (plan/predicates accepted candidate (request (conj patterns predicate)))
+        query (plan/sql accepted (assoc candidate :predicates predicates) {} 4096)]
+    (is (= [2] (mapv :id predicates)))
+    (is (.contains (:sql query) "COLLATE pg_catalog.\"C\" LIKE ?::text ESCAPE '!'"))
+    (is (= ["%Alpha%"] (:params query)))
+    (doseq [args ['[[:const "Alpha"] [:var ?title]]
+                  '[[:var ?title] [:var ?pattern]]
+                  '[[:var ?title] [:const "%!x"]]]]
+      (is (empty? (plan/predicates accepted candidate
+                    (request (conj patterns (assoc predicate :args args)))))))))
+
+(deftest explain-projections-keep-the-filter-and-never-run-or-fetch-values
+  (let [d (spi/-source-info (pg/source accepted profile))
+        candidate (assoc (first (plan/choices d (request patterns) true)) :bindings {})
+        predicate {:id 2 :kind :predicate :operator :like :semantics-version 1
+                   :args '[[:var ?title] [:const "%Alpha%"]]}
+        filters (plan/predicates accepted candidate (request (conj patterns predicate)))
+        query (plan/estimate-sql accepted (assoc candidate :predicates filters))]
+    (is (.startsWith (:sql query) "SELECT 1 FROM ONLY \"public\".\"orders\" AS r WHERE "))
+    (is (.contains (:sql query) "COLLATE pg_catalog.\"C\" LIKE ?::text ESCAPE '!'"))
+    (is (= ["%Alpha%"] (:params query)))
+    (is (nil? (plan/estimate-sql accepted candidate)))
+    (is (nil? (plan/estimate-sql accepted (assoc candidate :predicates filters :requires [{:variable '?e}]))))))
 
 (deftest unbindable-offsets-remain-local
   (doseq [offset ["+16:00" "-16:00" "+18:00" "-18:00"]]

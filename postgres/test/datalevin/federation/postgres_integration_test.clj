@@ -6,6 +6,7 @@
             [datalevin.federation.mapping :as mapping]
             [datalevin.federation.postgres :as pg]
             [datalevin.federation.postgres.jdbc :as jdbc]
+            [datalevin.federation.postgres.statistics :as statistics]
             [datalevin.federation.postgres-test :as unit]
             [datalevin.query.source :as spi]
             [datalevin.query.source.batch :as batch]
@@ -86,6 +87,36 @@
 
 (defn delegated-window [explanation]
   (some :result-window (:regions explanation)))
+
+(deftest explicit-native-text-extrema-compose-bounded-groups-in-the-column-collation
+  (sql! (str "CREATE TABLE " (table "native_extrema")
+             " (id bigint PRIMARY KEY, g bigint, v text COLLATE \"C\")"))
+  (sql! (str "INSERT INTO " (table "native_extrema") " SELECT i,0,'text-'||i FROM generate_series(1,600) i"))
+  (sql! (str "INSERT INTO " (table "native_extrema") " VALUES (601,1,'\uE000'),(602,1,'"
+             (String. (Character/toChars 0x10000)) "')"))
+  (let [accepted (pg/accept-mapping (pg/discover *profile* [*schema* "native_extrema"])
+                   {:source-instance-id unit/source-id :relation-id :test/native-extrema :identity-attribute :extrema/id
+                    :attributes {:extrema/g "g" :extrema/v "v"}})
+        provider (pg/source accepted (assoc *profile* :fetch-size 64))
+        q '{:find [?g (min ?v) (max ?v)] :in [$p]
+            :where [[$p ?e :extrema/g ?g] [$p ?e :extrema/v ?v]]
+            :query-source {:native-extrema {?v {:source $p :attribute :extrema/v}}
+                           :limits {:binding-rows 8}}}
+        expected (with-open [stmt (.createStatement ^Connection *db*)
+                             rs (.executeQuery stmt (str "SELECT g,min(v),max(v) FROM " (table "native_extrema") " GROUP BY g"))]
+                   (loop [out #{}]
+                     (if (.next rs) (recur (conj out [(.getLong rs 1) (.getString rs 2) (.getString rs 3)])) out)))]
+    (is (= expected (set (d/q q provider))))
+    (is (not= expected (set (d/q (update q :query-source dissoc :native-extrema) provider))))
+    (is (zero? (:live-sessions (pg/statistics provider))))
+    (doseq [spec ['{?v {:source $missing :attribute :extrema/v}}
+                  '{?v {:source $p :attribute :extrema/g}}
+                  '{?unused {:source $p :attribute :extrema/v}}]]
+      (is (#{:query-source/invalid :query-source/unsupported}
+            (category #(d/q (assoc-in q [:query-source :native-extrema] spec) provider))))
+      (is (zero? (:live-sessions (pg/statistics provider)))))
+    (let [plan (d/explain {:run? false} q provider)]
+      (is (empty? (:cursors plan))))))
 
 (deftest local-expressions-fall-back-from-sql-delegation
   (let [queries
@@ -464,12 +495,12 @@
 (defn request [provider ctl]
   {:control ctl :query-id (random-uuid) :spi-version 2 :features #{} :consistency :snapshot
    :limits (control/limits ctl) :authorization nil :source-descriptors [(spi/-source-info provider)]})
-(defn alternatives [provider session request clauses available]
-  (:alternatives
-    (spi/-plan-source provider session
-      (merge request {:source-symbol '$p :region-id 0 :scope-id (get-in (spi/-source-info provider) [:scope :id])
+(defn planning-request [provider request clauses available]
+  (merge request {:source-symbol '$p :region-id 0 :scope-id (get-in (spi/-source-info provider) [:scope :id])
                       :source-descriptor (spi/-source-info provider) :bindings {} :available-inputs available
-                      :max-alternatives 32 :clauses clauses}))))
+                      :max-alternatives 32 :clauses clauses}))
+(defn alternatives [provider session request clauses available]
+  (:alternatives (spi/-plan-source provider session (planning-request provider request clauses available))))
 (defn open [provider session request alternative bindings]
   (spi/-open-cursor session
     (cond-> (merge (select-keys request [:control :query-id :spi-version :features :authorization :consistency :limits])
@@ -615,6 +646,39 @@
       (is (relational-plan? explained))
       (is (= 1 (read-rows explained))))
     (control/close! ctl)))
+
+(deftest output-batches-use-the-requested-byte-window-and-shrink-under-pressure
+  (sql! (str "CREATE TABLE " (table "output_batches") " (id bigint PRIMARY KEY, payload text)"))
+  (sql! (str "INSERT INTO " (table "output_batches") " SELECT i,repeat('x',2000) FROM generate_series(1,100) i"))
+  (let [accepted (pg/accept-mapping (pg/discover *profile* [*schema* "output_batches"])
+                   {:source-instance-id unit/source-id :relation-id :test/output-batches
+                    :identity-attribute :output/id :attributes {:output/payload "payload"}})
+        provider (pg/source accepted (assoc *profile* :fetch-size 128 :relational? false))]
+    (doseq [pressure? [false true]]
+      (let [ctl (control/create) request (request provider ctl)
+            session (spi/-open-session provider request)]
+        (try
+          (let [clauses [{:id 0 :kind :pattern :terms '[[:ignore] [:const :output/payload] [:var ?payload]]}]
+                alternative (first (alternatives provider session request clauses []))
+                cursor (open provider session request alternative nil)
+                held (when pressure?
+                       (spi/reserve! ctl {:retained-bytes (- (:retained-bytes (control/limits ctl))
+                                                           (:retained-bytes (control/usage ctl)) 98304)}))]
+            (try
+              (let [fetch {:control ctl :max-rows 100 :max-bytes 1048576}
+                    result (batch/accept! {:control ctl} (:columns alternative) false fetch
+                             (spi/-next-batch! cursor fetch) identity)]
+                (try
+                  (is (= (repeat (:row-count result) [(apply str (repeat 2000 "x"))]) (:rows result)))
+                  (if pressure?
+                    (is (< 0 (:row-count result) 100))
+                    (do (is (= 100 (:row-count result))) (is (> (:byte-count result) 65536))))
+                  (is (<= (:byte-count result) (:max-bytes fetch)))
+                  (finally (spi/release! (:reservation result)))))
+              (finally (when held (spi/release! held)) (spi/-close-cursor! cursor))))
+          (finally (spi/-close-session! session)))
+        (is (released? ctl))
+        (control/close! ctl)))))
 
 (deftest fetch-pages-shrink-to-fit-the-shared-memory-budget
   (doseq [max-row-bytes [16384 1048576]]
@@ -2278,6 +2342,197 @@
            (set (d/q query native provider))
            (set (d/q query native (pg/source accepted (assoc *profile* :relational? false))))))
     (is (fragment-plan? (d/explain {:run? true} query native provider)))))
+
+(def like-values
+  ["" "Alpha" "alphabet" "βeta" "😀" "a\nb" "a%b" "a_b" "a!b" "a\\b"
+   "x'; DROP TABLE x; --" "Downey Jr., Robert" "Downey Sr., Robert"
+   "Robert Downey" "a\u0301b" "猫" "Alpha\nBeta" "!" "_" "%" "a" "a!" nil])
+
+(defn like-fixture []
+  (sql! (str "CREATE TABLE " (table "like_values") " (id bigint PRIMARY KEY, value text, short_value varchar(128))"))
+  (with-open [stmt (.prepareStatement ^Connection *db* (str "INSERT INTO " (table "like_values") " VALUES (?,?,?)"))]
+    (doseq [[i text] (map-indexed vector like-values)]
+      (.setLong stmt 1 (inc i))
+      (.setString stmt 2 text)
+      (.setString stmt 3 text)
+      (.addBatch stmt))
+    (.executeBatch stmt))
+  (let [accepted (accept-relation "like_values" {:like/value "value" :like/short "short_value"}
+                                  {:identity-attribute :like/id})
+        compiled (mapping/compile-logical-mapping accepted)]
+    {:accepted accepted
+     :facts (vec (mapcat (fn [[i text]]
+                          (mapping/project-facts compiled [(inc i)] {:like/value text :like/short text}))
+                        (map-indexed vector like-values)))}))
+
+(defn like-query [attribute call]
+  {:find '[?id ?value] :in '[$p]
+   :where [['$p '?e :like/id '?id] ['$p '?e attribute '?value] [call]]})
+
+(deftest like-prefilters-preserve-native-pattern-semantics-and-reduce-reads
+  (let [{:keys [accepted facts]} (like-fixture)]
+    (doseq [fusion? [true false] attribute [:like/value :like/short]
+            :let [provider (pg/source accepted (assoc *profile* :fusion? fusion? :relational? false :fetch-size 3))]
+            pattern ["%Downey%Robert%" "A%" "%" "_" "__" "a_b" "a%b" "%a%a%" ""
+                     "a!%b" "a!_b" "a!!b" "a\\b" "!" "a!" "a!!!" "%\n%" "%'; DROP TABLE x; --"]
+            operator '[like not-like]
+            :let [q (like-query attribute (list operator '?value pattern))]]
+      (is (= (set (d/q q facts)) (set (d/q q provider))) (pr-str [fusion? attribute operator pattern]))
+    (let [provider (pg/source accepted (assoc *profile* :relational? false :fetch-size 1))
+          q (like-query :like/value '(like ?value "%Downey%Robert%"))
+          explained (d/explain {:run? true} q provider)
+          region (first (:regions explained))]
+      (is (= #{[12 "Downey Jr., Robert"] [13 "Downey Sr., Robert"]} (set (d/q q provider))))
+      (is (= 2 (read-rows explained)))
+      (is (some #(seq (:prefilters %)) (:steps region)))
+      (is (some #(and (= :predicate (:kind %)) (= 'like (:function %))) (:operators region)))
+      (is (zero? (:live-sessions (pg/statistics provider)))))))
+
+(deftest unsupported-like-calls-remain-local-with-correct-results-and-errors
+  (let [{:keys [accepted facts]} (like-fixture)
+        provider (pg/source accepted (assoc *profile* :relational? false))]
+    (doseq [call '[(like ?value "猫%") (like ?value "a|%b" {:escape \|})
+                   (like ?value "A%" nil true) (like ?value "\u0000")]
+            :let [q (like-query :like/value call)]]
+      (is (= (set (d/q q facts)) (set (d/q q provider))) (pr-str call))
+      (is (every? #(empty? (:prefilters %)) (mapcat :steps (:regions (d/explain {:run? false} q provider))))))
+    (let [q (update (like-query :like/value '(like "Alpha" ?value)) :where conj '[$p ?e :like/id 20])]
+      (is (= #{[20 "%"]} (set (d/q q provider))))
+      (is (= (set (d/q q facts)) (set (d/q q provider)))))
+    (let [q {:find '[?id ?matches] :in '[$p]
+             :where '[[$p ?e :like/id ?id] [$p ?e :like/value ?value] [(like ?value "A%") ?matches]]}]
+      (is (= (set (d/q q facts)) (set (d/q q provider))))
+      (is (= 22 (count (d/q q provider)))))
+    (let [q (like-query :like/value '(like ?value "%!x"))]
+      (is (= :query-source/provider (category #(d/q q provider))))
+      (is (zero? (:live-sessions (pg/statistics provider))))))))
+
+(deftest prepared-string-counts-change-the-driving-access-without-changing-results
+  (let [{:keys [accepted]} (like-fixture)]
+    (sql! (str "INSERT INTO " (table "like_values")
+               " (id,value) SELECT i,'filler' FROM generate_series(100,100099) i"))
+    (sql! (str "CREATE TABLE " (table "filter_anchors") " (id bigint PRIMARY KEY)"))
+    (sql! (str "INSERT INTO " (table "filter_anchors") " SELECT i FROM generate_series(1,50000) i"))
+    (doseq [name ["filter_anchors" "like_values"]] (sql! (str "ANALYZE " (table name))))
+    (let [anchors (accept-relation "filter_anchors" {} {:relation-id :test/filter-anchors :identity-attribute :anchor/id})
+          q '{:find [?name] :in [$a $z]
+              :where [[$a ?a :anchor/id ?key] [$z ?z :like/id ?key] [$z ?z :like/value ?name]
+                      [(like ?name "%Downey%Robert%")]]}]
+      (doseq [enabled? [true false]
+              :let [profile (assoc *profile* :relational? false :filtered-statistics? enabled?)
+                    a (pg/source anchors profile) z (pg/source accepted profile)
+                    e (d/explain {:run? enabled?} q a z) first-step (get-in e [:regions 0 :steps 0])]]
+        (is (= (if enabled? '$z '$a) (:source first-step)))
+        (when enabled?
+          (is (= #{["Downey Jr., Robert"] ["Downey Sr., Robert"]} (set (d/q q a z))))
+          (is (= "postgres-explain-filtered-cardinality-v1" (get-in first-step [:estimate :provenance :id])))
+          (is (< (get-in first-step [:estimate :rows]) 50000.0))
+          (is (pos? (get-in e [:regions 0 :estimation :requests])))
+          (is (= 4 (read-rows e))))))))
+
+(deftest estimate-preparation-is-read-only-bounded-and-scoped-to-its-request
+  (let [{:keys [accepted]} (like-fixture)
+        _ (sql! (str "ANALYZE " (table "like_values")))
+        provider (pg/source accepted (assoc *profile* :relational? false))
+        ctl (control/create) request (request provider ctl) session (spi/-open-session provider request)
+        clauses [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :like/value] [:var ?value]]}
+                 {:id 1 :kind :predicate :operator :like :semantics-version 1
+                  :args '[[:var ?value] [:const "%Downey%Robert%"]]}]
+        planning (planning-request provider request clauses [])
+        budget {:max-requests 8 :max-elapsed-ns 1000000000}]
+    (try
+      (let [before (:external-requests (control/usage ctl))]
+        (is (pos? (:probe-requests (spi/-estimation-info provider session planning))))
+        (is (= before (:external-requests (control/usage ctl))))
+        (spi/-prepare-estimates provider session planning budget)
+        (is (> (:external-requests (control/usage ctl)) before)))
+      (let [before (:external-requests (control/usage ctl))
+            alternative (first (:alternatives (spi/-plan-source provider session planning)))]
+        (is (= "postgres-explain-filtered-cardinality-v1" (get-in alternative [:estimate :provenance :id])))
+        (is (= before (:external-requests (control/usage ctl))))
+        (spi/-prepare-estimates provider session planning budget)
+        (is (= before (:external-requests (control/usage ctl)))))
+      (let [changed (assoc-in planning [:clauses 1 :args 1] [:const "A%"])
+            alternative (first (:alternatives (spi/-plan-source provider session changed)))]
+        (is (= "postgres-catalog-cardinality-v1" (get-in alternative [:estimate :provenance :id]))))
+      ;; An unadmittable optional scratch estimate falls back without consuming a request.
+      (let [large (assoc planning :max-alternatives 1000000)
+            before (:external-requests (control/usage ctl))]
+        (spi/-prepare-estimates provider session large budget)
+        (is (= before (:external-requests (control/usage ctl))))
+        (is (= "postgres-catalog-cardinality-v1"
+               (get-in (first (:alternatives (spi/-plan-source provider session large))) [:estimate :provenance :id]))))
+      (finally (spi/-close-session! session)))
+    (is (= {:closed? true} @(:state session)))
+    (is (released? ctl))
+    (control/close! ctl)))
+
+(deftest explain-statistics-never-execute-the-statement
+  (sql! (str "CREATE SEQUENCE " (table "not_executed")))
+  (let [context {:profile (jdbc/profile! *profile*) :connection *db* :cancelled (atom false)}]
+    (is (= 1.0 (jdbc/explain-rows! context {:sql "SELECT nextval(?::regclass)" :params [(table "not_executed")]})))
+    (is (= [false] (jdbc/query! context :acquisition (str "SELECT is_called FROM " (table "not_executed")) []
+                                #(.getBoolean ^java.sql.ResultSet % 1))))))
+
+(deftest planner-counts-select-a-small-relation-before-a-large-scan
+  (sql! (str "CREATE TABLE " (table "large_counts") " (id bigint PRIMARY KEY, selector bigint, label text)"))
+  (sql! (str "INSERT INTO " (table "large_counts") " SELECT i,i%100,'row '||i FROM generate_series(1,10000) i"))
+  (sql! (str "CREATE TABLE " (table "small_counts") " (id bigint PRIMARY KEY, selector bigint)"))
+  (sql! (str "INSERT INTO " (table "small_counts") " VALUES (1,7)"))
+  (doseq [name ["large_counts" "small_counts"]] (sql! (str "ANALYZE " (table name))))
+  (let [large (accept-relation "large_counts" {:large/selector "selector" :large/label "label"}
+                              {:relation-id :test/large-counts})
+        small (accept-relation "small_counts" {:small/selector "selector"} {:relation-id :test/small-counts})
+        profile (assoc *profile* :relational? false :fetch-size 128)
+        q '{:find [?label] :in [$a $z]
+            :where [[$a ?l :large/selector ?selector] [$a ?l :large/label ?label]
+                    [$z ?s :small/selector ?selector]]}
+        a (pg/source large profile) z (pg/source small profile)
+        explained (d/explain {:run? true} q a z)
+        region (first (:regions explained))
+        [anchor lookup] (:steps region)]
+    (is (= :cardinality (:selection region)))
+    (is (= '$z (:source anchor)))
+    (is (= 1.0 (get-in anchor [:estimate :rows])))
+    (is (= '$a (:source lookup)))
+    (is (= :value-lookup (get-in lookup [:access :kind])))
+    (is (= 100.0 (get-in lookup [:estimate :rows-per-binding])))
+    (is (= 101 (read-rows explained)))
+    (is (= (set (map #(vector (str "row " %)) (range 7 10001 100))) (set (d/q q a z))))
+    (let [legacy-profile (assoc profile :statistics? false)
+          legacy (d/explain {:run? false} q (pg/source large legacy-profile) (pg/source small legacy-profile))]
+      (is (= :structural (get-in legacy [:regions 0 :selection])))
+      (is (= '$a (get-in legacy [:regions 0 :steps 0 :source]))))
+    (is (every? #(zero? (:live-sessions (pg/statistics %))) [a z]))))
+
+(deftest live-counts-do-not-enter-the-accepted-schema-contract
+  (let [accepted *accepted* provider (source {:relational? false})
+        fingerprint (:definition-fingerprint (spi/-source-info provider))
+        context {:profile (jdbc/profile! *profile*) :connection *db* :cancelled (atom false)}]
+    (sql! (str "ANALYZE " (table "orders")))
+    (let [stats (jdbc/statistics! context accepted)
+          clause {:id 0 :kind :pattern :terms '[[:var ?e] [:const :order/title] [:var ?title]]}]
+      (is (= 4.0 (:rows stats)))
+      (is (= 3.0 (:rows (statistics/estimate accepted {:clauses [clause]} stats)))))
+    (sql! (str "INSERT INTO " (table "orders") " (id,title) SELECT i,'new '||i FROM generate_series(5,104) i"))
+    (sql! (str "ANALYZE " (table "orders")))
+    (let [explanation (d/explain {:run? true} '[:find ?title :in $p :where [$p ?e :order/title ?title]] provider)]
+      (is (= :cardinality (get-in explanation [:regions 0 :selection])))
+      (is (< 102.9 (get-in explanation [:regions 0 :steps 0 :estimate :rows]) 103.1))
+      (is (= 103 (:result-rows explanation))))
+    (is (= fingerprint (:definition-fingerprint (spi/-source-info provider))))
+    (is (= accepted *accepted*))
+    (let [ctl (control/create) request (request provider ctl)
+          session (spi/-open-session provider request)
+          owned (mapv :statistics (vals (:views session)))]
+      (try
+        (is (= [104.0] (mapv #(get @% :rows) owned)))
+        (alternatives provider session request
+                      [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :order/title] [:var ?title]]}] [])
+        (finally (spi/-close-session! session)))
+      (is (every? #(nil? @%) owned))
+      (is (released? ctl))
+      (control/close! ctl))))
 
 (deftest fragment-cursors-own-mutable-bindings-and-drop-them-on-close
   (sql! (str "CREATE TABLE " (table "byte_selectors") " (id bigint PRIMARY KEY, value bytea)"))

@@ -2,7 +2,8 @@
   "Private PostgreSQL transport. SQL and driver errors never enter diagnostics."
   (:require [clojure.string :as str]
             [datalevin.query.source :as spi]
-            [datalevin.federation.fingerprint :as fp])
+            [datalevin.federation.fingerprint :as fp]
+            [jsonista.core :as json])
   (:import [java.lang AutoCloseable]
            [java.sql Connection DriverManager PreparedStatement ResultSet SQLException]
            [java.util IdentityHashMap Properties]
@@ -47,7 +48,8 @@
 
 (defn profile! [profile]
   (let [profile (merge {:connect-timeout-ms 10000 :statement-timeout-ms 10000
-                        :fetch-size 128 :max-row-bytes 16384 :fusion? true :relational? true} profile)]
+                        :fetch-size 128 :max-row-bytes 16384 :fusion? true :relational? true
+                        :statistics? true :filtered-statistics? true} profile)]
     (ensure! (= 1 (count (filter some? ((juxt :jdbc-url :data-source) profile)))) :profile)
     (when-let [url (:jdbc-url profile)]
       (ensure! (and (string? url) (str/starts-with? url "jdbc:postgresql:")) :profile))
@@ -57,6 +59,7 @@
       (ensure! (and (integer? (k profile)) (<= 1 (k profile) 1048576)) :profile))
     (ensure! (and (integer? (:fetch-size profile)) (<= 1 (:fetch-size profile) 256)
                   (boolean? (:fusion? profile)) (boolean? (:relational? profile))
+                  (boolean? (:statistics? profile)) (boolean? (:filtered-statistics? profile))
                   (every? (fn [[k v]] (and (string? k) (string? v))) (:properties profile))) :profile)
     (when-let [role (:role profile)] (identifier role))
     (ensure! (and (or (nil? (:session-settings profile)) (map? (:session-settings profile)))
@@ -180,11 +183,16 @@
   "Admit a real round trip. The callback fully consumes its bounded result."
   [{:keys [limiter metrics] :as context} phase f]
   (check! context)
-  (let [permit (when limiter (spi/acquire-request! limiter))]
+  (let [started (when (:request-observation context) (System/nanoTime))
+        permit (when limiter (spi/acquire-request! limiter))]
     (when metrics (swap! metrics update :external-requests inc))
     (try (let [result (f)] (check! context) result)
          (catch SQLException e (translate! context phase e))
-         (finally (close! permit)))))
+         (finally
+           (when started
+             (swap! (:request-observation context)
+                    #(-> % (update :count inc) (update :elapsed-ns + (- (System/nanoTime) started)))))
+           (close! permit)))))
 
 (defn statement ^PreparedStatement [{:keys [connection profile control]} sql params]
   (let [stmt (.prepareStatement ^Connection connection sql)]
@@ -365,35 +373,47 @@
 
 (defn catalog!
   "Inspect a named relation and its key, enum, view, and authorization contracts."
-  [context table]
+  ([context table] (catalog! context table nil))
+  ([context table statistics-columns]
   (relation table)
-  (let [[schema name] table
+  (when statistics-columns
+    (ensure! (and (vector? statistics-columns) (<= 1 (count statistics-columns) 128)
+                  (every? string? statistics-columns)) :discovery))
+  (let [[schema name] table statistics-set (set statistics-columns)
         tables (query! context :discovery
-                 (str "SELECT c.oid::bigint, c.relkind::text, c.relrowsecurity, current_database(), ?::regclass::oid::bigint "
+                 (str "SELECT c.oid::bigint, c.relkind::text, c.relrowsecurity, current_database(), ?::regclass::oid::bigint"
+                      (when statistics-columns ", c.reltuples::float8") " "
                       "FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
                       "WHERE n.nspname=? AND c.relname=?") [(relation table) schema name]
                  (fn [^ResultSet r]
                    (when-not (= (.getLong r 1) (.getLong r 5))
                      (fail! :query-source/stale-definition :acquisition))
-                   {:oid (.getLong r 1) :kind (.getString r 2)
-                    :row-security? (.getBoolean r 3) :database (.getString r 4)}))
+                   (cond-> {:oid (.getLong r 1) :kind (.getString r 2)
+                            :row-security? (.getBoolean r 3) :database (.getString r 4)}
+                     statistics-columns (assoc ::rows (.getDouble r 6)))))
         _ (ensure! (= 1 (count tables)) :discovery)
         info (first tables)
         columns (query! context :discovery
                   (str "SELECT a.attname, t.typname, a.atttypid::bigint, a.atttypmod, a.attnotnull, "
                        "a.attcollation::bigint, t.typtype::text, n.nspname, "
-                       "(SELECT array_agg(e.enumlabel ORDER BY e.enumsortorder) FROM pg_catalog.pg_enum e WHERE e.enumtypid=t.oid) "
+                       "(SELECT array_agg(e.enumlabel ORDER BY e.enumsortorder) FROM pg_catalog.pg_enum e WHERE e.enumtypid=t.oid)"
+                       (when statistics-columns ", s.null_frac::float8, s.n_distinct::float8") " "
                        "FROM pg_catalog.pg_attribute a "
                        "JOIN pg_catalog.pg_type t ON t.oid=a.atttypid JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace "
+                       (when statistics-columns
+                         (str "LEFT JOIN pg_catalog.pg_stats s ON s.schemaname=? AND s.tablename=? "
+                              "AND s.attname=a.attname AND NOT s.inherited AND s.attname IN ("
+                              (str/join "," (repeat (count statistics-columns) "?")) ") "))
                        "WHERE a.attrelid=?::oid AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum")
-                  [(:oid info)]
-                  (fn [^ResultSet r] [(.getString r 1)
+                  (if statistics-columns (into [schema name] (concat statistics-columns [(:oid info)])) [(:oid info)])
+                  (fn [^ResultSet r] (cond-> [(.getString r 1)
                                      (cond-> {:type (.getString r 2) :type-id (.getLong r 3) :modifier (.getInt r 4)
                                               :not-null? (.getBoolean r 5) :collation (.getLong r 6)}
                                        (= "e" (.getString r 7))
                                        (assoc :enum {:schema (.getString r 8) :name (.getString r 2)
                                                      :labels (let [a (.getArray r 9)]
-                                                               (try (vec (.getArray a)) (finally (.free a))))}))]))
+                                                               (try (vec (.getArray a)) (finally (.free a))))}))]
+                                      statistics-columns (conj {:null-fraction (.getObject r 10) :distinct (.getObject r 11)}))))
         keys (query! context :discovery
                (str "SELECT a.attname, c.condeferrable, c.convalidated FROM pg_catalog.pg_constraint c "
                     "CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY k(attnum, ord) "
@@ -402,7 +422,11 @@
                (fn [^ResultSet r] {:column (.getString r 1) :deferred? (.getBoolean r 2)
                                   :validated? (.getBoolean r 3)}))
         security (when (or (:row-security? info) (#{"v" "m"} (:kind info))) (security! context (:oid info)))]
-    (cond-> (assoc info :table table :columns (into (sorted-map) columns) :primary-key keys)
+    (cond-> (assoc (dissoc info ::rows) :table table :columns (into (sorted-map) (map #(subvec % 0 2)) columns) :primary-key keys)
+      statistics-columns
+      (assoc :statistics {:rows (let [n (::rows info)] (when (and (Double/isFinite (double n)) (not (neg? n))) n))
+                          :columns (into {} (keep (fn [[column _ stats]] (when (statistics-set column) [column stats]))) columns)
+                          :observed-at-ms (System/currentTimeMillis)})
       (or (:row-security? info) (#{"v" "m"} (:kind info)))
       (assoc :security security)
       (#{"v" "m"} (:kind info))
@@ -411,4 +435,34 @@
                                  "reloptions::text, relispopulated FROM pg_catalog.pg_class WHERE oid=?::oid") [(:oid info)]
                             (fn [^ResultSet r] {:definition (.getString r 1) :owner (.getLong r 2)
                                                :options (.getString r 3) :populated? (.getBoolean r 4)})))
-                          :dependencies (:dependencies security))))))
+                          :dependencies (:dependencies security)))))))
+
+(defn statistics!
+  "Read bounded scalar planner statistics for mapped columns of one ordinary
+  table. No values or histograms are read. RLS/captured relations are excluded by
+  the caller. Missing ANALYZE or column privileges leave statistics unknown."
+  [context accepted]
+  (:statistics (catalog! context (get-in accepted [:requirements :table])
+                        (vec (keys (get-in accepted [:requirements :columns]))))))
+
+(defn- explain-text [context ^ResultSet rs]
+  (with-open [reader (.getCharacterStream rs 1)]
+    (let [buffer (char-array 1024) output (StringBuilder.)]
+      (loop []
+        (check! context)
+        (let [n (.read ^java.io.Reader reader buffer)]
+          (cond
+            (= n -1) (str output)
+            (> (+ (.length output) n) 65536) nil
+            :else (do (.append output buffer 0 n) (recur))))))))
+
+(defn explain-rows!
+  "Get PostgreSQL's estimated returned rows without running the supplied SELECT.
+  Oversized/missing plans decline estimation. SQL and plan text stay private."
+  [context {:keys [sql params]}]
+  (when-let [text (first (query! context :acquisition
+                         (str "EXPLAIN (ANALYZE FALSE, FORMAT JSON) " sql) params
+                         #(explain-text context %)))]
+    (let [n (get-in (json/read-value text) [0 "Plan" "Plan Rows"])]
+      (when (and (number? n) (Double/isFinite (double n)) (not (neg? n)))
+        (double n)))))

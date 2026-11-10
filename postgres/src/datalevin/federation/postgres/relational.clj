@@ -21,7 +21,7 @@
   (let [types (mapv #(pm/storage-type (get-in accepted [:requirements :columns %])) columns)]
     (require! (every? #{"int2" "int4" "int8" "bool" "uuid" "text" "varchar" "bytea" "numeric" "timestamptz"} types))
     {:sql (mapv #(text-column (str alias "." (jdbc/identifier %1)) %2) columns types)
-     :types types :type type :shape shape
+     :types types :type type :shape shape :aliases #{alias}
      :modifier (when (= 1 (count columns)) (get-in accepted [:requirements :columns (first columns) :modifier]))}))
 
 (defn- equivalent [a b strict?]
@@ -54,6 +54,16 @@
       [(conjunction (map first filters)) (vec (mapcat second filters))])))
 
 (defn- predicate-filter [variables {:keys [operator args]}]
+  (if (#{:in :not-in} operator)
+    (let [[[tag v] [other xs]] args expr (variables v)]
+      (require! (and (= tag :var) (= other :const) (= :scalar (:shape expr))
+                     (#{"text" "varchar"} (first (:types expr)))
+                     (or (sequential? xs) (set? xs)) (<= (count xs) 256)
+                     (every? #(or (nil? %) (text-value? %)) xs)))
+      (let [xs (vec (sort (distinct (remove nil? xs))))]
+        [(if (empty? xs) (if (= operator :in) "FALSE" "TRUE")
+             (str (first (:sql expr)) (if (= operator :in) " IN (" " NOT IN (")
+                  (str/join "," (repeat (count xs) "?::text")) ")")) xs]))
   (let [[a b] args
         [a b operator] (if (= :const (first a)) [b a (plan/reverse-operator operator)] [a b operator])
         expr (variables (second a))]
@@ -72,7 +82,7 @@
           (do (require! (and (= (:type expr) (:type other)) (= 1 (count (:sql expr)))
                             (every? #{"int2" "int4" "int8" "numeric" "timestamptz"}
                                     (concat (:types expr) (:types other)))))
-              [(str (first (:sql expr)) " " (plan/operators operator) " " (first (:sql other))) []]))))))
+              [(str (first (:sql expr)) " " (plan/operators operator) " " (first (:sql other))) []])))))))
 
 (defn- nonnegative? [variable predicates]
   (some (fn [{:keys [operator args]}]
@@ -104,36 +114,62 @@
 
 (def ^:private input-types {:long "int8" :string "text" :bigdec "numeric" :uuid "uuid" :boolean "bool" :bytes "bytea"})
 
+(defn- input-expression [column i]
+  (let [type (:type column) nominal? (and (map? type) (= :custom (:kind type)))
+        _ (when nominal? (require! (= ref/type-name (:name type))))
+        key-types (if nominal?
+                    (try (get-in (ref/validate-type! type) [:parameters :key-types])
+                         (catch Exception _ (unsupported!))) [type])
+        types (mapv input-types key-types)
+        _ (require! (and (every? some? types) (or (not nominal?) (not-any? #{:bigdec} key-types))))
+        names (mapv #(str "k" i "_" %) (range (count types)))]
+    (cond-> {:sql (mapv text-column (map #(str "b." %) names) types)
+             :types types :type type :shape (if nominal? :ref :scalar)
+             :input-names names :key-types key-types}
+      (= type :bigdec) (assoc :scales [(str "b.s" i)] :scale-name (str "s" i)))))
+
+(defn- default-input [type]
+  (case type :long 0 :string "" :bigdec 0M :uuid (java.util.UUID. 0 0) :boolean false :bytes (byte-array 0)))
+
+(defn- valid-input? [column expression x]
+  (and (value/matches-type? (:type column) x)
+       (every? true?
+         (map (fn [type x]
+                (case type
+                  :string (text-value? x)
+                  :bigdec (boolean (plan/comparison-filter "numeric" "x" := x))
+                  true))
+              (:key-types expression)
+              (if (= :ref (:shape expression)) (ref/key-tuple x) [x])))))
+
 (defn- input-relation [request]
   (when-let [columns (:inputs request)]
-    (require! (and (vector? columns) (<= 1 (count columns) 18)
-                   (= (count columns) (count (set (map :variable columns))))
-                   (every? #(and (input-types (:type %)) (false? (:nullable? %))) columns)))
-    (let [bindings (or (:input-bindings request)
-                       [{:binding-id 0 :values (mapv #(case (:type %) :long 0 :string "" :bigdec 0M
-                                                       :uuid (java.util.UUID. 0 0) :boolean false :bytes (byte-array 0)) columns)}])
+    (require! (and (= :relational (:mode request)) (vector? columns) (seq columns)
+                   (every? #(false? (:nullable? %)) columns)))
+    (let [expressions (mapv input-expression columns (range))
+          bindings (or (:input-bindings request)
+                       [{:binding-id 0 :values
+                         (mapv (fn [{:keys [type shape key-types]}]
+                                 (if (= shape :ref) (ref/entity-ref type (mapv default-input key-types))
+                                     (default-input type))) expressions)}])
           _ (require! (<= 1 (count bindings) 256))
-          names (vec (mapcat (fn [i c] (cond-> [(str "k" i)] (= :bigdec (:type c)) (conj (str "s" i)))) (range) columns))
           params (atom [])
-          rows (mapv (fn [{:keys [values]}]
-                       (require! (= (count columns) (count values)))
-                       (let [valid? (every? true? (map (fn [c x]
-                                                       (and (value/matches-type? (:type c) x)
-                                                            (case (:type c)
-                                                              :string (text-value? x)
-                                                              :bigdec (boolean (plan/comparison-filter "numeric" "x" := x))
-                                                              true))) columns values))
-                             fields (mapcat (fn [c x]
-                                              (swap! params conj (when valid? x))
-                                              (cond-> [(str "?::" (input-types (:type c)))]
-                                                (= :bigdec (:type c)) (conj (str (if valid? (.scale ^BigDecimal x) 0))))) columns values)]
-                         (str "(" (if valid? "TRUE" "FALSE") "," (str/join "," fields) ")"))) bindings)
-          variables (into {} (map-indexed (fn [i c]
-                                            [(:variable c) (cond-> {:sql [(text-column (str "b.k" i) (input-types (:type c)))]
-                                                                   :types [(input-types (:type c))] :type (:type c) :shape :scalar}
-                                                            (= :bigdec (:type c)) (assoc :scales [(str "b.s" i)]))]) columns))]
+          names (mapcat #(cond-> (:input-names %) (:scale-name %) (conj (:scale-name %))) expressions)
+          rows (mapv
+                 (fn [{:keys [values]}]
+                   (require! (= (count values) (count columns)))
+                   (let [valid? (every? true? (map valid-input? columns expressions values))
+                         fields (mapcat
+                                  (fn [{:keys [shape types scale-name key-types]} x]
+                                    (let [xs (if valid? (if (= shape :ref) (ref/key-tuple x) [x])
+                                                 (mapv (constantly nil) key-types))]
+                                      (doseq [x xs] (swap! params conj x))
+                                      (cond-> (mapv #(str "?::" %) types)
+                                        scale-name (conj (str (if valid? (.scale ^BigDecimal x) 0)))))) expressions values)]
+                     (str "(" (if valid? "TRUE" "FALSE") "," (str/join "," fields) ")"))) bindings)]
       {:sql (str "(VALUES " (str/join "," rows) ") AS b(ok," (str/join "," names) ")")
-       :params @params :variables variables})))
+       :params @params
+       :variables (into {} (map (fn [c expr] [(:variable c) (assoc (dissoc expr :input-names :key-types :scale-name) :input? true)]) columns expressions))})))
 
 (defn- window-sql [window outputs output-fields max-row-bytes]
   (let [{:keys [order limit offset]} window
@@ -181,6 +217,28 @@
                  " FROM window_guard AS g WHERE (g.oversized OR g.invalid) AND NOT EXISTS (SELECT 1 FROM selected)")]
     {:sql sql :params [(long limit) (long offset)]}))
 
+(defn- dependent-from
+  "Keep each dependent lookup behind the keys produced by its predecessors.
+  OFFSET 0 is a PostgreSQL planning fence; all original outer checks remain.
+  Edges contain only variable equalities, so moving copies adds no parameters."
+  [tables input edges]
+  (require! input)
+  (loop [pending (vec tables) known #{} out [(:sql input)]]
+    (if (empty? pending) (str/join " CROSS JOIN " out)
+      (let [ready? (fn [{:keys [alias]}]
+                     (some #(and ((:aliases %) alias)
+                                 (every? (conj known alias) (:aliases %))
+                                 (or (:input? %) (seq (filter known (:aliases %))))) edges))
+            table (first (filter ready? pending))]
+        (require! table)
+        (let [{:keys [alias accepted columns]} table
+              available (conj known alias)
+              conditions (map :sql (filter #(and ((:aliases %) alias) (every? available (:aliases %))) edges))
+              sql (str "LATERAL (SELECT " (str/join ", " (map #(str alias "." (jdbc/identifier %)) (sort columns)))
+                       " FROM ONLY " (jdbc/relation (get-in accepted [:requirements :table])) " AS " alias
+                       " WHERE " (conjunction conditions) " OFFSET 0) AS " alias)]
+          (recur (filterv #(not= alias (:alias %)) pending) available (conj out sql)))))))
+
 (defn compile-query
   "Return a parameterized exact plan, or nil for a shape whose semantics have
   not been established. Views are accepted mappings indexed by source alias."
@@ -223,7 +281,12 @@
                             :const (let [[sql params] (literal expr (second term) false)]
                                      (-> state (update :conditions conj sql) (update :params into params)))
                             :var (let [v (second term) before (get-in state [:variables v])
-                                       state (cond-> state before (update :conditions conj (equivalent before expr true)))
+                                       state (if before
+                                               (let [sql (equivalent before expr true)]
+                                                 (-> state (update :conditions conj sql)
+                                                     (update :edges conj {:sql sql
+                                                                          :aliases (into (:aliases expr #{}) (:aliases before))
+                                                                          :input? (boolean (:input? before))}))) state)
                                        state (assoc-in state [:variables v] (or before expr))]
                                    (if (contains? (:bindings request) v)
                                      (let [[sql params] (literal expr (get-in request [:bindings v]) true)]
@@ -275,8 +338,9 @@
           grouping (vec (distinct (mapcat (fn [{:keys [kind variable]}]
                                           (when (= :variable kind) (cond-> (fields variable)
                                                                     (scale-fields variable) (conj (scale-fields variable))))) (:find request))))
-          from (str/join " CROSS JOIN " (cond-> (mapv #(str "ONLY " (jdbc/relation (get-in % [:accepted :requirements :table])) " AS " (:alias %)) tables)
-                                           input (conj (:sql input))))
+          from (if (:dependent-order? request) (dependent-from tables input (:edges state))
+                   (str/join " CROSS JOIN " (cond-> (mapv #(str "ONLY " (jdbc/relation (get-in % [:accepted :requirements :table])) " AS " (:alias %)) tables)
+                                             input (conj (:sql input)))))
           matched (str "SELECT DISTINCT " (str/join ", " distinct-select) " FROM " from " WHERE " (conjunction conditions))
           result (str "SELECT " (str/join ", " (map #(str %1 " AS " %2) output-expressions output-fields))
                       ", " (if aggregate? "bool_or(oversized)" "oversized") " AS oversized, "

@@ -13,6 +13,7 @@
                        datalevin.federation.file-test
                        datalevin.federation.github-test
                        datalevin.federation.postgres-test
+                       datalevin.federation.postgres-job-test
                        datalevin.federation.workflow-test
                        datalevin.federation.local-test
                        datalevin.federation.local-batch-test
