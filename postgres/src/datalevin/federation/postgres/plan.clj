@@ -6,13 +6,70 @@
             [datalevin.federation.postgres.mapping :as pm]
             [datalevin.federation.postgres.temporal :as temporal]
             [datalevin.query.source.value :as value])
-  (:import [datalevin.utl QueryKey]
+  (:import [java.nio.charset StandardCharsets]
+           [datalevin.utl QueryKey]
            [java.sql ResultSet]
            [java.math BigDecimal]
            [java.time Instant LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime]
            [java.time.temporal ChronoUnit]))
 
 (def constraints {:max-binding-rows 256 :max-binding-bytes 2097152 :max-request-binding-rows 256})
+
+(defn dependent-preference
+  "Cheap whole-query policy over a typed join graph. Retain selective text
+  dimension drivers with membership filters or identity-only existence probes.
+  This is a structural heuristic, not a row-count or elapsed-time estimate."
+  [views request]
+  (let [clauses (:clauses request)
+        patterns (filterv #(= :pattern (:kind %)) clauses)
+        group-key #(vector (:source-symbol %) (first (:terms %)))
+        groups (group-by group-key patterns)
+        producers (into {} (keep #(let [[tag v] (nth (:terms %) 2)]
+                                    (when (= :var tag) [v (group-key %)]))) patterns)
+        outgoing (into #{} (keep #(when (get-in (views (:source-symbol %))
+                                               [:attributes (second (second (:terms %))) :reference])
+                                   (group-key %))) patterns)
+        predicates (filterv #(= :predicate (:kind %)) clauses)
+        positive (into #{} (keep #(when (and (= :like (:operator %)) (= :var (ffirst (:args %))))
+                                    (second (first (:args %))))) predicates)
+        selective (into #{} (keep #(let [[[tag v] [kind pattern]] (:args %)]
+                                    (when (and (= :like (:operator %)) (= :var tag) (= :const kind)
+                                               (string? pattern) (<= 4 (count (remove #{\% \_} pattern)))) v))) predicates)
+        probe-drivers (into selective
+                       (keep #(let [[[tag v] [kind pattern]] (:args %)]
+                                (when (and (= :like (:operator %)) (= :var tag) (= :const kind)
+                                           (string? pattern) (seq pattern)
+                                           (not (#{\% \_} (first pattern)))) v))) predicates)
+        drivers (into #{} (comp (keep producers) (remove outgoing)) selective)
+        projected (into #{} (map :variable) (:find request))
+        small? (<= (count groups) 8)]
+    (when (and (<= 3 (count groups)) (seq positive)
+               (every? #(and (= :aggregate (:kind %)) (#{:min :max} (:operator %))) (:find request))
+               (not-any? #(#{:absence :optional} (:kind %)) clauses))
+      (cond
+        (and (some #(let [[[vtag v] [tag xs]] (:args %)]
+                      (and (= :in (:operator %)) (= :const tag)
+                           (= :var vtag) (producers v) (not (outgoing (producers v)))
+                           (or (sequential? xs) (set? xs)) (< 1 (count xs)))) predicates)
+             (or (and small? (some projected selective))
+                 (and (<= (count groups) 12) (<= 2 (count drivers)))))
+        :text-membership-driver
+
+        (and small? (seq probe-drivers))
+        (let [variables (fn [terms] (keep #(when (= :var (first %)) (second %)) terms))
+              uses (frequencies (mapcat #(variables (:terms %)) patterns))
+              live (into (into projected (:with request)) (mapcat #(variables (:args %))) predicates)
+              references (into #{} (keep (fn [{:keys [source-symbol terms]}]
+                                          (when (get-in (views source-symbol) [:attributes (second (second terms)) :reference])
+                                            (nth terms 2)))) patterns)
+              witnesses (filter (fn [[[symbol entity] ps]]
+                                  (let [identity (get-in (views symbol) [:identity :attribute])]
+                                    (and (contains? references entity)
+                                         (not (some live (variables [entity])))
+                                         (every? #(and (= identity (second (second (:terms %))))
+                                                       (every? (fn [v] (and (= 1 (uses v)) (not (live v))))
+                                                               (variables [(nth (:terms %) 2)]))) ps)))) groups)]
+          (when (<= 2 (count witnesses)) :existence-probes))))))
 
 (defn columns [descriptor clauses]
   (reduce
@@ -33,7 +90,12 @@
                       (keep (fn [[entity clauses]]
                               (when (and (not= :ignore (first entity)) (> (count clauses) 1)) clauses)))))
         fused-ids (into #{} (mapcat #(map :id %)) groups)
-        units (into (vec groups) (comp (remove #(contains? fused-ids (:id %))) (map vector)) patterns)
+        ;; Share each group's typed columns across independent and dependent
+        ;; alternatives. Delays preserve the candidate quota's lazy tail.
+        work (mapv (fn [clauses] {:clauses clauses :columns (delay (columns descriptor clauses))})
+                   (concat groups (map vector patterns)))
+        units (filterv #(or (> (count (:clauses %)) 1)
+                            (not (contains? fused-ids (:id (first (:clauses %)))))) work)
         maximum (get request :max-alternatives 32)
         _ (when (> (count units) maximum) (jdbc/fail! :query-source/limit :planning))
         available (into {} (map (juxt :variable identity)) (:available-inputs request))
@@ -48,8 +110,8 @@
               {:id (str (name kind) "-" (:id anchor) "-" (str/join "-" (map :id clauses)))
                :clauses (vec clauses) :anchor anchor :kind kind :position position
                :columns cols :requires required})))
-        for-group (fn [clauses]
-                    (let [cols (columns descriptor clauses)]
+        for-group (fn [{:keys [clauses columns]}]
+                    (let [cols @columns]
                       (concat
                         ;; All clauses in a group have the same entity term.
                         (keep identity [(candidate clauses cols (first clauses) :entity-lookup 0)])
@@ -58,9 +120,10 @@
         ;; These independent accesses partition the patterns, so they remain
         ;; schedulable even when available inputs are only potential producers.
         ;; Coverage in dependent lookups alone could leave a dependency cycle.
-        required (mapv #(candidate % (columns descriptor %) (first %) :attribute-enumeration nil) units)
+        required (mapv (fn [{:keys [clauses columns]}]
+                         (candidate clauses @columns (first clauses) :attribute-enumeration nil)) units)
         required-ids (set (map :id required))
-        candidates (concat (mapcat for-group groups) (mapcat #(for-group [%]) patterns))
+        candidates (mapcat for-group work)
         selected (into required
                        (comp (remove #(contains? required-ids (:id %)))
                              (take (- maximum (count required)))) candidates)
@@ -99,6 +162,15 @@
     (cond
       (and (#{"int2" "int4" "int8"} type) (int? x))
       [(str column " " (operators operator) " ?::int8") [x]]
+
+      ;; ASCII cutoffs agree with Java UTF-16 ordering for every row: any
+      ;; non-ASCII first differing character sorts after the cutoff in both.
+      ;; Equality keeps its existing native-index prefilter and core recheck.
+      (and (#{"text" "varchar"} type) (#{:< :<= :> :>=} operator)
+           (string? x) (not (str/includes? x "\u0000"))
+           (.canEncode (.newEncoder StandardCharsets/UTF_8) ^String x)
+           (every? #(<= (int %) 127) x))
+      [(str "(" column ") COLLATE pg_catalog.\"C\" " (operators operator) " ?::text") [x]]
 
       (and (= type "numeric") (instance? BigDecimal x)
            (<= (- (.precision ^BigDecimal x) (.scale ^BigDecimal x)) 131072)
@@ -199,6 +271,16 @@
       [(str column " COLLATE pg_catalog.\"C\" " (if (= :like operator) "LIKE" "NOT LIKE")
             " ?::text ESCAPE '!'") [pattern]])))
 
+(defn like-any-filter
+  "Advisory OR of fully admitted LIKE patterns. Decline the entire union when
+  any branch is unsupported; pushing only some branches could lose matches."
+  [type column patterns]
+  (when (and (vector? patterns) (<= 1 (count patterns) 32))
+    (let [filters (mapv #(like-filter type column :like %) patterns)]
+      (when (every? some? filters)
+        [(str "(" (str/join " OR " (map #(str "(" (first %) ")") filters)) ")")
+         (vec (mapcat second filters))]))))
+
 (defn predicates
   "Push matching scalar comparisons and supported LIKE calls as prefilters.
   Unsupported types and comparisons remain core residuals."
@@ -210,14 +292,17 @@
                                   [v (first cs)]))) (:clauses candidate)))]
     (vec (keep (fn [{:keys [kind operator args] :as predicate}]
                  (when (and (= kind :predicate) (= 2 (count args)))
-                   (let [[a b] args like? (#{:like :not-like} operator)
+                   (let [[a b] args like? (#{:like :not-like :like-any} operator)
                          [a b op] (if (and (not like?) (= :const (first a)))
                                     [b a (reverse-operator operator)] [a b operator])
                          [tag v] a [ctag x] b column (vars v)]
                      (when (and (= :var tag) column (= :const ctag))
-                       (when-let [filter ((if like? like-filter comparison-filter)
+                       (when-let [filter (if (= op :like-any)
+                                         (like-any-filter (pm/storage-type (get-in accepted [:requirements :columns column]))
+                                                          (column-sql column) x)
+                                         ((if like? like-filter comparison-filter)
                                           (pm/storage-type (get-in accepted [:requirements :columns column]))
-                                          (column-sql column) op x)]
+                                          (column-sql column) op x))]
                          (assoc predicate :column column :filter filter)))))) (:clauses request)))))
 
 (defn estimate-sql
@@ -423,7 +508,14 @@
         needed (into needed (map :variable) (:requires candidate))]
     (update candidate :columns #(filterv (comp needed :variable) %))))
 
-(defn match-row [accepted plan bindings row]
+(defn- reference-value [type make-reference term bindings values]
+  (let [[bound? x] (operand bindings term)]
+    (if bound?
+      (if (and (ref/entity-ref? x) (value/matches-type? type x)
+               (QueryKey/equals (ref/key-tuple x) values)) x ::mismatch)
+      (if make-reference (make-reference values) (ref/entity-ref type values)))))
+
+(defn- match-row* [accepted plan bindings row entity-reference references]
   (let [keys (mapv row (pm/key-columns accepted))
         observed (into (set (clojure.core/keys bindings)) (map :variable) (:columns plan))
         observed (into observed (keep (fn [clause]
@@ -431,8 +523,10 @@
         entity (when (some (fn [clause]
                             (let [[tag x] (first (:terms clause))]
                               (or (= :const tag) (and (= :var tag) (observed x))))) (:clauses plan))
-                 (ref/entity-ref (get-in accepted [:identity :type]) keys))
+                 (reference-value (get-in accepted [:identity :type]) entity-reference
+                                  (first (:terms (first (:clauses plan)))) bindings keys))
         matched
+        (when-not (= ::mismatch entity)
         (reduce
           (fn [bound clause]
             (let [[entity-term _ term] (:terms clause)
@@ -445,10 +539,32 @@
                       (do
                         (when (some #{::oversized} raw) (jdbc/fail! :query-source/limit :decode))
                         (let [x (if-let [type (get-in accepted [:attributes attribute :reference :type])]
-                                  (ref/entity-ref type raw) (if (= 1 (count raw)) (first raw) raw))]
-                          (match-term bound term x))))))))) bindings (:clauses plan))]
+                                  (reference-value type (references attribute) term bound raw)
+                                  (if (= 1 (count raw)) (first raw) raw))]
+                          (when-not (= ::mismatch x) (match-term bound term x)))))))))) bindings (:clauses plan)))]
     (when matched
       (when-let [sizes (::sizes (meta row))]
         (when (> (reduce + 0 (map sizes (value-columns accepted plan))) (::max-row-bytes (meta row)))
           (jdbc/fail! :query-source/limit :decode)))
       (mapv matched (map :variable (:columns plan))))))
+
+(defn row-matcher
+  "Prepare immutable reference metadata once per cursor. Bound nominal keys
+  are checked against physical keys and reuse the already owned reference."
+  [accepted plan]
+  (let [known (into (set (keys (:bindings plan))) (map :variable) (:requires plan))
+        observed (into (into known (map :variable) (:columns plan))
+                       (keep (fn [clause] (let [[tag v] (nth (:terms clause) 2)] (when (= :var tag) v)))) (:clauses plan))
+        [tag e] (first (:terms (first (:clauses plan))))
+        entity-reference (when (and (= :var tag) (observed e) (not (known e)))
+                           (ref/reference-constructor (get-in accepted [:identity :type])))
+        references (into {} (keep (fn [clause]
+                                    (let [attribute (second (second (:terms clause)))
+                                          [tag v] (nth (:terms clause) 2)]
+                                      (when-let [type (and (= :var tag) (not (known v))
+                                                          (get-in accepted [:attributes attribute :reference :type]))]
+                                        [attribute (ref/reference-constructor type)])))) (:clauses plan))]
+    (fn [bindings row] (match-row* accepted plan bindings row entity-reference references))))
+
+(defn match-row [accepted plan bindings row]
+  ((row-matcher accepted plan) bindings row))

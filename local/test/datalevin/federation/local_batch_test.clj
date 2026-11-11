@@ -361,18 +361,18 @@
 
 (deftest cancellation-inside-owned-copy-releases-the-batch-reservation
   (let [on-compare (atom nil) comparisons (atom [])
-        values (into (sorted-set)
-                     (map #(MeasuredLeaf. % 64 (atom nil) on-compare)) (range 8))]
+        values (into (sorted-map)
+                     (map #(vector (MeasuredLeaf. % 64 (atom nil) on-compare) (Date. %))) (range 8))]
     (with-cursor data-descriptor [[1 values]] terms {} {}
       (fn [{:keys [control cursor] :as fixture}]
         (let [baseline (control/usage control)]
-          ;; Default sorted-set copying calls its elements' natural comparison.
-          ;; Cancel on the first comparison, after the output has been reserved.
+          ;; Copying each mutable date updates its sorted-map entry, invoking
+          ;; the key's natural comparison after the output has been reserved.
           (reset! on-compare #(do (swap! comparisons conj %)
                                  (control/cancel! control {:error :query-source/cancelled :phase :fetch})))
           (is (= :query-source/cancelled (category #(fetch! fixture 1 100000))))
-          ;; One set insertion can compare twice; no later element is copied.
-          (is (= 1 (count (set @comparisons))))
+          ;; A tree update can compare several keys before checking active.
+          (is (seq @comparisons))
           (is (zero? (:rows (spi/-cursor-metrics cursor))))
           (is (= baseline (control/usage control))))))))
 

@@ -29,8 +29,7 @@
 
 (defn- restricted? [catalog] (or (:row-security? catalog) (#{"v" "m"} (:kind catalog))))
 
-(defn accept
-  "Accept a catalog capture and explicit attribute/identity declarations."
+(defn- accepted-mapping
   [catalog {:keys [relation-id source-instance-id identity-attribute attributes]
             :as declaration}]
   (ensure! (and (every? #{:relation-id :source-instance-id :identity-attribute :attributes :identity-version :key-columns}
@@ -99,11 +98,17 @@
                   :dependencies {:provider {:name :postgres :version 1} :conversion-version 1
                                  :identity-version (get declaration :identity-version 0)}}]
     (ensure! (<= (count used) 128) :mapping)
+    accepted))
+
+(defn accept
+  "Accept a catalog capture and explicit attribute/identity declarations."
+  [catalog declaration]
+  (let [accepted (accepted-mapping catalog declaration)]
     (mapping/compile-logical-mapping accepted)
     accepted))
 
 (defn compiled! [accepted]
-  (let [canonical (accept (:requirements accepted)
+  (let [canonical (accepted-mapping (:requirements accepted)
                     (cond-> {:relation-id (:relation-id accepted) :source-instance-id (:source-instance-id accepted)
                      :identity-attribute (get-in accepted [:identity :attribute])
                      :identity-version (get-in accepted [:dependencies :identity-version])

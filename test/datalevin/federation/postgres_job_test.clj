@@ -24,7 +24,8 @@
 (deftest benchmark-configuration-stays-explicit
   (is (= :6a (:query (job/options! {}))))
   (doseq [options [{:query :unknown} {:samples 0} {:timeout-ms -1}
-                   {:jdbc-url "secret"} {:limits {:made-up 1}} {:limits {:external-requests 0}}]]
+                   {:jdbc-url "secret"} {:limits {:made-up 1}} {:limits {:external-requests 0}} {:limits nil}
+                   {:max-row-bytes 0} {:max-row-bytes 1048577}]]
     (is (thrown? clojure.lang.ExceptionInfo (job/options! options))))
   (is (= 8192 (get-in (job/options! {:limits {:external-requests 8192}}) [:limits :external-requests]))))
 

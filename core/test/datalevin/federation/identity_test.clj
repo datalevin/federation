@@ -49,6 +49,28 @@
     (is (= "#<EntityRef>" (str x)))
     (is (<= 64 (value/-retained-bytes x)))))
 
+(deftest prepared-reference-constructors-preserve-wire-identity-and-key-ownership
+  (let [type (type-for [:bytes :instant]) make-reference (ref/reference-constructor type)
+        bytes (byte-array [1 2 3]) date (Date. 42)
+        a (make-reference [bytes date]) b (make-reference [(byte-array [1 2 3]) (Date. 42)])]
+    (is (= a b))
+    (is (= (hash a) (hash b)))
+    (is (Arrays/equals (ref/encode a) (ref/encode b)))
+    (is (identical? (value/-logical-type a) (value/-logical-type b)))
+    (aset-byte bytes 0 (byte 9))
+    (.setTime date 99)
+    (is (= a b))
+    (is (= a (ref/decode (ref/encode a))))
+    (doseq [key [[nil (Date. 42)] [(byte-array [1])] ["wrong" (Date. 42)]]]
+      (is (thrown? clojure.lang.ExceptionInfo (make-reference key)))))
+  (let [type (type-for [:long]) make-reference (ref/reference-constructor type)]
+    (doseq [n (range 100)]
+      (is (= (ref/entity-ref type [n]) (make-reference [n])))))
+  (doseq [limits [(assoc ref/codec-limits :max-bytes 20)
+                 (assoc ref/codec-limits :max-depth 2)
+                 (assoc ref/codec-limits :max-nodes 2)]]
+    (is (thrown? clojure.lang.ExceptionInfo ((ref/reference-constructor (type-for [:long]) limits) [1])))))
+
 (deftest descriptor-equivalence-hash-and-order-laws
   (doseq [[a b] [[1 1N] [1M 1.00M] [(float 1.1) (double (float 1.1))]
                  [0.0 -0.0] [[1 2] '(1 2)]

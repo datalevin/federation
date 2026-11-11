@@ -24,12 +24,39 @@ bindings. Fresh cardinalities rank accesses, and bounded lookahead compares
 complete join paths and their expected fan-out. PostgreSQL supplies catalog
 counts and cost-budgeted filtered estimates. Same-entity fusion combines
 attribute patterns into one table access; dependent filtered joins can combine
-two accepted mappings. Elapsed-time and transfer-cost ranking remain planned.
+two accepted mappings. Complete paths with fresh time estimates also price
+batched cursor opens, request latency, and local row/column processing. Missing
+time estimates retain cardinality ranking; transfer-byte and index-aware
+backend execution costs remain further work.
 You can inspect the plan and execution metrics with `d/explain`.
 
 **Status:** federation adapters are development snapshots (`0.1.0-SNAPSHOT`).
 The PostgreSQL adapter has verified full-data JOB 6d and 17c wins; see its
 [benchmark results and methodology](postgres/README.md#planning-bounds-and-follow-up-priorities).
+The [latest full 113-query pass](doc/measurements/postgres-job-full113-post-fragments-2026-11-10.md)
+completes and verifies every original aggregate answer. Total adapter client
+time is **155.82 seconds versus native's 166.38 seconds**, 6.3% less in this
+single sample without warmups. Complete projected tuple sets verify for 107
+queries; six additional tuple checks exceed the unchanged 64 MiB result limit.
+There are no aggregate execution failures or result mismatches. Native timings
+vary between passes, so this is an observed advantage rather than a repeated
+full-suite win. Adapter time also rises from 140.28 s in the preceding pass;
+the report preserves the regressions and native timing variation. The
+[targeted follow-up](doc/measurements/postgres-job-31b-7c-17f-2026-11-10.md)
+explains the repaired 7c/17f failures and 31b's improved plan choice.
+Automatic SQL delegation preserves
+selective dependent plans; see the
+[single-SQL implementation report](doc/measurements/postgres-job-single-sql-2026-11-10.md).
+Independent minima over nullable columns now
+support [JOB 1a](doc/measurements/postgres-job-nullable-min-summary-2026-11-10.edn),
+with all three minima and 116 output tuples verified.
+A [planning optimization comparison](doc/measurements/postgres-job-cheap-planning-2026-11-10.md)
+reduces total adapter time for an eight-query cohort from 4.79 s to 1.67 s;
+1a/1b/1c run within about 4–9% of native in that separately measured cohort.
+A [fragment execution comparison](doc/measurements/postgres-job-fragment-work-2026-11-10.md)
+measures prepared reference decoders, narrower dependent boundaries, and fewer
+intermediate copies. It is a separate selected-query measurement; the full-suite
+rerun above includes these changes.
 Datalevin **1.2.8** introduced the query-source SPI. PostgreSQL's current
 pushdown paths require the matching **1.2.10** build with relational SPI support.
 
@@ -168,8 +195,10 @@ issue number, local priority, and current GitHub title.
 Mappings define which fields become attributes, their types, and their entity
 identities. Missing optional values contribute no facts. Collection attributes
 such as labels contribute one fact per distinct value. You can use these facts
-in joins, aggregates, and supported Datalog rules. Ordinary tuple inputs still
-work through `:in`.
+in joins, aggregates, and supported Datalog rules. Bound `not` and `not-join`
+fact bodies check attribute absence over external sources; see the
+[absence example](postgres/README.md#identity-types-and-absence). Ordinary tuple
+inputs still work through `:in`.
 
 See the [GitHub guide](github/README.md) for all supported attributes and the
 [file guide](file/README.md) for a complete export-mapping example.

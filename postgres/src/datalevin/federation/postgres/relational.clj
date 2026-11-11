@@ -21,6 +21,7 @@
   (let [types (mapv #(pm/storage-type (get-in accepted [:requirements :columns %])) columns)]
     (require! (every? #{"int2" "int4" "int8" "bool" "uuid" "text" "varchar" "bytea" "numeric" "timestamptz"} types))
     {:sql (mapv #(text-column (str alias "." (jdbc/identifier %1)) %2) columns types)
+     :raw-sql (mapv #(str alias "." (jdbc/identifier %)) columns)
      :types types :type type :shape shape :aliases #{alias}
      :modifier (when (= 1 (count columns)) (get-in accepted [:requirements :columns (first columns) :modifier]))}))
 
@@ -54,7 +55,22 @@
       [(conjunction (map first filters)) (vec (mapcat second filters))])))
 
 (defn- predicate-filter [variables {:keys [operator args]}]
-  (if (#{:in :not-in} operator)
+  (cond
+    (= :like-any operator)
+    (let [[[tag v] [other patterns]] args expr (variables v)]
+      (require! (and (= 2 (count args)) (= tag :var) (= other :const)
+                     (= :scalar (:shape expr)) (= 1 (count (:sql expr)))))
+      (or (plan/like-any-filter (first (:types expr)) (str "(" (first (:sql expr)) ")") patterns)
+          (unsupported!)))
+
+    (#{:like :not-like} operator)
+    (let [[[tag v] [other pattern]] args expr (variables v)]
+      (require! (and (= 2 (count args)) (= tag :var) (= other :const)
+                     (= :scalar (:shape expr)) (= 1 (count (:sql expr)))))
+      (or (plan/like-filter (first (:types expr)) (str "(" (first (:sql expr)) ")") operator pattern)
+          (unsupported!)))
+
+    (#{:in :not-in} operator)
     (let [[[tag v] [other xs]] args expr (variables v)]
       (require! (and (= tag :var) (= other :const) (= :scalar (:shape expr))
                      (#{"text" "varchar"} (first (:types expr)))
@@ -64,6 +80,7 @@
         [(if (empty? xs) (if (= operator :in) "FALSE" "TRUE")
              (str (first (:sql expr)) (if (= operator :in) " IN (" " NOT IN (")
                   (str/join "," (repeat (count xs) "?::text")) ")")) xs]))
+  :else
   (let [[a b] args
         [a b operator] (if (= :const (first a)) [b a (plan/reverse-operator operator)] [a b operator])
         expr (variables (second a))]
@@ -83,6 +100,21 @@
                             (every? #{"int2" "int4" "int8" "numeric" "timestamptz"}
                                     (concat (:types expr) (:types other)))))
               [(str (first (:sql expr)) " " (plan/operators operator) " " (first (:sql other))) []])))))))
+
+(defn- condition-filter [variables clause]
+  (let [remaining (volatile! 128)]
+    (letfn [(emit [{:keys [kind operator clauses] :as clause} depth]
+              (require! (and (<= depth 16) (not (neg? (vswap! remaining dec)))))
+              (if (= :boolean kind)
+                (do (require! (and (#{:and :or} operator) (vector? clauses)
+                                   (<= (count clauses) (if (= :or operator) 32 128))))
+                    (let [filters (mapv #(emit % (inc depth)) clauses)]
+                      [(if (empty? filters) (if (= :and operator) "TRUE" "FALSE")
+                         (str/join (if (= :and operator) " AND " " OR ")
+                                   (map #(str "(" (first %) ")") filters)))
+                       (vec (mapcat second filters))]))
+                (do (require! (= :predicate kind)) (predicate-filter variables clause))))]
+      (emit clause 0))))
 
 (defn- nonnegative? [variable predicates]
   (some (fn [{:keys [operator args]}]
@@ -106,7 +138,8 @@
                 :types [(if (= type "numeric") "numeric" "int8")] :shape :scalar :type :data})
       (:min :max)
       (do (require! (and (= 1 (count fields))
-                        (or (#{"int2" "int4" "int8" "timestamptz"} type)
+                        (or (and (:native-extremum? expr) (#{"text" "varchar"} type))
+                            (#{"int2" "int4" "int8" "timestamptz"} type)
                             (and (= type "numeric") (integer? (:modifier expr))
                                  (not (neg? (long (:modifier expr))))))))
           {:sql [(str (name operator) "(" field ")")] :types [type] :shape :scalar :type :data})
@@ -249,32 +282,54 @@
                    (= (count views) (count (:sources request)))
                    (= (set (keys views)) (set (map :symbol (:sources request))))))
     (let [input (input-relation request)
-          patterns (filterv #(= :pattern (:kind %)) (:clauses request))
+          required-patterns (filterv #(= :pattern (:kind %)) (:clauses request))
+          optional-patterns (filterv #(= :optional (:kind %)) (:clauses request))
+          patterns (into required-patterns optional-patterns)
           _ (require! (<= 1 (count patterns) 32))
           _ (require! (and (every? #(and (integer? (:id %)) (not (neg? (:id %)))) patterns)
                            (= (count patterns) (count (set (map :id patterns))))))
-          predicates (filterv #(= :predicate (:kind %)) (:clauses request))
-          _ (require! (= (count (:clauses request)) (+ (count patterns) (count predicates))))
+          predicates (filterv #(#{:predicate :boolean} (:kind %)) (:clauses request))
+          absences (filterv #(= :absence (:kind %)) (:clauses request))
+          _ (require! (= (count (:clauses request)) (+ (count patterns) (count predicates) (count absences))))
+          native-specs (:datalevin.query.source/native-extrema request)
+          source-order (zipmap (map :symbol (:sources request)) (range))
           state
           (reduce
-            (fn [{:keys [tables] :as state} {:keys [id source-symbol terms]}]
-              (let [[entity [_ attribute] val] terms accepted (views source-symbol)
+            (fn [{:keys [tables] :as state} {:keys [id kind source-symbol terms]}]
+              (let [optional? (= :optional kind)
+                    [entity [_ attribute] val] terms accepted (views source-symbol)
                     _ (require! (and accepted (= :const (first (second terms))) (= 3 (count terms))))
                     key [source-symbol (if (= :ignore (first entity)) [:occurrence id] entity)]
                     alias (or (get-in tables [key :alias]) (str "r" (count tables)))
                     columns (pm/attribute-columns accepted attribute)
-                    _ (require! (seq columns))
+                    _ (require! (and (seq columns)
+                                     (or (not optional?)
+                                         (and (contains? tables key) (= 1 (count columns))
+                                              (= :var (first val))
+                                              (nil? (get-in accepted [:attributes attribute :reference]))))))
                     attribute-type (if (= attribute (get-in accepted [:identity :attribute]))
                                      (if (= 1 (count columns)) (pm/types (get-in accepted [:requirements :columns (first columns) :type])) :data)
                                      (or (get-in accepted [:attributes attribute :reference :type])
                                          (get-in accepted [:attributes attribute :type])))
                     expressions [(expression accepted alias (pm/key-columns accepted) (get-in accepted [:identity :type]) :ref)
-                                 (expression accepted alias columns attribute-type
-                                   (cond (= :custom (:kind attribute-type)) :ref (> (count columns) 1) :tuple :else :scalar))]
-                    table {:alias alias :accepted accepted
+                                 (assoc (expression accepted alias columns attribute-type
+                                          (cond (= :custom (:kind attribute-type)) :ref (> (count columns) 1) :tuple :else :scalar))
+                                        :nullable? optional?)]
+                    table {:alias alias
+                           :ordinal (get-in tables [key :ordinal] [(source-order source-symbol) (count tables)])
+                           :accepted accepted
                            :columns (into (get-in tables [key :columns] #{}) (concat (pm/key-columns accepted) columns))}
-                    state (-> state (assoc-in [:tables key] table)
-                              (update :conditions into (map #(str alias "." (jdbc/identifier %) " IS NOT NULL") columns)))]
+                    native-spec (when (= :var (first val)) (get native-specs (second val)))
+                    state (if (and native-spec (= source-symbol (:source native-spec))
+                                   (= attribute (:attribute native-spec)))
+                            (do (require! (and (= 1 (count columns))
+                                                (#{"text" "varchar"} (first (:types (second expressions))))))
+                                (assoc-in state [:native-expressions (second val)]
+                                  {:sql (:raw-sql (second expressions))
+                                   :collation (get-in accepted [:requirements :columns (first columns) :collation])})) state)
+                    state (cond-> (assoc-in state [:tables key] table)
+                            (not optional?)
+                            (update :conditions into (map #(str alias "." (jdbc/identifier %) " IS NOT NULL") columns)))]
                 (reduce (fn [state [term expr]]
                           (case (first term)
                             :ignore state
@@ -293,22 +348,49 @@
                                        (-> state (update :conditions conj sql) (update :params into params))) state))
                             (unsupported!))) state (map vector [entity val] expressions))))
             {:tables (array-map) :variables (:variables input {}) :conditions (if input ["b.ok"] []) :params (:params input [])} patterns)
+          state
+          (reduce (fn [state {:keys [source-symbol terms]}]
+                    (let [[entity [tag attribute] val] terms
+                          key [source-symbol entity]
+                          {:keys [alias accepted]} (get-in state [:tables key])
+                          columns (when accepted (pm/attribute-columns accepted attribute))]
+                      ;; Scalar NULL is precisely the accepted mapping's absent fact.
+                      ;; Composite mappings remain with the complete core lookup.
+                      (require! (and alias (= :const tag) (= [:ignore] val)
+                                     (= 3 (count terms)) (= 1 (count columns))))
+                      (-> state
+                          (update-in [:tables key :columns] into columns)
+                          (update :conditions conj (str alias "." (jdbc/identifier (first columns)) " IS NULL")))))
+                  state absences)
           variables (:variables state)
-          filters (mapv #(predicate-filter variables %) predicates)
+          _ (doseq [{:keys [kind variable operator]} (:find request)
+                    :when (and (= :aggregate kind) (:nullable? (variables variable)))]
+              (require! (and (#{:min :max} operator)
+                             (contains? (:datalevin.query.source/ignore-nil-extrema request) variable))))
+          native-expressions (get state :native-expressions {})
+          _ (require! (every? #(contains? native-expressions %) (keys native-specs)))
+          filters (mapv #(condition-filter variables %) predicates)
           conditions (into (:conditions state) (map first filters))
           params (into (:params state) (mapcat second) filters)
           _ (require! (<= (count params) 65535))
-          tables (sort-by :alias (vals (:tables state)))
+          ;; Preserve declaration order beyond ten aliases: lexical r10/r2
+          ;; ordering changes PostgreSQL's bounded join search and GEQO input.
+          tables (sort-by :ordinal (vals (:tables state)))
           columns (mapcat (fn [{:keys [alias accepted columns]}]
                             (map #(vector (str alias "." (jdbc/identifier %))
                                           (get-in accepted [:requirements :columns % :type])) columns)) tables)
           ;; Backend-only intermediate values do not consume the wire row cap.
           oversized "FALSE"
-          invalid (str/join " OR " (cons "FALSE"
+          collation-guards (map (fn [{:keys [collation]}]
+                                  (require! (and (integer? collation) (pos? collation)))
+                                  (str "NOT COALESCE((SELECT collisdeterministic FROM pg_catalog.pg_collation WHERE oid="
+                                       collation "::oid), FALSE)")) (vals native-expressions))
+          invalid (str/join " OR " (concat collation-guards (cons "FALSE"
                                     (keep (fn [[sql type]]
                                             (case type
                                               "numeric" (str sql "::text IN ('NaN','Infinity','-Infinity')")
-                                              "timestamptz" (str "NOT isfinite(" sql ")") nil)) columns)))
+                                              "timestamptz" (str "NOT isfinite(" sql ")") nil)) columns))))
+          invalid (str "COALESCE((" invalid "),FALSE)")
           bad (str "(" oversized ") OR (" invalid ")")
           used (vec (distinct (concat (map :variable (:find request)) (:with request))))
           _ (require! (every? variables used))
@@ -317,20 +399,22 @@
           distinct-select (concat
                             (mapcat (fn [v]
                                       (map #(str "CASE WHEN " bad " THEN NULL ELSE " %1 " END AS " %2)
-                                           (:sql (variables v)) (fields v))) used)
+                                           (or (:sql (native-expressions v)) (:sql (variables v))) (fields v))) used)
                             (map (fn [[v name]] (str "CASE WHEN " bad " THEN NULL ELSE "
                                                    (or (first (:scales (variables v))) (str "scale(" (first (:sql (variables v))) ")")) " END AS " name)) scale-fields)
                             [(str "(" oversized ") AS oversized") (str "(" invalid ") AS invalid")])
           aggregate? (some #(= :aggregate (:kind %)) (:find request))
           outputs (mapv (fn [{:keys [kind variable] :as find}]
                           (if (= kind :variable) (assoc (variables variable) :sql (fields variable))
-                              (aggregate find (variables variable) (fields variable) predicates))) (:find request))
+                              (aggregate find (cond-> (variables variable) (contains? native-expressions variable)
+                                                          (assoc :native-extremum? true)) (fields variable) predicates))) (:find request))
           _ (require! (and (vector? (:columns request)) (= (count outputs) (count (:columns request)))
                            (every? true?
                              (map (fn [find output column]
                                     (and (= (:type column) (if (= :variable (:kind find)) (:type output)
                                                                (if (#{:count :count-distinct} (:operator find)) :long :data)))
-                                         (= (:nullable? column) (boolean (#{:min :max} (:operator find))))))
+                                         (= (:nullable? column) (boolean (or (#{:min :max} (:operator find))
+                                                                           (and (= :variable (:kind find)) (:nullable? output)))))))
                                   (:find request) outputs (:columns request)))))
           output-fields (mapv #(str "o" %) (range (reduce + (map #(count (:sql %)) outputs))))
           _ (require! (<= (count output-fields) 128))
@@ -339,9 +423,17 @@
                                           (when (= :variable kind) (cond-> (fields variable)
                                                                     (scale-fields variable) (conj (scale-fields variable))))) (:find request))))
           from (if (:dependent-order? request) (dependent-from tables input (:edges state))
-                   (str/join " CROSS JOIN " (cond-> (mapv #(str "ONLY " (jdbc/relation (get-in % [:accepted :requirements :table])) " AS " (:alias %)) tables)
+                   ;; Leave the full graph to PostgreSQL's join search. A CROSS
+                   ;; JOIN tree can constrain graphs above join_collapse_limit.
+                   (str/join ", " (cond-> (mapv #(str "ONLY " (jdbc/relation (get-in % [:accepted :requirements :table])) " AS " (:alias %)) tables)
                                              input (conj (:sql input)))))
-          matched (str "SELECT DISTINCT " (str/join ", " distinct-select) " FROM " from " WHERE " (conjunction conditions))
+          ;; MIN/MAX and the validation flags are insensitive to duplicates.
+          ;; Let PostgreSQL aggregate the join directly instead of building a
+          ;; distinct intermediate relation. Other reducers keep Datalog's
+          ;; distinct find/with witness semantics.
+          extrema-only? (every? #(and (= :aggregate (:kind %)) (#{:min :max} (:operator %))) (:find request))
+          matched (str "SELECT " (when-not extrema-only? "DISTINCT ")
+                       (str/join ", " distinct-select) " FROM " from " WHERE " (conjunction conditions))
           result (str "SELECT " (str/join ", " (map #(str %1 " AS " %2) output-expressions output-fields))
                       ", " (if aggregate? "bool_or(oversized)" "oversized") " AS oversized, "
                       (if aggregate? "bool_or(invalid)" "invalid") " AS invalid FROM matched"
@@ -356,7 +448,8 @@
                    (str " SELECT " too-large ", invalid, "
                         (str/join ", " (map #(str "CASE WHEN " safe " THEN " % " END") output-fields)) " FROM result")))
        :params (into params (:params window)) :layout (mapv #(dissoc % :sql :modifier) outputs) :columns (:columns request)
-       :physical-columns (count output-fields)})
+       :physical-columns (count output-fields)
+       :max-rows (when (and aggregate? (empty? grouping) (nil? window)) 1)})
     (catch clojure.lang.ExceptionInfo e (if (::unsupported (ex-data e)) nil (throw e)))))
 
 (defn compile-fragment [views request max-row-bytes]
@@ -367,14 +460,23 @@
   (when (and (= :relational-window (:mode request)) (:window request) (not (:inputs request)))
     (compile-query views (assoc request :mode :relational) max-row-bytes)))
 
-(defn read-row [query ^ResultSet rs]
+(defn row-reader
+  "Prepare cursor-local decoders. Constructors are runtime state and never
+  enter the portable SQL plan or its captured metadata."
+  [query]
+  (let [layout (mapv (fn [column]
+                       (cond-> column (= :ref (:shape column))
+                         (assoc ::reference (ref/reference-constructor (:type column))))) (:layout query))]
+  (fn [^ResultSet rs]
   (when (.getBoolean rs 1) (jdbc/fail! :query-source/limit :decode))
   (when (.getBoolean rs 2) (jdbc/fail! :query-source/invalid :decode))
   (first
-    (reduce (fn [[out index] {:keys [shape type types count?]}]
+    (reduce (fn [[out index] {:keys [shape types count?] :as column}]
               (let [values (mapv #(plan/decode-value %1 rs %2) types (range index (+ index (count types))))
-                    x (case shape :ref (ref/entity-ref type values) :tuple values :scalar (first values))
+                    x (case shape :ref ((::reference column) values) :tuple values :scalar (first values))
                     ;; clojure.core/count returns a boxed Integer for ordinary
                     ;; collections. Preserve that representation in return maps.
                     x (if (and count? (<= (long x) Integer/MAX_VALUE)) (int x) x)]
-                [(conj out x) (+ index (count types))])) [[] 3] (:layout query))))
+                [(conj out x) (+ index (count types))])) [[] 3] layout)))))
+
+(defn read-row [query rs] ((row-reader query) rs))

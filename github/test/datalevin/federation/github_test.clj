@@ -405,3 +405,15 @@
         (is (released? ctl))
         (is (zero? (:live-sessions (github/statistics provider))))
         (control/close! ctl)))))
+
+(deftest empty-api-collections-can-be-tested-for-absence
+  (with-api
+    (fn [api]
+      (let [provider (source api)
+            q (query '[?number] '[$g [?number ...]]
+                     '[[$g ?e :github.issue/number ?number]
+                       (not-join [?e] [$g ?e :github.issue/assignee ?person])])]
+        (is (= #{[2]} (d/q q provider [1 2])))
+        (is (= (d/q (dissoc q :query-source) (input-facts) [1 2])
+               (d/q q provider [1 2])))
+        (is (zero? (:live-sessions (github/statistics provider))))))))

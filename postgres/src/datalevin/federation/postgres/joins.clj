@@ -65,7 +65,14 @@
                :find (mapv #(hash-map :kind :variable :variable (:variable %)) query-columns)}
         accepted (into {} (map (fn [[alias view]] [alias (:accepted view)]))
                        (select-keys views (map :source-symbol patterns)))]
-    (when (and required (or existence? (seq predicates)
+    ;; Compound text predicates need whole-query costing. Retain the existing
+    ;; joined alternatives until their correlated fan-out can be estimated.
+    (when (and required
+               (not-any? (fn [predicate]
+                           (or (#{:like :not-like :like-any} (:operator predicate))
+                               (and (#{:< :<= :> :>=} (:operator predicate))
+                                    (some #(= :string (:type (get types %))) (contract/variables predicate))))) predicates)
+               (or existence? (seq predicates)
                             (some #(= :const (first (nth (:terms %) 2))) patterns)))
       (when-let [compiled (relational/compile-fragment accepted query maximum-row-bytes)]
         (merge (select-keys request [:source-symbol :region-id :scope-id])

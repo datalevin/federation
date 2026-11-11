@@ -210,3 +210,12 @@
     (is (= 3 (d/q '[:find (count ?v) . :with ?id :in $s :where [$s ?id :row/value ?v]] source)))
     (let [q {:find '[?id] :in '[$s] :where [['$s '?id :row/value (value/owned-copy a)]]}]
       (is (= #{[1] [2]} (d/q q source))))))
+
+(deftest bound-absence-keeps-missing-entities-and-private-locals
+  (let [rows [[1 "present"] [2 nil] [3 ""]]
+        provider (pair-source descriptor rows)
+        q '[:find ?e ?private :in $s [[?e ?private]]
+            :where (not-join [?e] [$s ?e :row/value ?private])]
+        inputs [[1 :outer] [2 :outer] [2 :outer] [3 :outer] [999 :missing]]]
+    (is (= #{[2 :outer] [999 :missing]}
+           (d/q q (row-facts rows) inputs) (d/q q provider inputs)))))

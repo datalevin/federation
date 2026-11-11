@@ -113,3 +113,26 @@
             :provenance {:kind :statistics :id "postgres-explain-filtered-cardinality-v1"
                          :observed-at-ms (:observed-at-ms filtered) :valid-for-ms nil})
      (catalog-estimate accepted candidate statistics))))
+
+(defn with-request-cost
+  "Add a low-confidence transport model without planning I/O. The observed
+  metadata-request elapsed time is a latency proxy, not a backend cost unit.
+  Three fixed trips cover declare, terminal fetch, and close; remaining pages
+  are amortized over returned rows. Core prices distinct-key batching and its
+  own local work separately. Unknown cardinality/latency stays unknown."
+  [estimate dependent? request-ns fetch-size]
+  (let [rows (get estimate (if dependent? :rows-per-binding :rows))]
+    (if (and (finite? rows) (not (neg? rows)) (finite? request-ns) (pos? request-ns))
+      (let [pages (/ (double rows) (double fetch-size))
+            fixed 3.0
+            bounded #(min Double/MAX_VALUE (double %))]
+        (-> estimate
+            (assoc :startup-ns (bounded (* fixed request-ns))
+                   (if dependent? :per-binding-ns :run-ns) (bounded (* pages request-ns))
+                   :requests-per-open (if dependent? fixed (bounded (+ fixed pages)))
+                   :confidence :low)
+            (cond-> dependent? (assoc :requests-per-binding pages))
+            (assoc :datalevin.query.source/cost-model
+                   {:kind :heuristic :id "postgres-observed-request-v1"
+                    :request-ns request-ns :fetch-rows fetch-size})))
+      estimate)))

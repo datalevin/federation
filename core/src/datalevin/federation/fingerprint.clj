@@ -1,11 +1,10 @@
 (ns datalevin.federation.fingerprint
   "Companion-owned canonical-v1 metadata encoding and SHA-256 fingerprints."
-  (:import [java.io ByteArrayOutputStream]
-           [java.math BigDecimal BigInteger]
+  (:import [java.math BigDecimal BigInteger]
            [java.nio CharBuffer]
            [java.nio.charset CharacterCodingException StandardCharsets]
            [java.security MessageDigest]
-           [java.util Date UUID]))
+           [java.util Date HexFormat UUID]))
 
 (defn- utf8 ^bytes [^String s]
   (try
@@ -16,15 +15,20 @@
     (catch CharacterCodingException _
       (throw (ex-info "Malformed metadata text" {:error :federation/metadata})))))
 (defn- frame ^bytes [tag ^bytes payload]
-  (let [out (ByteArrayOutputStream.)]
-    (.write out (utf8 (str tag (alength payload) ":")))
-    (.write out payload)
-    (.toByteArray out)))
+  (let [header (.getBytes (str tag (alength payload) ":") StandardCharsets/US_ASCII)
+        n (alength header) out (byte-array (+ n (alength payload)))]
+    (System/arraycopy header 0 out 0 n)
+    (System/arraycopy payload 0 out n (alength payload))
+    out))
 
 (defn- concat-bytes ^bytes [parts]
-  (let [out (ByteArrayOutputStream.)]
-    (doseq [^bytes part parts] (.write out part))
-    (.toByteArray out)))
+  (let [parts (vec parts)
+        out (byte-array (reduce (fn [n ^bytes part] (+ n (alength part))) 0 parts))]
+    (loop [offset 0 pending (seq parts)]
+      (when-let [^bytes part (first pending)]
+        (System/arraycopy part 0 out offset (alength part))
+        (recur (+ offset (alength part)) (next pending))))
+    out))
 
 (defn- compare-bytes [^bytes a ^bytes b]
   (loop [i 0]
@@ -70,8 +74,8 @@
 
 (defn hex
   "Lowercase hexadecimal representation of bytes."
-  [bytes]
-  (apply str (map #(format "%02x" (bit-and 255 %)) bytes)))
+  [^bytes bytes]
+  (.formatHex (HexFormat/of) bytes))
 
 (defn fingerprint
   "Digest a semantic payload. Purpose is schema or definition; neither is a row hash."

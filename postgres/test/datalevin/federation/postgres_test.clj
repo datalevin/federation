@@ -6,6 +6,7 @@
             [datalevin.federation.postgres.captured :as captured]
             [datalevin.federation.postgres.jdbc :as jdbc]
             [datalevin.federation.postgres.plan :as plan]
+            [datalevin.federation.postgres.relational :as relational]
             [datalevin.federation.postgres.mapping :as pm]
             [datalevin.federation.postgres.temporal :as temporal]
             [datalevin.federation.postgres.statistics :as statistics]
@@ -177,6 +178,143 @@
   [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :order/title] [:var ?title]]}
    {:id 1 :kind :pattern :terms '[[:var ?e] [:const :order/amount] [:ignore]]}])
 
+(deftest whole-query-mode-is-an-advisory-policy-not-a-semantic-override
+  (is (= :auto (:whole-query-mode (jdbc/profile! profile))))
+  (doseq [mode [:auto :sql :dependent]]
+    (is (= mode (:whole-query-mode (jdbc/profile! (assoc profile :whole-query-mode mode))))))
+  (doseq [mode [nil true :always "sql"]]
+    (is (thrown? Exception (jdbc/profile! (assoc profile :whole-query-mode mode))))))
+
+(defn relational-request [find columns predicates]
+  {:mode :relational :semantics-version 1 :sources [{:symbol '$p}]
+   :clauses (into [{:id 0 :kind :pattern :source-symbol '$p
+                   :terms '[[:var ?e] [:const :order/title] [:var ?title]]}]
+                  predicates)
+   :bindings {} :find find :with [] :columns columns})
+
+(deftest extrema-only-sql-avoids-distinct-while-other-reducers-preserve-witnesses
+  (let [compile (fn [find columns]
+                  (relational/compile-query {'$p accepted}
+                    (assoc (relational-request find columns [])
+                           :datalevin.query.source/native-extrema {'?title {:source '$p :attribute :order/title}}) 4096))
+        extrema [{:kind :aggregate :operator :min :variable '?title}
+                 {:kind :aggregate :operator :max :variable '?title}]
+        columns [{:variable '?min :type :data :nullable? true}
+                 {:variable '?max :type :data :nullable? true}]
+        minmax (compile extrema columns)
+        mixed (compile (conj extrema {:kind :aggregate :operator :count :variable '?title})
+                       (conj columns {:variable '?count :type :long :nullable? false}))]
+    (is minmax)
+    (is mixed)
+    (is (= 1 (:max-rows minmax)))
+    (is (= 1 (:max-rows mixed)))
+    (is (not (.contains (:sql minmax) "SELECT DISTINCT")))
+    (is (.contains (:sql mixed) "SELECT DISTINCT"))))
+
+(deftest scalar-boolean-sql-is-exact-parameterized-and-bounded
+  (let [a {:kind :predicate :operator := :args '[[:var ?title] [:const "Alpha"]]}
+        b {:kind :predicate :operator :like :args '[[:var ?title] [:const "B%"]]}
+        logical {:id 1 :kind :boolean :operator :or
+                 :clauses [a {:kind :boolean :operator :and :clauses [b a]}]}
+        request (relational-request [{:kind :aggregate :operator :count :variable '?title}]
+                                    [{:variable '?n :type :long :nullable? false}] [logical])
+        compile #(relational/compile-query {'$p accepted} (assoc-in request [:clauses 1] %) 4096)
+        sql (compile logical)]
+    (is sql)
+    (is (= ["Alpha" "B%" "Alpha"] (:params sql)))
+    (is (.contains (:sql sql) " OR "))
+    (is (.contains (:sql sql) "COLLATE pg_catalog.\"C\""))
+    (is (nil? (compile (assoc logical :operator :xor))))
+    (is (nil? (compile (assoc logical :clauses [a (assoc b :operator :unknown)]))))
+    (is (nil? (compile (assoc logical :clauses [a (assoc-in b [:args 0] [:var '?private])]))))
+    (is (nil? (compile (nth (iterate #(assoc logical :clauses [%]) a) 18))))
+    (is (nil? (compile (assoc logical :clauses (vec (repeat 33 a))))))
+    (let [wide (assoc logical :clauses (vec (repeat 32 a)))]
+      (is (nil? (compile (assoc logical :clauses [wide wide wide wide])))))))
+
+(deftest whole-sql-preserves-declaration-order-for-large-join-graphs
+  (let [symbols (mapv #(symbol (str "$p" %)) (range 12))
+        request (assoc (relational-request [{:kind :aggregate :operator :count :variable '?title}]
+                                           [{:variable '?n :type :long :nullable? false}] [])
+                       :sources (mapv #(hash-map :symbol %) symbols)
+                       :clauses (mapv (fn [i s] {:id i :kind :pattern :source-symbol s
+                                               :terms '[[:var ?e] [:const :order/title] [:var ?title]]})
+                                      (range) symbols))
+        query (relational/compile-query (zipmap symbols (repeat accepted)) request 4096)
+        aliases (map second (re-seq #"ONLY \"public\"\.\"orders\" AS (r\d+)" (:sql query)))]
+    (is (= (mapv #(str "r" %) (range 12)) aliases))
+    (is (not (.contains (:sql query) "CROSS JOIN")))
+    (let [reversed (relational/compile-query (zipmap symbols (repeat accepted))
+                                            (update request :clauses #(vec (reverse %))) 4096)
+          aliases (map second (re-seq #"ONLY \"public\"\.\"orders\" AS (r\d+)" (:sql reversed)))]
+      (is (= (mapv #(str "r" %) (reverse (range 12))) aliases)))))
+
+(deftest whole-sql-text-comparisons-use-exact-binary-predicates
+  (doseq [[operator x expected] [[:= "Alpha" ["Alpha"]]
+                                [:not= "Alpha" ["Alpha"]]
+                                [:in ["Alpha" "beta"] ["Alpha" "beta"]]
+                                [:not-in ["Alpha" "beta"] ["Alpha" "beta"]]]]
+    (let [request (relational-request [{:kind :aggregate :operator :count :variable '?title}]
+                                     [{:variable '?n :type :long :nullable? false}]
+                                     [{:id 1 :kind :predicate :operator operator :semantics-version 1
+                                       :args [[:var '?title] [:const x]]}])
+          query (relational/compile-query {'$p accepted} request 4096)]
+      (is query)
+      (is (= expected (:params query)))
+      (is (.contains (:sql query) "COLLATE pg_catalog.\"C\""))
+      (when (#{:= :in} operator)
+        (is (not (.contains (:sql query) (str "r0.\"title\" " (if (= := operator) "=" "IN")))))))))
+
+(deftest selective-dependent-preferences-use-graph-roles-rather-than-query-names
+  (let [type (get-in accepted [:identity :type])
+        view (pg/accept-mapping catalog
+               (assoc declaration :attributes
+                 {:order/title "title"
+                  :edge/a {:column "id" :reference {:type type :domain (get-in type [:parameters :identity-domain-id])}}
+                  :edge/b {:column "id" :reference {:type type :domain (get-in type [:parameters :identity-domain-id])}}}))
+        views {'$driver view '$a view '$b view}
+        pattern (fn [id source entity attribute output]
+                  {:id id :kind :pattern :source-symbol source
+                   :terms [[:var entity] [:const attribute] [:var output]]})
+        clauses [(pattern 0 '$driver '?d :order/title '?text)
+                 (pattern 1 '$driver '?d :edge/a '?a)
+                 (pattern 2 '$driver '?d :edge/b '?b)
+                 (pattern 3 '$a '?a :order/id '?unused-a)
+                 (pattern 4 '$b '?b :order/id '?unused-b)
+                 {:id 5 :kind :predicate :operator :like :args '[[:var ?text] [:const "prefix%"]]}]
+        request {:clauses clauses :find [{:kind :aggregate :operator :min :variable '?text}] :with []}]
+    (is (= :existence-probes (plan/dependent-preference views request)))
+    (is (nil? (plan/dependent-preference views (assoc-in request [:clauses 5 :args 1] [:const "%B%"]))))
+    (is (= :existence-probes
+           (plan/dependent-preference views (assoc-in request [:clauses 5 :args 1] [:const "X%"]))))
+    (is (nil? (plan/dependent-preference views (assoc request :with ['?unused-a]))))
+    (is (nil? (plan/dependent-preference views (assoc-in request [:find 0 :operator] :count))))
+    (is (nil? (plan/dependent-preference views (update request :clauses conj {:kind :absence}))))
+    (let [membership {:id 6 :kind :predicate :operator :in :args '[[:var ?unused-a] [:const ["one" "two"]]]}
+          filtered (assoc-in request [:clauses 3 :terms 1] [:const :order/title])]
+      (is (= :text-membership-driver
+             (plan/dependent-preference views (update filtered :clauses conj membership))))
+      (let [extra (mapv #(pattern (+ 10 %) '$driver (symbol (str "?extra" %)) :order/title '?text) (range 6))]
+        (is (nil? (plan/dependent-preference views
+                    (update filtered :clauses into (conj extra membership))))))
+      (let [extra (mapv #(pattern (+ 10 %) '$driver (symbol (str "?extra" %)) :order/id
+                                 (symbol (str "?id" %))) (range 6))
+            large (-> filtered
+                      (assoc-in [:clauses 4 :terms 1] [:const :order/title])
+                      (update :clauses into (conj extra membership
+                                             {:id 20 :kind :predicate :operator :like
+                                              :args '[[:var ?unused-b] [:const "other%"]]})))]
+        ;; A text predicate on the reference-bearing bridge is not a second
+        ;; dimension driver. Two independent leaf drivers may still qualify.
+        (is (nil? (plan/dependent-preference views large)))
+        (is (= :text-membership-driver
+               (plan/dependent-preference views
+                 (update large :clauses conj {:id 21 :kind :predicate :operator :like
+                                              :args '[[:var ?unused-a] [:const "prefix%"]]})))))
+      (is (nil? (plan/dependent-preference views
+                  (-> request (assoc :with ['?unused-a])
+                      (update :clauses conj (assoc-in membership [:args 1] [:const 42])))))))))
+
 (deftest postgres-cardinalities-distinguish-scans-lookups-and-unknowns
   (let [stats {:rows 1000.0 :observed-at-ms 1
                :columns {"id" {:distinct -1.0 :null-fraction 0.0}
@@ -231,6 +369,20 @@
     (is (= 1.0 (statistics/filter-selectivity accepted (assoc c :requires [{:variable '?title}]) stats)))
     (is (= 1.0 (statistics/filter-selectivity accepted c nil)))
     (is (= 1.0 (statistics/filter-selectivity accepted c (assoc-in stats [:columns "title" :distinct] 0))))))
+
+(deftest observed-round-trips-price-pages-without-changing-cardinalities
+  (let [base (assoc (plan/unknown-estimate true) :rows-per-binding 2.0 :confidence :low
+                   :provenance {:kind :statistics :id "fixture" :observed-at-ms 1 :valid-for-ms nil})
+        priced (statistics/with-request-cost base true 1000 128)]
+    (is (= 2.0 (:rows-per-binding priced)))
+    (is (= 3000.0 (:startup-ns priced)))
+    (is (= 15.625 (:per-binding-ns priced)))
+    (is (= 3.0 (:requests-per-open priced)))
+    (is (= 0.015625 (:requests-per-binding priced)))
+    (is (= (:provenance base) (:provenance priced)))
+    (is (= base (statistics/with-request-cost base true nil 128)))
+    (is (= (plan/unknown-estimate true)
+           (statistics/with-request-cost (plan/unknown-estimate true) true 1000 128)))))
 
 (deftest acquired-reference-domains-refine-sampled-fanout-without-proving-completeness
   (let [target accepted
@@ -485,6 +637,23 @@
   (doseq [offset ["+16:00" "-16:00" "+18:00" "-18:00"]]
     (is (nil? (plan/comparison-filter "timetz" "x" := (java.time.OffsetTime/parse (str "12:00" offset)))))))
 
+(deftest matched-nominal-bindings-reuse-owned-references
+  (let [type (get-in accepted [:identity :type])
+        entity (ref/entity-ref type [1])
+        accepted (pg/accept-mapping catalog
+                   (assoc declaration :attributes {:order/parent {:column "id" :reference
+                                                                 {:domain (get-in type [:parameters :identity-domain-id]) :type type}}}))
+        column (fn [v] {:variable v :type type :nullable? false})
+        candidate {:clauses [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :order/parent] [:var ?p]]}]
+                   :columns [(column '?e) (column '?p)] :requires [(column '?e) (column '?p)]}
+        matcher (plan/row-matcher accepted candidate)
+        result (matcher {'?e entity '?p entity} {"id" 1})]
+    (is (identical? entity (first result)))
+    (is (identical? entity (second result)))
+    (is (nil? (matcher {'?e entity '?p entity} {"id" 2})))
+    (is (nil? (matcher {'?e (ref/entity-ref (assoc-in type [:parameters :identity-domain-id] :other) [1])
+                       '?p entity} {"id" 1})))))
+
 (deftest existence-projections-keep-presence-and-omit-payload-size
   (let [d (spi/-source-info (pg/source accepted profile))
         clauses [{:id 0 :kind :pattern :terms '[[:var ?e] [:const :order/title] [:ignore]]}]
@@ -529,3 +698,20 @@
                    {:id 1 :kind :pattern :terms '[[:var ?e] [:const :order/b] [:const 1.0M]]}]
           candidate (first (plan/choices descriptor (request clauses) true))]
       (is (= [entity] (plan/match-row accepted candidate {} {"id" 1 "amount" 1.0M "other" 1.00M}))))))
+
+(deftest text-prefilters-use-exact-ascii-order-bounds
+  (doseq [type ["text" "varchar"] op [:< :<= :> :>=]]
+    (is (= [(str "(r.x) COLLATE pg_catalog.\"C\" " (plan/operators op) " ?::text") ["6.0"]]
+           (plan/comparison-filter type "r.x" op "6.0"))))
+  (doseq [op [:< :<= :> :>=] cutoff ["猫" "😀" "\uE000"]]
+    (is (nil? (plan/comparison-filter "text" "r.x" op cutoff))))
+  (doseq [cutoff ["\u0000" (str (char 0xd800))]]
+    (is (nil? (plan/comparison-filter "text" "r.x" := cutoff)))))
+
+(deftest like-union-prefilters-decline-all-branches-if-any-is-unsupported
+  (let [[sql params] (plan/like-any-filter "text" "r.x" ["A%" "%Down%" "a!%b"])]
+    (is (.contains sql " OR "))
+    (is (= ["A%" "%Down%" "a!%b"] params)))
+  (doseq [patterns [[] ["A%" "猫%"] ["A%" "%!x"] ["A%" nil] (vec (repeat 33 "A%"))]]
+    (is (nil? (plan/like-any-filter "text" "r.x" patterns))))
+  (is (nil? (plan/like-any-filter "int8" "r.x" ["%"]))))

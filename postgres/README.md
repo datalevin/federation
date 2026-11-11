@@ -36,17 +36,21 @@ export POSTGRES_JOB_USER="$USER"
 clojure -M:postgres-job '{:warmups 2 :samples 7}' /tmp/postgres-job-6a.edn
 ```
 
-Federation queries now default to a 1 GiB retained-memory allowance, sized for
-a server workload. The JOB alias starts with a 1 GiB heap and allows it to grow
-to 8 GiB. The allowance is a conservative accounting cap, not a heap reservation;
-size the JVM for concurrent queries and other work. Override a query's allowance
-with `:limits {:retained-bytes ...}`. Reports include effective limits and the
-JVM's maximum heap size. Binding batches allow 2 MiB and at most 256 keys,
-including typed-reference ownership charges.
+The JOB harnesses use an 8 GiB retained-memory allowance, a 256 KiB payload-row
+cap, a 16,384-request budget and a five-minute timeout. The JOB alias starts
+with a 1 GiB heap and allows it to grow to 16 GiB. The retained allowance is a
+conservative accounting cap, not a heap reservation. Binding batches allow
+2 MiB and at most 256 keys, including typed-reference ownership charges.
+
+Override individual budgets with `:limits {:retained-bytes ...}` and payloads
+with `:max-row-bytes`. Partial limit overrides preserve the other JOB defaults.
+Reports include effective query limits, source payload/fetch settings, and the
+JVM's maximum heap size. Ordinary federation queries retain the engine's
+1 GiB default allowance; these larger defaults apply to the JOB harnesses.
 
 Optional `POSTGRES_JOB_PASSWORD` supplies the password. Credentials stay out of
 the report. Set `:query` to select a supported query, for example `:17c` or `:20b`. `:schema`,
-`:timeout-ms`, `:fusion?`, `:relational?`, `:statistics?`, `:filtered-statistics?`, `:native-extrema?`, and explicit
+`:timeout-ms`, `:max-row-bytes`, `:fusion?`, `:relational?`, `:statistics?`, `:filtered-statistics?`, `:native-extrema?`, and explicit
 query-source `:limits` are also configurable. The harness performs reads only;
 it does not load data, create indexes, or run `ANALYZE`. Keep the dataset static
 throughout a run because the compared invocations acquire separate snapshots.
@@ -91,6 +95,270 @@ The integration checks create and remove isolated fixture schemas in the
 disposable test database. They cover duplicate joins, absent references, nulls,
 filters, empty aggregates, incompatible text minima, and budget failures.
 
+## Full JOB suite timing
+
+The [latest full 113-query pass](../doc/measurements/postgres-job-full113-post-fragments-2026-11-10.md)
+completes and matches every original aggregate answer. Adapter client time is
+**155.82 s versus native PostgreSQL's 166.38 s**, 6.3% less in this pass. There
+are no aggregate execution failures or result mismatches. Complete projected
+tuple sets verify for 107 queries; six additional tuple checks hit the unchanged
+64 MiB result limit after their original aggregates pass. This is one sample
+without warmups or controlled cache state, with native timings varying between
+passes, rather than a repeated full-suite win.
+
+On the same 113 aggregates in the
+[preceding full pass](../doc/measurements/postgres-job-full113-post-targets-2026-11-10.md),
+adapter time rises from 140.28 s to 155.82 s, while native time rises from
+157.80 s to 166.38 s. The seven retained dependent plans improve from 11.87 s
+to 11.12 s combined. Query 17a is the largest adapter regression, from 7.68 s
+to 19.95 s; 17a, 19d, and 26a have the largest gaps against native in this pass.
+These separate single passes do not isolate the code change from runtime
+variation. The
+[31b/7c/17f investigation](../doc/measurements/postgres-job-31b-7c-17f-2026-11-10.md)
+explains the repaired memory failures and automatic plan choice. The latest
+report retains all per-query regressions and distinguishes aggregate execution
+from the separate tuple oracle.
+
+The [single-SQL expansion screen](../doc/measurements/postgres-job-single-sql-2026-11-10.md)
+reduces the same 40-query cohort from **34.85 s to 17.85 s**. Native takes
+**37.70 s** in the new pass. All 43 executed queries verify their original
+aggregates and full projected tuple sets. Its plan-only inventory selected
+one SQL plan for 101 of 113 queries, up from 20, with nine dependent plans and
+three nested-OR shapes in core before the follow-up above. This is a one-pass cohort comparison;
+it does not replace the full 113-query execution baseline below. Separate
+five-pair repeats preserve the 6d/17c wins at 339/579 ms against native's
+5.07/6.28 s, winning every pair.
+
+The full-suite harness reads all 113 original SQL files from the sibling
+`datalevin/benchmarks/JOB-bench/queries` directory. It translates their flat
+joins and predicates into accepted PostgreSQL sources and keeps every original
+aggregate output and table-existence check. It uses the same 16 GiB JVM and
+raised budgets as the single-query harness:
+
+```sh
+clojure -M:postgres-job:postgres-job-suite \
+  '{:samples 1 :warmups 0}' /tmp/postgres-job-suite.edn
+```
+
+`POSTGRES_JOB_URL`, `POSTGRES_JOB_USER` and `POSTGRES_JOB_PASSWORD` have the same
+meaning as above. Optional `:corpus` and `:schema` select the existing SQL corpus
+and database schema. A `:queries` vector runs an explicitly labeled subset for
+debugging. The database must remain static throughout the run.
+
+For the four queries that reached the earlier limits, run:
+
+```sh
+clojure -M:postgres-job:postgres-job-suite \
+  '{:queries [:7c :20c :29a :29c] :samples 1 :warmups 0}' /tmp/postgres-job-raised-limits.edn
+```
+
+Earlier measurements retain their recorded 1 GiB memory, 16 KiB payload,
+1,024-request and 8 GiB JVM settings. Use explicit options and JVM flags to
+reproduce those settings.
+
+Each query's native and adapter invocations alternate order. Timed calls include
+connection, snapshot, schema validation, planning, cardinality estimation,
+execution, decoding, and cleanup. JVM startup, initial catalog discovery,
+mapping acceptance, warmups, and correctness oracles are separate. Each
+successful aggregate comparison is followed by a distinct-output tuple check;
+`:oracle-max-rows` bounds that untimed check. Results checkpoint after every
+query, and an adapter failure does not prevent timing native PostgreSQL or
+continuing to the next query.
+
+The summary reports a native total only when every selected native query
+completed. A full-suite adapter total and speedup require all 113 queries to
+complete and pass correctness checks. Otherwise, verified subtotals, attempted
+time, unsupported translations, resource limits, timeouts, and verification
+failures remain separate. External `IS NULL` uses bound attribute absence;
+nullable `MIN` outputs use optional projections and independently ignore NULLs.
+Unsupported queries never count as zero-time successes.
+
+The default single pass is a baseline screen, with no claim of repeated wins
+or controlled cold-cache behavior. Use repeated samples and warmups to assess
+stable performance once coverage permits a complete comparison. The generated
+Datalog and original SQL, per-query raw times, limits, environment and source
+fingerprints are included in the artifact.
+
+Timed native aggregates leave JDBC fetch size at zero. Only the untimed tuple
+oracle uses bounded fetching. PostgreSQL can execute a parallel plan without
+workers when a client sends a nonzero fetch count; see its
+[parallel-query restrictions](https://www.postgresql.org/docs/18/when-can-parallel-query-be-used.html).
+
+A native-only replay can replace a confounded native control without repeating
+adapter executions. It checks the SQL corpus and every aggregate answer against
+the completed reference report and labels the measurements as separate passes:
+
+```sh
+clojure -M:postgres-job:postgres-job-native \
+  '{:samples 1 :warmups 0 :timeout-ms 60000}' \
+  /tmp/postgres-job-suite.edn /tmp/postgres-job-native.edn
+```
+
+Run the suite harness checks with:
+
+```sh
+clojure -M:test datalevin.federation.postgres-job-suite-test
+POSTGRES_TEST_URL='jdbc:postgresql://127.0.0.1:5432/federation_test' \
+  clojure -M:test datalevin.federation.postgres-job-suite-integration-test
+```
+
+The [2026-11-09 full-suite summary](../doc/measurements/postgres-job-suite-summary-2026-11-09.edn)
+and [per-query CSV](../doc/measurements/postgres-job-suite-queries-2026-11-09.csv)
+contain one sample per query, no explicit warmup, a 60-second deadline, an 8 GiB
+heap, a 1 GiB retained-memory cap, and a 1,024-request cap:
+
+| Scope | Native client wall time | Adapter client wall time |
+| --- | ---: | ---: |
+| All 113 original queries | 136.10 s | Incomplete |
+| The same 40 verified queries | 36.29 s | 199.44 s |
+
+The initial adapter baseline was **5.50x slower on the verified subset**. The other 73 queries
+comprise 42 memory-limit failures, 11 request-limit failures, nine unsupported
+plans, nine external `IS NULL` translations, one independent nullable `MIN`,
+and one timeout. All source sessions closed, and no result mismatch occurred.
+Adapter calls including failed attempts consumed 1,854.38 seconds; this is
+attempted work, **not** a full-suite completion time.
+
+The [adapter screen](../doc/measurements/postgres-job-suite-adapter-screen-2026-11-09.edn)
+retains its original native timings as explicitly superseded diagnostics.
+Those calls used a nonzero JDBC fetch size and could suppress parallel workers.
+The [corrected native control](../doc/measurements/postgres-job-suite-native-control-2026-11-09.edn)
+replayed all 113 queries with fetch size zero and rechecked every original
+aggregate answer. Adapter and corrected native times come from separate passes,
+with no cache flush or controlled cache state. Treat this as a baseline screen,
+not paired samples or a repeated-win result.
+
+The [current optimization results](../doc/measurements/postgres-job-next-targets-2026-11-09.edn)
+repeat every one of those 40 queries, with the same original aggregate answers
+and distinct-output tuple hashes. Adapter total time is now **110.42 s**, down
+from **199.44 s** (**44.6%**). Native total in this cohort run is **33.43 s**,
+leaving a **3.30x** gap. Both cohort totals are single-pass screens. The complete
+113-query suite has not been rerun after these changes, so there is no updated
+full-suite adapter total or coverage count.
+
+| Target | Initial adapter screen | Optimized median, JVM 1 | Optimized median, JVM 2 |
+| --- | ---: | ---: | ---: |
+| 1c | 15.64 s | 139 ms | 133 ms |
+| 8b | 22.45 s | 381 ms | 370 ms |
+| 14b | 24.25 s | 290 ms | 262 ms |
+| Sum | 62.34 s | 0.810 s | 0.765 s |
+
+Reproduce the focused comparison with:
+
+```sh
+clojure -M:postgres-job:postgres-job-suite \
+  '{:queries [:1c :8b :14b] :samples 7 :warmups 2}' /tmp/postgres-job-targets.edn
+```
+
+Each optimized target run has two warmups and seven alternating native/adapter
+sample pairs in a fresh JVM. All original SQL outputs and distinct matching
+tuples pass in both runs. The production adapter reduces eligible compound
+text filters and explicit source-native extrema in PostgreSQL, transferring
+one aggregate row per target. Baseline diagnostic plans transferred 21,195,
+50,791 and 55,675 rows respectively. Retained-memory and request limits are
+unchanged. See [JVM 1](../doc/measurements/postgres-job-targets-optimized-run1-2026-11-09.edn),
+[JVM 2](../doc/measurements/postgres-job-targets-optimized-run2-2026-11-09.edn),
+the [40-query run](../doc/measurements/postgres-job-common40-optimized-2026-11-09.edn)
+and [per-query comparison CSV](../doc/measurements/postgres-job-common40-comparison-2026-11-09.csv).
+
+Exact ASCII `LIKE`/`NOT LIKE` calls and bounded same-variable `LIKE`
+disjunctions can participate in relational filtering. Advisory disjunction
+hints require explicit provider support; unsupported branches keep the complete
+local disjunction. `:predicate-prefilters? false` disables those hints in a
+PostgreSQL source profile. Ordered text comparisons use C collation only for
+ASCII cutoffs, where they preserve ordinary Datalog ordering. Chained integral
+comparisons normalize inside complete SQL delegation, preserving existing
+scoped fallback plans.
+
+Native text reduction requires an explicit `:native-extrema` declaration that
+matches the selected source attribute. It preserves that column's collation and
+rejects nondeterministic collations. The optimizer restricts new text-filter
+delegation to at most eight table groups, or twelve for exact bound absence,
+keeps selective positive-filter probe plans available, and declines new
+text-filtered partial joins whose correlated
+fan-out is unpriced. These bounds preserve the 6d, 10c and 17c screening wins.
+Ordinary Datalog text extrema retain their existing ordering.
+
+Validation covers 284 tests with 7,637 assertions and no failures or errors;
+targeted lint has no errors or warnings. All source sessions closed. The next
+largest measured excesses in the 40-query cohort are 4c, 18a and 28b.
+
+The [2026-11-10 absence screen](../doc/measurements/postgres-job-absence-summary-2026-11-10.edn)
+verifies all nine previously rejected `IS NULL` queries: 11a, 11b, 18b,
+21a–21c and 27a–27c. All original aggregates and distinct output tuples agree
+with PostgreSQL, and every source session closes. The five regression queries
+1c, 6d, 8b, 14b and 17c also pass. Bound absence uses the shared subtraction
+operator; eligible SQL plans translate it to `IS NULL`.
+
+Admitting exact absence plans with up to twelve table groups lowers the nine
+queries' combined adapter time from 38.77 s to **10.73 s**, including planning,
+estimation and cleanup. Native takes **0.57 s** on those same nine queries.
+27b falls from 25.82 s to 1.01 s; 27a and 27c rise to 3.60 s and 3.92 s and
+remain optimization targets. These are single-pass screens in separate JVMs,
+without warmups or a controlled cold-cache claim. The original 113-query suite
+has not been rerun, and these subset timings do not form a new full-suite total.
+See the [per-query comparison](../doc/measurements/postgres-job-absence-comparison-2026-11-10.csv)
+and [test output](../doc/measurements/postgres-job-absence-tests-2026-11-10.txt).
+
+The [OR investigation](../doc/measurements/postgres-job-or-investigation-2026-11-10.edn)
+reruns the nine historical planner rejections. All nine now plan. Their original
+failure was a missing scoped dependency: provider projection could discard a
+column consumed only by `or-join`. Source requests now retain every scoped
+operator input. A controlled projection replay reproduces all nine old
+rejections with LIKE hints disabled; enabling those hints rescues seven, while
+7c and 12b still require the projection fix. Current planning succeeds with
+hints either enabled or disabled.
+
+| Result under the earlier 1 GiB / 16 KiB budgets | Queries |
+| --- | --- |
+| Original aggregates and distinct output tuples verified | 12b, 19a, 19b, 23a, 23c |
+| 1 GiB retained-memory limit | 20c, 29a, 29c |
+| 16 KiB payload-row limit in a joined biography read | 7c |
+
+These were execution limits in supported scoped programs. Diagnostic traces show
+20c materializing 85,941 intermediate rows and 29c reading 106,001 person rows
+before narrowing to 50,011. In 29a, the next movie-keyword lookup hits the
+memory cap after a frontier of 810 wide tuples, so retained allocations also
+need profiling. Raising 7c's payload cap to 256 KiB moves it to the same 1 GiB
+memory limit. No default limits changed.
+
+The [current per-query CSV](../doc/measurements/postgres-job-or-current-2026-11-10.csv)
+records one sample without warmups; plan-only ablations and execution traces
+are separate from timed calls. The five verified queries take 24.76 s in the
+adapter versus 0.72 s in native PostgreSQL. This subset does not establish a
+new full-suite time. New regression coverage includes private LIKE/equality OR
+inputs, nested AND/OR and multiple OR clauses with hints disabled; the targeted
+suites pass 95 tests and 802 assertions with clean lint. See the
+[test output](../doc/measurements/postgres-job-or-tests-2026-11-10.txt).
+
+The [raised-budget screen](../doc/measurements/postgres-job-raised-limits-summary-2026-11-10.edn)
+uses the current JOB defaults: 8 GiB retained memory, 256 KiB payload rows,
+16,384 requests, a five-minute timeout, and a 16 GiB JVM. **20c now verifies**
+both original minima and all 3,593 distinct output tuples. Its client-wall time
+is 133.32 s versus native's 1.16 s in this single-pass screen. Queries 7c, 29a
+and 29c still reach the raised 8 GiB memory cap; 7c clears the payload-row cap.
+All source sessions close. The configuration and harness tests pass 23 tests
+with 192 assertions; see the [test output](../doc/measurements/postgres-job-raised-limits-tests-2026-11-10.txt).
+The report preserves the run-start source fingerprints and records a concurrent
+estimator source change; these measurements do not isolate a before/after
+performance effect or establish a full-suite time.
+
+The [nullable-minimum screen](../doc/measurements/postgres-job-nullable-min-summary-2026-11-10.edn)
+verifies **JOB 1a**, including all three original minima and 116 distinct output
+tuples. The translator preserves rows with absent projection attributes, so
+each minimum can independently ignore NULL. Matching SQL delegation transfers
+one aggregate row; the same optional projections also work through the scoped
+fallback. This dataset's matching tuples have non-NULL years; isolated fixtures
+exercise mixed NULL columns, independent minima, all-NULL groups, empty inputs,
+native text ordering, and captured views.
+
+The single-pass client-wall result is 0.84 s for the adapter and 0.054 s for
+native PostgreSQL, without warmups. Seven regression queries—1b, 1c, 6d, 8b,
+11a, 14b and 17c—also pass their aggregate and tuple checks. The original full
+113-query suite has not been rerun. Validation passes 376 tests and 8,774
+assertions with clean lint; see the [test output](../doc/measurements/postgres-job-nullable-min-tests-2026-11-10.txt)
+and the [nullable projection example](#identity-types-and-absence).
+
 ## Workload fit and current gaps
 
 The current fit is selective enrichment of a small set of keys from ordinary
@@ -111,7 +379,7 @@ application schema or a larger reporting query:
 | Filter amounts, times, or names | Matching integral, `BigDecimal`, and `Instant` comparisons and eligible binary `like`/`not-like` calls are pushed down | Eligible filters reduce transfer. Mixed representations, unsupported patterns/call forms, and out-of-range timestamp bounds can still require a broad read. |
 | Read an existing application schema | Temporal types and enums are supported; domains, `char`, `citext`, arrays, and JSON/JSONB remain unmapped | Supported columns can be selected independently. Collection-valued attributes are not implemented. |
 | Read reporting views, partitioned datasets, or tenant tables with RLS | Views need declared keys; partitioned parents need primary keys; RLS needs an enforced authorization profile | These relations capture all mapped columns at acquisition under shared row, request, and retention limits. Subsequent accesses use the captured rows; SQL predicate, join, and aggregate delegation is unavailable for these captures. |
-| Aggregate, sort, or join large PostgreSQL relations | Whole-query and mixed-source fragment delegation cover eligible flat joins and aggregates; eligible whole-query ordering/limit windows execute in SQL | Mixed native/SQL spending queries can return customer totals instead of every order. Complete aggregate groups must fit a binding batch; unsupported shapes retain fact accesses. Catalog cardinalities guide fact-access ordering. Index discovery and a latency/cost model remain absent. |
+| Aggregate, sort, or join large PostgreSQL relations | Whole-query and mixed-source fragment delegation cover eligible flat joins and aggregates; eligible whole-query ordering/limit windows execute in SQL | Mixed native/SQL spending queries can return customer totals instead of every order. Complete aggregate groups must fit a binding batch; unsupported shapes retain fact accesses. Catalog cardinalities and observed request latency guide fact-access ordering. Index discovery and backend execution-time estimates remain absent. |
 | Read large text or binary fields | The default payload-row cap is 16 KiB, measured using SQL text representations | `_` existence checks use presence flags and do not fetch the payload. Values needed for output or local matching remain capped; delegated SQL applies the cap to its final returned row. |
 | Discover relationships | Discovery covers one named relation, its columns, key, enum labels, and applicable view/security contracts; foreign-key discovery is absent | Define references manually. Use PostgreSQL policies and explicit runtime role/settings for authorization; query filters do not establish an authorization boundary. |
 
@@ -150,9 +418,21 @@ parameter order remain in the outer query.
 The core first finds a complete typed plan, then compares up to 16 distinct
 starting sources using propagated `:rows`/`:rows-per-binding`. It estimates
 returned-row work across complete paths, with a 20 ms allowance and the remaining
-4096-state search budget. Unknown or expired counts, unmodeled local producers,
+4096-state search budget. Regions with at most eight work items and 32 choices
+use a 1 ms allowance and at most 128 additional search checks. The complete
+feasibility search retains its original bound; optional lookahead keeps that
+complete plan when its smaller allowance expires. It skips the baseline driver
+already evaluated. Unknown or expired counts, unmodeled local producers,
 and unknown selectivity for a second independent scan retain the original plan.
-This is a row-work heuristic; it does not model skew, CPU time, or network latency.
+When every access on the baseline path has fresh time hints, lookahead ranks
+complete paths by estimated access time plus local row/column processing, then
+row work and peak tuples. Missing time hints retain cardinality ranking. The
+model includes logical cursor opens at the effective binding batch size; it
+does not treat a backend's per-request binding cap as another cursor open.
+PostgreSQL reuses already observed metadata-request latency to price three
+fixed cursor requests (declare, terminal fetch, close) and estimated fetch
+pages. This adds no estimation I/O. These low-confidence transport estimates
+exclude most backend execution work and can underprice skewed joins.
 Joined estimates use catalog distinct counts for equality and text membership
 filters, retaining the strongest local filter rather than multiplying correlated
 predicates. Acquired single-column reference-domain sizes refine sampled
@@ -170,6 +450,40 @@ existing time, request, and latency-based preparation caps remain in effect.
 Explanations show `:join-cost`, `:cost-search`, and `:selection :join-cost` when
 lookahead changes the selected path. Planning time includes provider plan
 construction, capture, and scheduling; optional estimation is reported separately.
+`:cost-search :model` identifies `:elapsed` or `:cardinality`; `:join-cost`
+separates `:access-ns`, `:local-ns`, `:estimated-ns`, and estimated opens/requests.
+The default `:query-source :planning` options are `:cost-model :elapsed`,
+`:local-row-ns 1000`, and `:local-column-ns 250`. The local coefficients are
+nonnegative integer heuristics, configurable for the deployment. Set
+`:cost-model :cardinality` to compare the original row-work model.
+
+Execution prepares immutable reference descriptors once per cursor or mapping
+projector and reuses validated bound references. Each new key still receives
+its own value validation, wire encoding, ownership, and retained-memory charge.
+Dependent boundaries collect positional tuples directly instead of first
+building owned row maps, and project columns after their last use while keeping
+find/with witnesses and shared join keys. The single empty input tuple scans
+directly without building a redundant hash join. Complete binding collection
+and final boundary materialization remain; these changes do not permit partial
+or replayed lookups. The
+[fragment execution measurements](../doc/measurements/postgres-job-fragment-work-2026-11-10.md)
+cover the retained JOB dependent plans and single-SQL controls.
+
+The provider prepares access alternatives and estimate SQL once per session and
+request, sharing them across estimation and final planning. Changed bindings,
+available inputs, projection, scope, or candidate bounds require new preparation.
+Group column schemas and sort keys are also computed once. Captured descriptors
+are checked by identity inside the compiler; public requests and provider
+responses retain their structural validation.
+
+Metadata ownership shares unchanged immutable containers after visiting their
+children, while copying mutable values and detaching vector views. Byte sizing
+uses one ledger snapshot followed by an atomic reservation, preserving concurrent
+quota enforcement. Ordinary metadata avoids generic custom-value protocol
+hierarchy walks; direct implementations and externally extended values retain
+their contracts. Once a complete delegated SQL plan is selected, acquisition
+skips optional cardinality statistics while retaining schema, authorization,
+locking, and snapshot checks.
 
 Projection analysis retains final outputs, input keys, local operator variables,
 and cross-access join variables. Unused internal entity identities need not be
@@ -255,6 +569,15 @@ estimation, execution, source-native extrema, and cleanup. Every run checks all
 distinct matching output tuples and every original aggregate output. The
 [measurement summary](../doc/measurements/postgres-job-target-optimizations-2026-11-09.edn)
 verifies 21 current source fingerprints and closed sessions across all reports.
+
+A subsequent [planning comparison](../doc/measurements/postgres-job-cheap-planning-2026-11-10.md)
+uses eight queries, two warmups, and five alternating sample pairs in separate
+before/after JVMs. Median summed adapter time falls from **4.79 s to 1.67 s**
+(65% less). Queries 1a/1b/1c reach 40.2/28.3/35.8 ms against native's
+37.7/26.0/34.3 ms. All eight verify their original aggregates and complete tuple
+sets; 6d and 17c remain faster than native in every final pair. Native subtotal
+variation is retained in the report. This cohort uses the current JOB limits and
+does not update the full 113-query coverage count.
 
 All runs below use a 1 GiB retained allowance, 2 MiB binding allowance, and an
 8 GiB maximum heap. Queries 17c, 17d, 20b and 6d use two warmups and seven
@@ -396,6 +719,62 @@ containing `:triage/order-id` and `:triage/priority` long attributes:
 ```
 
 ## Identity, types, and absence
+
+Bound `not` and `not-join` fact bodies work over external sources. For example,
+this query returns existing orders whose note is absent:
+
+```clojure
+(d/q '[:find ?id :in $p
+       :where [$p ?e :order/id ?id]
+              (not [$p ?e :order/note _])]
+     orders)
+```
+
+The identity fact establishes that the row exists. An input entity reference
+alone can also name a missing row, whose attributes are all absent. Use an
+explicit identity or other positive fact when row existence matters.
+
+Absence checks complete their positive fact bodies in the query's acquired
+source sessions, then subtract matches using the engine's bounded operator.
+They preserve `not-join` locals and share cancellation, memory and request
+limits with positive reads. Failed or incomplete reads never prove absence.
+External negative bodies currently admit positive fact patterns; external
+negative recursion, nested negation and other body operators remain unsupported.
+
+Exact relational plans can push a bound scalar absence into PostgreSQL as
+`IS NULL`, retaining a positive row witness. Composite mappings, captured views,
+and other shapes use ordinary fact lookup and subtraction. SQL NULL still
+produces no EAV fact.
+
+Nullable outputs can preserve a matching row by binding `nil` when its
+attribute is absent. Declare SQL-style NULL handling for selected extrema with
+`:ignore-nil-extrema`:
+
+```clojure
+(d/q '{:find [(min ?amount)] :in [$p]
+       :where [[$p ?order :order/id _]
+               (or-join [[?order] ?amount]
+                 [$p ?order :order/amount ?amount]
+                 (and (not-join [?order] [$p ?order :order/amount _])
+                      [(ground [nil]) [?amount]]))]
+       :query-source {:ignore-nil-extrema #{?amount}}}
+     orders)
+```
+
+Each declared `min`/`max` ignores only its own nil inputs and returns nil for
+an all-NULL group. Other selected columns retain every matching row, and other
+aggregates keep their existing behavior. Ordinary Datalog extrema preserve
+their original nil handling. Tuple binding in the default branch binds nil as
+a value; scalar functions returning nil filter their row.
+
+Eligible scalar projections and extrema delegate to PostgreSQL without an
+`IS NOT NULL` filter on optional columns. Text extrema still use explicit
+`:native-extrema` declarations for PostgreSQL ordering. The scoped fact,
+absence and tuple operators provide the same semantics when SQL delegation
+is unavailable, including captured views. Nullable predicates and other
+unproven shapes retain core execution. The JOB translator generates these
+projections for nullable output columns, retaining all original independent
+minima and NULL-bearing tuples.
 
 Ordinary tables and partitioned parents require a validated, nondeferrable
 primary key. Views and materialized views require explicit `:key-columns`,
@@ -706,20 +1085,96 @@ references. SQL uses binary text equality and preserves decimal scale where
 query-key equality requires it. Unsupported types and expressions decline
 delegation before acquisition and use the existing fact-access path.
 
+Whole-query SQL is the default candidate across the supported graph size,
+including text filters and explicit native text extrema. The former eight-table
+text restriction is removed. Eligible filters, joins, distinctness, grouping,
+and aggregation execute together on PostgreSQL, returning final result rows.
+This is one data query; snapshot and catalog validation retain their own bounded
+requests.
+The source aliases must share one source-instance/compute-context group and
+compatible authorization scopes; matching host names alone is insufficient.
+
+This follows the same locality principle as
+[`postgres_fdw` remote joins](https://www.postgresql.org/docs/18/postgres-fdw.html#POSTGRES-FDW-REMOTE-QUERY-OPTIMIZATION):
+PostgreSQL can ship joins within one foreign server, retaining individual reads
+when they are expected to cost less and keeping different user mappings separate.
+Its [upper-path callback](https://www.postgresql.org/docs/18/fdw-callbacks.html#FDW-CALLBACKS-UPPER-PATHS)
+also supports remote aggregation. Our SQL compiler additionally proves the
+Datalevin value and aggregate semantics before accepting a plan.
+
+The automatic policy retains dependent MIN/MAX plans for two bounded structural
+shapes: a selective text driver paired with membership filters, and a selective
+text driver feeding several identity-only existence lookups. Graphs larger than
+eight table/entity groups require at least two independent text drivers on leaf
+dimensions, with at most twelve groups. A filter on a bridge carrying outgoing
+references does not count as a selective dimension driver. Existence probes
+require at most eight groups and an anchored
+prefix or at least four literal pattern characters; a broad substring such as
+`%B%` alone does not establish a selective driver. These include the measured
+6d, 10c, 17c, 17d, and 20b paths. The policy is a cheap graph heuristic, rather
+than an elapsed-time or selectivity estimate. It uses no query IDs or stored
+answers. Queries with nullable projections or absence checks prefer complete
+SQL instead of these exceptions.
+
+Bound scalar AND/OR filters can execute with the joins and aggregation when
+every branch uses already bound fact values and supported scalar comparisons.
+The planner bounds the logical forest to 128 nodes and depth 16, with at most
+32 branches per OR. Chained comparisons, including string BETWEEN predicates,
+normalize to adjacent comparisons; PostgreSQL still checks each leaf's types,
+constants, NULL behavior, and collation. Branches that introduce facts, functions,
+negation, rules, or optional nullable values keep core execution. Overlapping
+Boolean branches filter a witness once and do not duplicate aggregate inputs.
+
+Set `:whole-query-mode` consistently on the participating runtime profiles:
+
+| Mode | Selection |
+| --- | --- |
+| `:auto` (default) | Attempt complete SQL, preserving the selective graph exceptions |
+| `:sql` | Prefer complete SQL whenever the compiler proves it eligible |
+| `:dependent` | Keep whole-query execution in core; retain filtered and dependent join pushdown |
+
+The existing `:relational? false` setting disables relational delegation in every
+mode. SQL preference never bypasses type, collation, source, authorization, or
+expression checks. Host functions and unsupported scoped branches still use
+core execution. `d/explain` reports `:policy :relational-v1` for a selected
+whole-query plan; `{:run? false}` acquires metadata without executing its data
+query. Use the mode override to compare complete SQL against dependent plans on
+your workload, including connection and planning time.
+
 Supported aggregates are `count`, `count-distinct`, decimal `sum`, integral
 `sum` with an explicit nonnegative range predicate, and eligible scalar
 `min`/`max`. Decimal min/max require a fixed column scale; floating-point
 aggregation, unrestricted integral sums, and other reducers remain in core.
 The SQL projection establishes distinct `:find`/`:with` input tuples before
-grouping. Empty inputs yield no groups, matching ordinary query behavior.
+grouping. All-MIN/MAX projections omit this intermediate DISTINCT because both
+extrema and validation flags are insensitive to duplicates. Mixed reducers keep
+the distinct witness relation. Empty inputs yield no groups, matching ordinary
+query behavior.
 Input conversion guards still apply when aggregation returns a small value.
 The row-size guard applies to the final SQL projection: values used only inside
 PostgreSQL for joins, filters, distinctness, or aggregation do not consume that
 wire payload cap.
 
+Scalar aggregation without grouping or a result window is proven to return at
+most one row. It uses a direct SELECT with JDBC fetch size zero, permitting
+PostgreSQL parallel plans while retaining a one-row decoder limit. This avoids
+the parallelism restriction of
+[`DECLARE CURSOR` and nonzero protocol fetch counts](https://www.postgresql.org/docs/18/when-can-parallel-query-be-used.html).
+Grouped and unbounded results retain owned, bounded cursor pages. The same
+snapshot, cancellation, output-size, and reservation rules apply to both forms.
+
+Large SQL join graphs preserve numeric
+alias creation order rather than sorting `r10` before `r2`, which would change
+the input to PostgreSQL's bounded join search. Whole-query SQL uses a comma
+`FROM` list so that an explicit `CROSS JOIN` tree does not accidentally constrain
+large graphs through
+[`join_collapse_limit`](https://www.postgresql.org/docs/18/runtime-config-query.html#GUC-JOIN-COLLAPSE-LIMIT).
+Key-dependent LATERAL fragments keep their deliberate planning fences.
+
 The initial relational contract accepts up to 32 patterns and 128 physical
-output components. Rules, unions, negation, functions, `:having`, collection
-inputs, and queries spanning independent sessions retain core execution.
+output components. Exact scalar absence and eligible LIKE unions can delegate.
+Other scoped programs, functions, `:having`, collection inputs, and queries
+spanning independent sessions retain core execution.
 Public result shaping uses the shared result processor; ordering combined with
 return maps currently retains core execution. Finite relational windows use a
 distinct top-k collector that retains at most `offset + limit` candidate rows,
@@ -856,6 +1311,7 @@ Idle admission entries are removed rather than retaining caller-owned pools.
 | `:max-row-bytes` | `16384` | Maximum combined SQL text size of materialized values and keys per fact-access row, or the final returned row for delegated SQL |
 | `:fusion?` | `true` | Set false to compare separate EAV accesses |
 | `:relational?` | `true` | Allow eligible whole-conjunction joins and aggregation |
+| `:whole-query-mode` | `:auto` | Prefer whole-query SQL automatically, or select `:sql` / `:dependent` for workload comparisons; semantic checks always apply |
 | `:statistics?` | `true` | Read session-local catalog cardinalities for fact-access ordering |
 | `:filtered-statistics?` | `true` | Allow cost-budgeted EXPLAIN row estimates before pure access planning; requires `:statistics?` |
 | `:role` | unset | Transaction-local PostgreSQL role |

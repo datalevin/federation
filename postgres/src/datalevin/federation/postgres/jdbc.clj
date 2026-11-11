@@ -49,7 +49,8 @@
 (defn profile! [profile]
   (let [profile (merge {:connect-timeout-ms 10000 :statement-timeout-ms 10000
                         :fetch-size 128 :max-row-bytes 16384 :fusion? true :relational? true
-                        :statistics? true :filtered-statistics? true} profile)]
+                        :statistics? true :filtered-statistics? true :predicate-prefilters? true
+                        :whole-query-mode :auto} profile)]
     (ensure! (= 1 (count (filter some? ((juxt :jdbc-url :data-source) profile)))) :profile)
     (when-let [url (:jdbc-url profile)]
       (ensure! (and (string? url) (str/starts-with? url "jdbc:postgresql:")) :profile))
@@ -60,6 +61,8 @@
     (ensure! (and (integer? (:fetch-size profile)) (<= 1 (:fetch-size profile) 256)
                   (boolean? (:fusion? profile)) (boolean? (:relational? profile))
                   (boolean? (:statistics? profile)) (boolean? (:filtered-statistics? profile))
+                  (boolean? (:predicate-prefilters? profile))
+                  (#{:auto :sql :dependent} (:whole-query-mode profile))
                   (every? (fn [[k v]] (and (string? k) (string? v))) (:properties profile))) :profile)
     (when-let [role (:role profile)] (identifier role))
     (ensure! (and (or (nil? (:session-settings profile)) (map? (:session-settings profile)))
@@ -208,15 +211,20 @@
   (request! context phase
     #(with-open [stmt (statement context sql params)] (.execute stmt))))
 
-(defn query! [context phase sql params read-row]
+(defn query!
+  ([context phase sql params read-row]
+   (query! context phase sql params read-row 2048 nil))
+  ([context phase sql params read-row maximum fetch-size]
   (request! context phase
-    #(with-open [stmt (statement context sql params) rs (.executeQuery stmt)]
+    #(with-open [stmt (statement context sql params)]
+       (when (some? fetch-size) (.setFetchSize stmt (int fetch-size)))
+       (with-open [rs (.executeQuery stmt)]
        (loop [out []]
          (check! context)
          (if (.next rs)
-           (do (when (>= (count out) 2048) (fail! :query-source/limit phase))
+           (do (when (>= (count out) maximum) (fail! :query-source/limit phase))
                (recur (conj out (read-row rs))))
-           out)))))
+           out)))))))
 
 (defn begin!
   "Establish one transaction-local authorization and decoding context."

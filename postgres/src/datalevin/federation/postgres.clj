@@ -52,8 +52,8 @@
       (catch Exception _ nil))))
 
 (defn- reserve-cursor! [ctl accepted candidate bindings profile]
-  (let [fixed (* 4 (value/value-charge [candidate bindings]))]
-    (loop [n (:fetch-size profile)]
+  (let [fixed (* 8 (value/value-charge [candidate bindings]))]
+    (loop [n (if (= 1 (get-in candidate [:query :max-rows])) 1 (:fetch-size profile))]
       (let [bytes (+ fixed (if (:relational? candidate)
                             (+ 131072 (* n (+ (* 16 (:max-row-bytes profile))
                                               (* 1024 (get-in candidate [:query :physical-columns])) 2048)))
@@ -68,7 +68,7 @@
         ;; runs, retaining the same row cap and shared query memory limit.
         (if result [result n] (recur (max 1 (quot n 2))))))))
 
-(defn- next-row! [{:keys [accepted candidate inputs context state metrics]}]
+(defn- next-row! [{:keys [accepted candidate inputs context state metrics decoder]}]
   (loop []
     (jdbc/check! context)
     (when (:closed? @state) (fail! :query-source/invalid :fetch))
@@ -83,7 +83,7 @@
                               (zipmap (map :variable (:requires candidate)) (:values input)))]
           (when snapshot? (swap! metrics update :read-rows inc))
           (swap! state assoc :remaining (next remaining))
-          (if-let [result (if (:relational? candidate) row (plan/match-row accepted candidate bindings row))]
+          (if-let [result (if (:relational? candidate) row (@decoder bindings row))]
             (let [pending {:row result :id (:binding-id input)}]
               (swap! state assoc :pending pending) pending)
             (recur)))
@@ -92,10 +92,10 @@
               rows (jdbc/query! context :fetch (str "FETCH FORWARD " n " FROM " portal) []
                                 (fn [^ResultSet rs]
                                   (if (:ordinal? candidate)
-                                    (let [decoded (relational/read-row (:query candidate) rs)]
+                                    (let [decoded (@decoder rs)]
                                       [(int (first decoded)) (vec (rest decoded))])
                                     [(if inputs (.getInt rs 1) 0)
-                                     (if (:relational? candidate) (relational/read-row (:query candidate) rs)
+                                     (if (:relational? candidate) (@decoder rs)
                                          (plan/read-row accepted projection rs (if inputs 1 0)))])))]
           (swap! metrics update :read-rows + (count rows))
           (swap! state assoc :remaining (seq rows) :more? (= n (count rows)))
@@ -107,11 +107,19 @@
               query (cond (:join? candidate) (joins/batch-query candidate (subvec inputs input-index end) max-row-bytes)
                           (:relational? candidate) (:query candidate)
                           inputs (plan/batch-sql accepted candidate (subvec inputs input-index end) max-row-bytes)
-                          :else (plan/sql accepted candidate (:bindings candidate) max-row-bytes))
-              portal (str "dtlv_" (.replace (str (UUID/randomUUID)) "-" ""))]
-          (jdbc/execute! context :open (str "DECLARE " portal " NO SCROLL CURSOR FOR " (:sql query)) (:params query))
-          (swap! state assoc :portal portal :projection (select-keys query [:columns :presence-columns]) :more? true
-                 :input-index end :input-start input-index)
+                          :else (plan/sql accepted candidate (:bindings candidate) max-row-bytes))]
+          (if (and (:relational? candidate) (nil? inputs) (= 1 (:max-rows query)))
+            ;; The compiler proves scalar aggregation returns at most one row.
+            ;; A normal SELECT with fetch size zero permits parallel execution;
+            ;; DECLARE/FETCH portals suppress it. Keep the same bounded decoder.
+            (let [rows (jdbc/query! context :fetch (:sql query) (:params query)
+                                   (fn [^ResultSet rs] [0 (@decoder rs)]) 1 0)]
+              (swap! metrics update :read-rows + (count rows))
+              (swap! state assoc :remaining (seq rows) :input-index end :input-start input-index))
+            (let [portal (str "dtlv_" (.replace (str (UUID/randomUUID)) "-" ""))]
+              (jdbc/execute! context :open (str "DECLARE " portal " NO SCROLL CURSOR FOR " (:sql query)) (:params query))
+              (swap! state assoc :portal portal :projection (select-keys query [:columns :presence-columns]) :more? true
+                     :input-index end :input-start input-index)))
           (recur))
         :else nil))))
 
@@ -125,7 +133,7 @@
                          (throw e))))]
       (if token [token window] (recur (max minimum (quot window 2)))))))
 
-(defrecord Cursor [accepted candidate inputs context state metrics reservation session-state]
+(defrecord Cursor [accepted candidate inputs context state metrics reservation session-state decoder]
   spi/IQuerySourceCursor
   (-next-batch! [this {:keys [control max-rows max-bytes]}]
     (ensure! (and (identical? control (:control context)) (pos-int? max-rows) (pos-int? max-bytes)) :fetch)
@@ -168,6 +176,7 @@
         (close-portal! context state)
         (reset! inputs nil)
         (reset! candidate nil)
+        (reset! decoder nil)
         (reset! state {:closed? true})
         (spi/release! reservation)
         (swap! session-state update :cursors disj this)))
@@ -193,13 +202,16 @@
                                                                                     (:values (when owned-inputs (nth owned-inputs i)))))]
                                                              (map #(vector i %) (row-source bindings))))
                                                          (range (if owned-inputs (count owned-inputs) 1)))}
-                                     {:input-index 0})) metrics token state)]
+                                     {:input-index 0})) metrics token state
+                             (atom (if (:relational? owned-candidate)
+                                     (relational/row-reader (:query owned-candidate))
+                                     (plan/row-matcher accepted owned-candidate))))]
         (swap! state update :cursors conj cursor)
         cursor)
       (catch Throwable e (spi/release! token) (throw e)))))
 
 (defn- compile-relational! [ctl views request max-row-bytes decline-on-limit?]
-  (let [n (count (filter #(= :pattern (:kind %)) (:clauses request)))]
+  (let [n (count (filter #(#{:pattern :optional} (:kind %)) (:clauses request)))]
     (when (<= 1 n 32)
       (let [token (try (spi/reserve! ctl {:retained-bytes (+ 1048576 (* 32768 n n))})
                        (catch clojure.lang.ExceptionInfo e
@@ -348,10 +360,15 @@
               result)
             (finally (spi/release! token))))))))
 
-(defn- descriptor [accepted profile]
-  (assoc (mapping/source-info accepted (:compute-context-id profile))
-         :read-capabilities #{:snapshot}
-         ::accepted accepted))
+(defn- descriptor [accepted profile compiled]
+  (cond-> (assoc (mapping/compiled-source-info compiled (:compute-context-id profile))
+                 :read-capabilities #{:snapshot}
+                 :datalevin.query.source/native-extrema-relational? true
+                 :datalevin.query.source/absence-relational? true
+                 :datalevin.query.source/boolean-filters-relational? true
+                 :datalevin.query.source/nullable-projections-relational? true ::accepted accepted)
+    (:predicate-prefilters? profile)
+    (assoc :datalevin.query.source/predicate-prefilters #{:like-any})))
 
 (defn- capture!
   "Capture one bounded owned relation before publishing a replayable session."
@@ -433,9 +450,8 @@
       (reset! limiter (spi/request-limiter ctl request-constraints))
       (let [views (into {}
                     (map (fn [d]
-                           (let [accepted (::accepted d)]
-                             (pm/compiled! accepted)
-                             (ensure! (and (= d (descriptor accepted profile))
+                           (let [accepted (::accepted d) compiled (pm/compiled! accepted)]
+                             (ensure! (and (= d (descriptor accepted profile compiled))
                                            (= (:source-instance-id d) (get-in source [:descriptor :source-instance-id])))
                                       :acquisition)
                              [(:definition-fingerprint d) (cond-> {:descriptor d :accepted accepted :statistics (atom nil)}
@@ -467,7 +483,9 @@
                               " FROM " (when (and narrow? (= "r" kind)) "ONLY ")
                               (jdbc/relation (:table requirements)) " LIMIT 0") [] (constantly nil)))
           (doseq [{:keys [accepted statistics]} (vals views)]
-            (let [columns (when (and (:statistics? profile) (not (pm/spooled? accepted)))
+            (let [columns (when (and (:statistics? profile)
+                                     (not (false? (:datalevin.query.source/estimates? request)))
+                                     (not (pm/spooled? accepted)))
                             (vec (keys (get-in accepted [:requirements :columns]))))
                   _ (when columns
                       (swap! reservations conj (spi/reserve! ctl {:retained-bytes (+ 1024 (* 512 (count columns)))})))
@@ -524,7 +542,8 @@
         (plan/choices descriptor request (:fusion? profile))))
 
 (defn- estimate-request [request]
-  (select-keys request [:source-symbol :region-id :scope-id :clauses :bindings :max-alternatives]))
+  (select-keys request [:source-symbol :region-id :scope-id :clauses :bindings :max-alternatives
+                        :available-inputs :required-vars :demand]))
 
 (defn- estimate-reservation [ctl bytes]
   (try (spi/reserve! ctl {:retained-bytes bytes})
@@ -532,30 +551,46 @@
          (when-not (and (= :query-source/limit (:error (ex-data e)))
                         (= :retained-bytes (:category (ex-data e)))) (throw e)))))
 
-(defn- filter-queries [descriptor accepted profile request]
-  (into [] (keep (fn [candidate]
-                   (when-let [query (plan/estimate-sql accepted candidate)] [(:id candidate) query])))
-        (access-candidates descriptor accepted profile request)))
+(defn- prepared-access! [descriptor accepted profile session request]
+  ;; One session-owned preparation feeds the estimate quote, optional probes,
+  ;; and the final opaque plan handles. It never crosses query/session bounds.
+  (let [key (assoc (estimate-request request) :definition-fingerprint (:definition-fingerprint descriptor))
+        slot [(:source-symbol request) (:region-id request)] state (:state session)]
+    (or (let [prepared (get-in @state [:prepared-access slot])]
+          (when (= key (:request prepared)) prepared))
+        (when-let [scratch (estimate-reservation (:control request)
+                            (+ 1048576 (*' 8 (:max-alternatives request) (value/value-charge key))))]
+          (try
+            (let [candidates (access-candidates descriptor accepted profile request)
+                  queries (if (and (:statistics? profile) (:filtered-statistics? profile)
+                                   (not (pm/spooled? accepted)))
+                            (into [] (keep (fn [candidate]
+                                             (when-let [query (plan/estimate-sql accepted candidate)]
+                                               [(:id candidate) query]))) candidates) [])
+                  data {:request key :candidates candidates :queries queries}]
+              (when-let [token (estimate-reservation (:control request) (+ 1024 (* 4 (value/value-charge data))))]
+                (swap! (:reservations session) conj token)
+                (let [owned (value/owned-copy data)]
+                  (when-let [previous (get-in @state [:prepared-access slot :reservation])]
+                    (spi/release! previous))
+                  (swap! state assoc-in [:prepared-access slot] (assoc owned :reservation token))
+                  owned)))
+            (finally (spi/release! scratch)))))))
 
 (defn- request-cost [session]
   (let [{:keys [count elapsed-ns]} @(get-in session [:context :request-observation])]
     (when (pos? count) (max 1 (long (Math/ceil (/ (double elapsed-ns) count)))))))
 
 (defn- estimation-info [descriptor accepted profile session request]
-  (let [key (estimate-request request) ctl (:control request)]
-    (when-let [scratch (estimate-reservation ctl
-                        (+ 1048576 (*' 8 (:max-alternatives request) (value/value-charge key))))]
-      (try
-        (let [observed (statistics/reference-statistics accepted
-                         @(get-in session [:views (:definition-fingerprint descriptor) :statistics]) (vals (:views session)))
-              candidates (access-candidates descriptor accepted profile request)
-              rows (keep #(when (empty? (:requires %)) (:rows (statistics/estimate accepted % observed))) candidates)
-              n (if (and (:statistics? profile) (:filtered-statistics? profile) (not (pm/spooled? accepted)))
-                  (count (distinct (keep #(plan/estimate-sql accepted %) candidates))) 0)
-              cost (request-cost session)]
-          {:rows (when (seq rows) (reduce min rows)) :relation-rows (:rows observed) :batch-rows (:fetch-size profile)
-           :request-ns cost :probe-requests n :estimated-ns (when cost (*' 2 cost n))})
-        (finally (spi/release! scratch))))))
+  (when-let [prepared (prepared-access! descriptor accepted profile session request)]
+    (let [observed (statistics/reference-statistics accepted
+                     @(get-in session [:views (:definition-fingerprint descriptor) :statistics]) (vals (:views session)))
+          candidates (:candidates prepared)
+          rows (keep #(when (empty? (:requires %)) (:rows (statistics/estimate accepted % observed))) candidates)
+          n (count (distinct (map second (:queries prepared))))
+          cost (request-cost session)]
+      {:rows (when (seq rows) (reduce min rows)) :relation-rows (:rows observed) :batch-rows (:fetch-size profile)
+       :request-ns cost :probe-requests n :estimated-ns (when cost (*' 2 cost n))})))
 
 (defn- prepare-estimates! [descriptor accepted profile session request budget]
   (when (and (:statistics? profile) (:filtered-statistics? profile) (not (pm/spooled? accepted))
@@ -569,7 +604,7 @@
                             (+ 1048576 (*' 8 (:max-alternatives request) (value/value-charge key))))]
           (try
             (let [started (System/nanoTime)
-                  queries (filter-queries descriptor accepted profile request)
+                  queries (:queries (prepared-access! descriptor accepted profile session request))
                   rows (loop [pending (seq (distinct (map second queries))) n 0 rows {}]
                          (if (and pending (< n (:max-requests budget))
                                   (<= (+ (- (System/nanoTime) started) (*' 2 (or (request-cost session) Long/MAX_VALUE)))
@@ -616,7 +651,9 @@
                               :scope-id (:scope-id request) :completion :all-bindings
                               :access {:kind :join :anchor-clause (get-in candidate [:anchor :id])}
                               :properties {:replay :identical :ordering [] :blocking-state :none}
-                              :constraints plan/constraints :estimate (:estimate candidate)
+                              :constraints plan/constraints
+                              :estimate (statistics/with-request-cost (:estimate candidate) true
+                                          (request-cost session) (:fetch-size profile))
                               :explain {:label "PostgreSQL filtered dependent join"}})
                            (catch Throwable e (spi/release! token) (throw e)))))
                      (joins/alternatives views request (:max-row-bytes profile)))
@@ -634,7 +671,8 @@
     nil)
   spi/IRelationalWindowSource
   (-plan-relational-window [_ request]
-    (when (and (:relational? profile) (= :relational-window (:mode request)))
+    (when (and (:relational? profile) (not= :dependent (:whole-query-mode profile))
+               (= :relational-window (:mode request)))
       (let [sources (:sources request)
             views (into {} (map (fn [{:keys [symbol descriptor]}] [symbol (::accepted descriptor)])) sources)]
         (when (and (= descriptor (:descriptor (first sources))) (every? some? (vals views))
@@ -642,18 +680,20 @@
           {:columns (:columns request)
            :plan {:sources (mapv (fn [{:keys [symbol descriptor]}]
                                   {:symbol symbol :definition-fingerprint (:definition-fingerprint descriptor)}) sources)
-                  :query (select-keys request [:mode :semantics-version :clauses :bindings :find :with :columns :window])}}))))
+                  :query (select-keys request [:mode :semantics-version :clauses :bindings :find :with :columns :window :datalevin.query.source/ignore-nil-extrema])}}))))
   spi/IRelationalQuerySource
   (-plan-relational [_ request]
-    (when (:relational? profile)
+    (when (and (:relational? profile) (not= :dependent (:whole-query-mode profile)))
       (let [sources (:sources request)
             views (into {} (map (fn [{:keys [symbol descriptor]}] [symbol (::accepted descriptor)])) sources)]
         (when (and (= descriptor (:descriptor (first sources))) (every? some? (vals views))
+                   (or (= :sql (:whole-query-mode profile))
+                       (nil? (plan/dependent-preference views request)))
                    (compile-relational! (:control request) views request (:max-row-bytes profile) true))
           {:columns (:columns request)
            :plan {:sources (mapv (fn [{:keys [symbol descriptor]}]
                                   {:symbol symbol :definition-fingerprint (:definition-fingerprint descriptor)}) sources)
-                  :query (select-keys request [:mode :semantics-version :clauses :bindings :find :with :columns])}}))))
+                  :query (select-keys request [:mode :semantics-version :clauses :bindings :find :with :columns :datalevin.query.source/native-extrema :datalevin.query.source/ignore-nil-extrema])}}))))
   spi/IRelationalFragmentSource
   (-plan-relational-fragment [_ request]
     (when (and (:relational? profile) (= :relational-fragment (:mode request)) (seq (:inputs request)))
@@ -664,7 +704,7 @@
           {:columns (:columns request) :constraints (select-keys plan/constraints [:max-binding-rows :max-binding-bytes])
            :plan {:sources (mapv (fn [{:keys [symbol descriptor]}]
                                   {:symbol symbol :definition-fingerprint (:definition-fingerprint descriptor)}) sources)
-                  :query (select-keys request [:mode :semantics-version :clauses :bindings :find :with :columns :inputs])}}))))
+                  :query (select-keys request [:mode :semantics-version :clauses :bindings :find :with :columns :inputs :datalevin.query.source/ignore-nil-extrema])}}))))
   spi/IQuerySource
   (-source-info [_] descriptor)
   (-open-session [this request] (acquire this request))
@@ -672,7 +712,11 @@
     (let [state (:state session) ctl (:control request)]
       (locking state
         (plan-request! descriptor session request)
-        (let [observed (statistics/reference-statistics accepted
+        (let [access (get-in @state [:prepared-access [(:source-symbol request) (:region-id request)]])
+              candidates (if (= (assoc (estimate-request request) :definition-fingerprint (:definition-fingerprint descriptor))
+                                (:request access))
+                           (:candidates access) (access-candidates descriptor accepted profile request))
+              observed (statistics/reference-statistics accepted
                          @(get-in session [:views (:definition-fingerprint descriptor) :statistics]) (vals (:views session)))
               prepared (get-in @state [:estimates [(:source-symbol request) (:region-id request)]])
               filtered (when (= (estimate-request request) (:request prepared)) (:counts prepared))]
@@ -683,7 +727,8 @@
                      token (spi/reserve! ctl {:retained-bytes (+ 4096 (* 4 (value/value-charge candidate)))})]
                  (try
                    (let [handle (Object.)]
-                     (swap! state assoc-in [:plans handle] (value/owned-copy candidate))
+                     (swap! state assoc-in [:plans handle]
+                            (if (identical? candidates (:candidates access)) candidate (value/owned-copy candidate)))
                      (swap! (:reservations session) conj token)
                      {:id id :plan handle :covers (set (map :id (:clauses candidate)))
                       :prefilters (set (map :id predicates)) :requires requires :columns columns
@@ -691,10 +736,12 @@
                       :access {:kind kind :anchor-clause (:id anchor)}
                       :properties {:replay :identical :ordering [] :blocking-state :none}
                       :constraints plan/constraints
-                      :estimate (statistics/estimate accepted candidate observed (get filtered id))
+                      :estimate (statistics/with-request-cost
+                                  (statistics/estimate accepted candidate observed (get filtered id))
+                                  (boolean (seq requires)) (request-cost session) (:fetch-size profile))
                       :explain {:label "PostgreSQL table access"}})
                    (catch Throwable e (spi/release! token) (throw e)))))
-             (access-candidates descriptor accepted profile request))})))))
+             candidates)})))))
 
 (defn source
   "Reopen accepted metadata without I/O. Runtime profiles require a public
@@ -703,9 +750,9 @@
   Optional :fusion? false offers separate EAV accesses for conformance checks.
   Set :relational? false to keep joins and aggregation in the core engine."
   [accepted profile]
-  (pm/compiled! accepted)
   (ensure! (some? (:compute-context-id profile)) :profile)
-  (let [profile (jdbc/profile! profile) d (descriptor accepted profile)]
+  (let [compiled (pm/compiled! accepted)
+        profile (jdbc/profile! profile) d (descriptor accepted profile compiled)]
     (spi/validate-source-info! d)
     (->PostgresSource d accepted profile (atom {:external-requests 0 :live-sessions 0}))))
 

@@ -344,37 +344,51 @@
               (every? true? (map key-matches? (:elements type) x)))
          (value/matches-type? type x))))
 
+(defn reference-constructor
+  "Prepare one owned, validated nominal type for repeated key construction.
+  The returned function retains immutable type metadata, never previously seen
+  keys or references. Every key still obeys the complete codec/type limits."
+  ([descriptor] (reference-constructor descriptor codec-limits))
+  ([descriptor limits]
+   (try
+     (preflight! descriptor (budget limits) 0 true)
+     (validate-type! descriptor)
+     (let [limits (into {} (limits! limits))
+           encoded (budget limits)
+           type-wire (immutable-bytes (encode-child (metadata-normalize descriptor) encoded 1))
+           inspected (budget limits)
+           _ (node! inspected 0)
+           descriptor (decode-node (DataInputStream. (ByteArrayInputStream. (byte-array-of type-wire))) inspected 1)
+           types (get-in descriptor [:parameters :key-types])
+           encoded-nodes @(:nodes encoded)
+           type-nodes @(:nodes inspected) type-depth @(:depth inspected)
+           base (+' 256 (value/value-charge descriptor) (value/value-charge type-wire))]
+       (fn [key]
+         (try
+           (preflight! key (budget limits) 0 true)
+           (ensure! (and (vector? key) (= (count types) (count key))
+                         (every? true? (map key-matches? types key))))
+           (let [state (budget limits)
+                 _ (vreset! (:nodes state) encoded-nodes)
+                 key-wire (immutable-bytes (encode-child (key-normalize key) state 1))
+                 inspected (budget limits)
+                 _ (vreset! (:nodes inspected) type-nodes)
+                 _ (vreset! (:depth inspected) type-depth)
+                 ;; Nested reference envelopes still contribute their complete
+                 ;; depth/node counts, including the outer envelope node.
+                 _ (decode-node (DataInputStream. (ByteArrayInputStream. (byte-array-of key-wire))) inspected 1)
+                 retained (+' base (value/value-charge key-wire))]
+             (ensure! (<= (+ 12 (count type-wire) (count key-wire)) (:max-bytes limits)))
+             (EntityRef. descriptor type-wire key-wire (long retained)
+                         (long @(:nodes inspected)) (long @(:depth inspected))))
+           (catch Exception _ (invalid!)))))
+     (catch Exception _ (invalid!)))))
+
 (defn entity-ref
   "Construct an owned reference from a complete type and a non-null key tuple.
   Mutable key leaves are encoded immediately and never retained or exposed."
   ([descriptor key] (entity-ref descriptor key codec-limits))
-  ([descriptor key limits]
-   (try
-     (preflight! descriptor (budget limits) 0 true)
-     (preflight! key (budget limits) 0 true)
-     (validate-type! descriptor)
-     (let [types (get-in descriptor [:parameters :key-types])
-           state (budget limits)]
-       (ensure! (and (vector? key) (= (count types) (count key))
-                     (every? true? (map key-matches? types key))))
-       (let [type-wire (immutable-bytes (encode-child (metadata-normalize descriptor) state 1))
-             key-wire (immutable-bytes (encode-child (key-normalize key) state 1))
-             inspected (budget limits)
-             _ (node! inspected 0)
-             ;; Decoding canonical metadata drops metadata/backing views, while
-             ;; preserving the complete accepted descriptor under map equality.
-             descriptor (decode-node (DataInputStream. (ByteArrayInputStream. (byte-array-of type-wire)))
-                                     inspected 1)
-             ;; Include nested reference envelopes in depth/node admission. The
-             ;; immutable wire strings retain these measurements for encoding.
-             _ (decode-node (DataInputStream. (ByteArrayInputStream. (byte-array-of key-wire)))
-                            inspected 1)
-             retained (+' 256 (value/value-charge descriptor)
-                          (value/value-charge type-wire) (value/value-charge key-wire))]
-         (ensure! (<= (+ 12 (count type-wire) (count key-wire)) (:max-bytes limits)))
-         (EntityRef. descriptor type-wire key-wire (long retained)
-                     (long @(:nodes inspected)) (long @(:depth inspected)))))
-     (catch Exception _ (invalid!)))))
+  ([descriptor key limits] ((reference-constructor descriptor limits) key)))
 
 (defn key-tuple
   "Return a detached typed key tuple. Mutating returned leaves cannot change x."

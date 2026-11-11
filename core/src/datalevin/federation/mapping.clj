@@ -295,11 +295,10 @@
      :definition-fingerprint (fp/accepted-fingerprint :definition payload)
      :fingerprint-scheme :federation/v2}))
 
-(defn- project-record [accepted entity-key extracted]
+(defn- project-record [accepted entity-reference references entity-key extracted]
   (require! (value/plain-map? extracted))
   (require! (every? #(contains? (:attributes accepted) %) (keys extracted)))
-  (let [entity-type (get-in accepted [:identity :type])
-        entity (ref/entity-ref entity-type entity-key)
+  (let [entity (entity-reference entity-key)
         identity-attribute (get-in accepted [:identity :attribute])
         identity-value (if (= 1 (count entity-key)) (first entity-key) entity-key)
         facts (QueryKey$KeySet.)]
@@ -315,7 +314,7 @@
                           composite? (> (count (get-in t [:parameters :key-types])) 1)]
                       (if (ref/entity-ref? x)
                         (do (require! (= t (value/-logical-type x))) x)
-                        (ref/entity-ref t (if composite? x [x]))))
+                        ((references a) (if composite? x [x]))))
                     (do (require! (value/matches-type? (:type body) x)) (value/owned-copy x)))]
             (.add facts [entity a x])))))
     (vec facts)))
@@ -328,11 +327,15 @@
   Extracted values must already have exact accepted types; no I/O occurs."
   [{:keys [accepted] :as compiled}]
   (require! (= compiled (compile-logical-mapping accepted)))
+  (let [entity-reference (ref/reference-constructor (get-in accepted [:identity :type]))
+        references (into {} (keep (fn [[a body]]
+                                    (when-let [type (get-in body [:reference :type])]
+                                      [a (ref/reference-constructor type)]))) (:attributes accepted))]
   (fn
-    ([entity-key extracted] (project-record accepted entity-key extracted))
+    ([entity-key extracted] (project-record accepted entity-reference references entity-key extracted))
     ([entity-key extracted attributes]
      (require! (and (set? attributes) (every? #(contains? (:attributes accepted) %) attributes)))
-     (project-record (update accepted :attributes select-keys attributes) entity-key extracted))))
+     (project-record (update accepted :attributes select-keys attributes) entity-reference references entity-key extracted)))))
 
 (defn project-facts
   "Project one provider-normalized record to distinct, non-null EAV facts.
@@ -343,7 +346,10 @@
   [compiled entity-key extracted]
   ((fact-projector compiled) entity-key extracted))
 
-(defn- compiled-source-info [compiled compute-context-id]
+(defn compiled-source-info
+  "Build a descriptor from a validated compile-logical-mapping result. Reuse
+  its validated schema and fingerprints within the same preparation operation."
+  [compiled compute-context-id]
   (require! (some? compute-context-id))
   (let [accepted (:accepted compiled)
         descriptor (merge (select-keys compiled [:pattern-contract :logical-schema :definition-fingerprint])

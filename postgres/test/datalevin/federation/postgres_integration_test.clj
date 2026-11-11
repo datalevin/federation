@@ -88,6 +88,45 @@
 (defn delegated-window [explanation]
   (some :result-window (:regions explanation)))
 
+(deftest whole-query-policy-expands-large-text-joins-and-honors-source-boundaries
+  (let [symbols (mapv #(symbol (str "$p" %)) (range 9))
+        q {:find '[(min ?title)] :in symbols
+           :where (conj (mapv #(vector % '?e :order/title '?title) symbols) '[(like ?title "A%")])
+           :query-source {:native-extrema {'?title {:source '$p0 :attribute :order/title}}}}]
+    (doseq [mode [:auto :sql :dependent]
+            :let [provider (source {:whole-query-mode mode}) providers (repeat 9 provider)
+                  explained (apply d/explain {:run? true} q providers)]]
+      (is (= (not= :dependent mode) (boolean (relational-plan? explained))))
+      (is (= #{["Alpha"]} (set (apply d/q q providers))))
+      (is (zero? (:live-sessions (pg/statistics provider)))))
+    (let [a (source {:whole-query-mode :sql})
+          b (source {:whole-query-mode :sql :compute-context-id :tests/another-context})
+          q '{:find [(count ?title)] :in [$a $b]
+              :where [[$a ?e :order/title ?title] [$b ?e :order/title ?title]]}]
+      (is (= #{[3]} (set (d/q q a b))))
+      (is (not (relational-plan? (d/explain {:run? false} q a b)))))
+    (let [provider (source {:whole-query-mode :sql})
+          q '[:find ?same :in $p :where [$p ?e :order/title ?title] [(identity ?title) ?same]]]
+      (is (= #{["Alpha"] ["βeta"] ["x'; DROP TABLE orders; --"]} (set (d/q q provider))))
+      (is (not (relational-plan? (d/explain {:run? false} q provider)))))))
+
+(deftest direct-extrema-and-mixed-reducers-preserve-join-witness-semantics
+  (sql! (str "CREATE TABLE " (table "duplicate_inputs") " (id bigint PRIMARY KEY,g bigint,n bigint)"))
+  (sql! (str "INSERT INTO " (table "duplicate_inputs") " VALUES (1,1,10),(2,1,10),(3,1,20),(4,1,NULL)"))
+  (let [accepted (pg/accept-mapping (pg/discover *profile* [*schema* "duplicate_inputs"])
+                   {:source-instance-id unit/source-id :relation-id :test/duplicates :identity-attribute :dup/id
+                    :attributes {:dup/g "g" :dup/n "n"}})
+        p (pg/source accepted *profile*)
+        base '{:in [$a $b] :where [[$a ?a :dup/g ?g] [$a ?a :dup/n ?n] [$b ?b :dup/g ?g]]}]
+    (doseq [with [[] '[?b] '[?a ?b]]
+            :let [q (assoc base :with with :find '[(min ?n) (max ?n)])]]
+      (is (= #{[10 20]} (set (d/q q p p))))
+      (is (relational-plan? (d/explain {:run? false} q p p))))
+    (doseq [[with n] [[[] 2] ['[?b] 8] ['[?a ?b] 12]]
+            :let [q (assoc base :with with :find '[(min ?n) (max ?n) (count ?n)])]]
+      (is (= #{[10 20 n]} (set (d/q q p p))))
+      (is (relational-plan? (d/explain {:run? false} q p p))))))
+
 (deftest explicit-native-text-extrema-compose-bounded-groups-in-the-column-collation
   (sql! (str "CREATE TABLE " (table "native_extrema")
              " (id bigint PRIMARY KEY, g bigint, v text COLLATE \"C\")"))
@@ -921,6 +960,35 @@
                        (object-array [(prepare (aget ^objects args 0))]) args)]
             (try (.invoke method connection args)
                  (catch InvocationTargetException e (throw (.getCause e))))))))))
+
+(deftest scalar-aggregates-use-direct-select-while-grouped-results-stay-paged
+  (let [statements (atom []) url (:jdbc-url *profile*)
+        url (str url (if (.contains ^String url "?") "&" "?") "defaultRowFetchSize=3")
+        pool (data-source #(intercepted-connection url (fn [sql] (swap! statements conj sql) sql)))
+        p (pg/source *accepted* (-> *profile* (dissoc :jdbc-url) (assoc :data-source pool)))]
+    (is (= #{[3]} (set (d/q '[:find (count ?title) :in $p :where [$p ?e :order/title ?title]] p))))
+    (is (some #(.startsWith ^String % "WITH matched AS") @statements))
+    (is (not-any? #(.startsWith ^String % "DECLARE ") @statements))
+    (reset! statements [])
+    (is (= #{["paid" 3] ["held" 1]}
+           (set (d/q '[:find ?status (count ?e) :in $p :where [$p ?e :order/status ?status]] p))))
+    (is (some #(and (.startsWith ^String % "DECLARE ") (.contains ^String % "WITH matched AS")) @statements))
+    (is (zero? (:live-sessions (pg/statistics p))))))
+
+(deftest bounded-direct-jdbc-queries-force-fetch-size-zero-and-reject-extra-rows
+  (let [url (:jdbc-url *profile*)
+        url (str url (if (.contains ^String url "?") "&" "?") "defaultRowFetchSize=3")
+        decoded (atom 0)]
+    (with-open [conn (DriverManager/getConnection url)]
+      (let [context {:connection conn :profile (jdbc/profile! *profile*) :cancelled (atom false)}
+            decode (fn [^java.sql.ResultSet rs]
+                     (is (zero? (.getFetchSize (.getStatement rs))))
+                     (swap! decoded inc) (.getInt rs 1))]
+        (is (= [1] (jdbc/query! context :fetch "SELECT 1" [] decode 1 0)))
+        (reset! decoded 0)
+        (is (= :query-source/limit (category #(jdbc/query! context :fetch "SELECT generate_series(1,2)" [] decode 1 0))))
+        (is (= 1 @decoded))
+        (is (= [1] (jdbc/query! context :fetch "SELECT 1" [] decode 1 0)))))))
 
 (deftest cancellation-unblocks-real-jdbc-fetch
   (let [entered (CountDownLatch. 1) url (:jdbc-url *profile*)
@@ -2455,6 +2523,19 @@
       (let [changed (assoc-in planning [:clauses 1 :args 1] [:const "A%"])
             alternative (first (:alternatives (spi/-plan-source provider session changed)))]
         (is (= "postgres-catalog-cardinality-v1" (get-in alternative [:estimate :provenance :id]))))
+      ;; Availability and projection are part of preparation, even when the
+      ;; clauses and their estimate SQL have not changed.
+      (let [projected (assoc planning :required-vars #{'?value})
+            _ (spi/-estimation-info provider session projected)
+            alternatives (:alternatives (spi/-plan-source provider session projected))]
+        (is (every? #(= ['?value] (mapv :variable (:columns %))) alternatives))
+        (let [expanded (assoc planning :required-vars #{'?e '?value}
+                             :available-inputs [{:variable '?e :type (get-in (spi/-source-info provider)
+                                                                             [:pattern-contract :attributes :like/value :entity-type])
+                                                 :nullable? false}])
+              expanded-alternatives (:alternatives (spi/-plan-source provider session expanded))]
+          (is (some #(= :entity-lookup (get-in % [:access :kind])) expanded-alternatives))
+          (is (some #(contains? (set (map :variable (:columns %))) '?e) expanded-alternatives))))
       ;; An unadmittable optional scratch estimate falls back without consuming a request.
       (let [large (assoc planning :max-alternatives 1000000)
             before (:external-requests (control/usage ctl))]
@@ -2466,6 +2547,18 @@
     (is (= {:closed? true} @(:state session)))
     (is (released? ctl))
     (control/close! ctl)))
+
+(deftest complete-plans-can-decline-optional-catalog-statistics
+  (let [provider (source)]
+    (doseq [estimates? [true false]]
+      (let [ctl (control/create)
+            acquisition (assoc (request provider ctl) :datalevin.query.source/estimates? estimates?)
+            session (spi/-open-session provider acquisition)]
+        (try
+          (let [statistics (map #(deref (:statistics %)) (vals (:views session)))]
+            (is (if estimates? (every? map? statistics) (every? nil? statistics))))
+          (finally (spi/-close-session! session) (control/close! ctl)))))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
 
 (deftest explain-statistics-never-execute-the-statement
   (sql! (str "CREATE SEQUENCE " (table "not_executed")))
@@ -2565,3 +2658,342 @@
       (finally (spi/-close-session! session)))
     (is (released? ctl))
     (control/close! ctl)))
+
+(deftest relational-like-predicates-keep-unicode-escape-and-null-semantics
+  (let [{:keys [accepted facts]} (like-fixture)
+        provider (pg/source accepted *profile*)]
+    (doseq [pattern ["A%" "%" "_" "__" "a_b" "a%b" "" "a!%b" "a!_b" "a!!b" "a\\b" "!" "a!" "%\n%"]
+            op '[like not-like]
+            :let [q (assoc (like-query :like/value (list op '?value pattern))
+                           :find '[(count ?value)] :with '[?id])]]
+      (is (= (set (d/q q facts)) (set (d/q q provider))) (pr-str [op pattern]))
+      (is (relational-plan? (d/explain {:run? false} q provider))))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
+(deftest disjunction-prefilters-are-advisory-complete-and-opt-in
+  (let [{:keys [accepted facts]} (like-fixture)
+        provider (pg/source accepted (assoc *profile* :relational? false))
+        legacy (pg/source accepted (assoc *profile* :relational? false :predicate-prefilters? false))
+        query (fn [calls] {:find '[?id ?value] :in '[$p]
+                           :where (into '[[$p ?e :like/id ?id] [$p ?e :like/value ?value]]
+                                        [(apply list 'or (map vector calls))])})
+        q (query '[(like ?value "A%") (like ?value "%Downey%")])
+        explained (d/explain {:run? true} q provider)
+        old (d/explain {:run? true} q legacy)]
+    (is (= (set (d/q q facts)) (set (d/q q provider)) (set (d/q q legacy))))
+    (is (= 5 (read-rows explained)))
+    (is (= 22 (read-rows old)))
+    (is (some #(seq (:prefilters %)) (mapcat :steps (:regions explained))))
+    (is (some #(= :union (:kind %)) (mapcat :operators (:regions explained))))
+    (doseq [calls ['[(like ?value "A%") (like ?value "猫%")]
+                   '[(like ?value "A%") (like ?value "a|%b" {:escape \|})]]
+            :let [q (query calls) plan (d/explain {:run? true} q provider)]]
+      (is (= (set (d/q q facts)) (set (d/q q provider))))
+      (is (= 22 (read-rows plan)))
+      (is (every? #(empty? (:prefilters %)) (mapcat :steps (:regions plan)))))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
+(deftest compound-filter-reduction-preserves-explicit-column-ordering
+  (sql! (str "CREATE TABLE " (table "native_reduce")
+             " (id bigint PRIMARY KEY, g bigint, v text COLLATE \"C\", w text COLLATE \"C\")"))
+  (let [supplementary (String. (Character/toChars 0x10000))]
+    (sql! (str "INSERT INTO " (table "native_reduce") " VALUES (1,1,'\uE000',NULL),(2,1,'" supplementary "',NULL),(3,2,NULL,NULL)"))
+    (let [accepted (accept-relation "native_reduce" {:reduce/g "g" :reduce/v "v" :reduce/w "w"}
+                                    {:identity-attribute :reduce/id})
+          provider (pg/source accepted *profile*)
+          fallback (pg/source accepted (assoc *profile* :relational? false))
+          query '{:find [(min ?v) (max ?v)] :in [$p]
+                  :where [[$p ?e :reduce/g ?g] [(= ?g 1)] [$p ?e :reduce/v ?v] [(not-like ?v "skip%")]]
+                  :query-source {:native-extrema {?v {:source $p :attribute :reduce/v}}}}
+          expected #{["\uE000" supplementary]}]
+      (is (= expected (set (d/q query provider)) (set (d/q query fallback))))
+      (is (relational-plan? (d/explain {:run? true} query provider)))
+      (is (not= expected (set (d/q (dissoc query :query-source) provider))))
+      (let [query (assoc-in query [:query-source :native-extrema '?v :attribute] :reduce/w)]
+        (is (= expected (set (d/q query provider))))
+        (is (not (relational-plan? (d/explain {:run? false} query provider)))))
+      (is (empty? (:cursors (d/explain {:run? false} query provider))))
+      (is (= #{} (set (d/q (assoc query :where (conj (:where query) '[(= ?g 99)])) provider))))
+      (is (zero? (:live-sessions (pg/statistics provider)))))))
+
+(deftest ascii-string-cutoffs-preserve-order-for-non-ascii-rows
+  (let [{:keys [accepted facts]} (like-fixture)
+        provider (pg/source accepted (assoc *profile* :relational? false))]
+    (doseq [operator '[= not= < <= > >=] cutoff ["" "A" "a" "~" "\u007f" "\uE000"]
+            :let [q (like-query :like/value (list operator '?value cutoff))]]
+      (is (= (set (d/q q facts)) (set (d/q q provider))) (pr-str [operator cutoff])))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
+(deftest native-reduction-rejects-nondeterministic-collations
+  (when (with-open [stmt (.createStatement ^Connection *db*)
+                   rs (.executeQuery stmt "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_collation WHERE collprovider='i')")]
+          (.next rs) (.getBoolean rs 1))
+    (sql! (str "CREATE COLLATION " (jdbc/relation [*schema* "fold_insensitive"])
+               " (provider=icu, locale='und-u-ks-level2', deterministic=false)"))
+    (sql! (str "CREATE TABLE " (table "fold_nondeterministic") " (id bigint PRIMARY KEY, v text COLLATE "
+               (jdbc/relation [*schema* "fold_insensitive"]) ")"))
+    (sql! (str "INSERT INTO " (table "fold_nondeterministic") " VALUES (1,'a'),(2,'A')"))
+    (let [provider (pg/source (accept-relation "fold_nondeterministic" {:row/value "v"}) *profile*)
+          q '{:find [(min ?v)] :in [$p]
+              :where [[$p ?e :row/value ?v] [(not-like ?v "skip%")]]
+              :query-source {:native-extrema {?v {:source $p :attribute :row/value}}}}]
+      (is (#{:query-source/invalid :query-source/unsupported} (category #(d/q q provider))))
+      (is (zero? (:live-sessions (pg/statistics provider)))))))
+
+(deftest whole-sql-preserves-binary-semantics-under-nondeterministic-collations
+  (when (with-open [stmt (.createStatement ^Connection *db*)
+                   rs (.executeQuery stmt "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_collation WHERE collprovider='i')")]
+          (.next rs) (.getBoolean rs 1))
+    (sql! (str "CREATE COLLATION " (jdbc/relation [*schema* "index_insensitive"])
+               " (provider=icu, locale='und-u-ks-level2', deterministic=false)"))
+    (sql! (str "CREATE TABLE " (table "index_values") " (id bigint PRIMARY KEY,v text COLLATE "
+               (jdbc/relation [*schema* "index_insensitive"]) ")"))
+    (sql! (str "INSERT INTO " (table "index_values") " VALUES (1,'a'),(2,'A'),(3,'u'),(4,'U')"))
+    (let [p (pg/source (accept-relation "index_values" {:row/value "v"}) (assoc *profile* :whole-query-mode :sql))]
+      (doseq [[operator x n] [['= "a" 1] ['not= "a" 3] ['in ["a" "u" nil] 2] ['not-in ["a" "u" nil] 2]]
+              :let [q {:find '[(count ?v)] :in '[$p]
+                       :where [['$p '?e :row/value '?v] [(list operator '?v x)]]}]]
+        (is (= #{[n]} (set (d/q q p))))
+        (is (relational-plan? (d/explain {:run? false} q p)))))))
+
+
+(deftest bound-absence-matches-eav-with-null-values-and-missing-entities
+  (doseq [relational? [true false]
+          q ['[:find ?id :in $p :where [$p ?e :order/id ?id] (not [$p ?e :order/note _])]
+             '[:find ?id :in $p :where (not [$p ?e :order/note _]) [$p ?e :order/id ?id]]
+             '[:find ?id :in $p :where [$p ?e :order/id ?id] (not-join [?e] [$p ?e :order/title ?local])]
+             '[:find (count ?id) :in $p :where [$p ?e :order/id ?id] (not [$p ?e :order/note _])]
+             '[:find (count ?id) :in $p :where [$p ?e :order/id ?id] (not-join [?id] [$p ?e :order/note _])]
+             '[:find ?id :in $p :where [$p ?e :order/id ?id] (not [$p ?e :order/note "present"])]
+             '[:find ?id :in $p :where [$p ?e :order/id ?id]
+               (not-join [?e] [$p ?e :order/note ?v] [$p ?e :order/amount _])]]]
+    (let [s (source {:relational? relational?})]
+      (is (= (set (d/q q (eager))) (set (d/q q s))) (pr-str [relational? q]))
+      (is (zero? (:live-sessions (pg/statistics s))))))
+  (let [q '[:find (count ?id) :in $p :where [$p ?e :order/id ?id] (not [$p ?e :order/note _])]
+        s (source)
+        explained (d/explain {:run? true} q s)]
+    (is (= #{[2]} (d/q q s)))
+    (is (relational-plan? explained))
+    (is (= 1 (read-rows explained))))
+  (let [type (get-in *accepted* [:identity :type])
+        keys (mapv #(ref/entity-ref type [%]) [1 2 999])
+        s (source)
+        q '[:find ?e :in $p [?e ...] :where (not [$p ?e :order/note _])]
+        anchored '[:find ?e :in $p [?e ...] :where [$p ?e :order/id _] (not [$p ?e :order/note _])]]
+    (is (= (set (map vector [(first keys) (last keys)])) (d/q q s keys)))
+    (is (= #{[(first keys)]} (d/q anchored s keys)))
+    (is (zero? (:live-sessions (pg/statistics s))))))
+
+(deftest absence-over-captured-views-and-present-falsey-values
+  (sql! (str "CREATE TABLE " (table "absence_values")
+             " (id bigint PRIMARY KEY, n bigint, b boolean, s text)"))
+  (sql! (str "INSERT INTO " (table "absence_values")
+             " VALUES (1,NULL,NULL,NULL),(2,0,FALSE,''),(3,1,TRUE,'present')"))
+  (sql! (str "CREATE VIEW " (table "absence_view") " AS SELECT * FROM " (table "absence_values")))
+  (doseq [relation ["absence_values" "absence_view"]]
+    (let [accepted (pg/accept-mapping (pg/discover *profile* [*schema* relation])
+                     (cond-> {:source-instance-id unit/source-id :relation-id :tests/absence
+                              :identity-attribute :row/id
+                              :attributes {:row/n "n" :row/b "b" :row/s "s"}}
+                       (= relation "absence_view") (assoc :key-columns ["id"])))
+          s (pg/source accepted *profile*)]
+      (doseq [attribute [:row/n :row/b :row/s]
+              :let [q {:find '[(count ?id)] :in '[$p]
+                       :where [['$p '?e :row/id '?id]
+                               (list 'not ['$p '?e attribute '_])]}]]
+        (is (= #{[1]} (set (d/q q s))))
+        (is (= (= relation "absence_values") (boolean (relational-plan? (d/explain {:run? false} q s))))))
+      (is (zero? (:live-sessions (pg/statistics s)))))))
+
+
+(deftest exact-absence-plans-admit-larger-graphs-with-native-text-extrema
+  (let [aliases (mapv #(symbol (str "$p" %)) (range 9))
+        provider (source)
+        query {:find '[(min ?title)] :in aliases
+               :where (into [['$p0 '?e :order/title '?title]
+                             '(not [$p0 ?e :order/note _])]
+                            (map #(vector % '?e :order/id '_)) aliases)
+               :query-source {:native-extrema {'?title {:source '$p0 :attribute :order/title}}}}
+        plan (apply d/explain {:run? true} query (repeat 9 provider))]
+    (is (relational-plan? plan))
+    (is (= #{["Alpha"]} (apply d/q query (repeat 9 provider))))
+    (is (= 1 (read-rows plan)))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
+(deftest scoped-or-inputs-survive-source-projection-without-filter-hints
+  (let [base '[[$p ?e :order/id ?id] [$p ?e :order/status ?status]]
+        queries
+        [(query '[?id] (conj base '(or-join [[?status]]
+                                    [(like ?status "p%")]
+                                    [(like ?status "h%")])))
+         (query '[?id] (conj base '(or-join [[?status]]
+                                    [(= ?status "paid")]
+                                    [(= ?status "held")])))
+         (query '[?id] (conj base '(or-join [[?status ?id]]
+                                    [(= ?status "held")]
+                                    (and [(= ?status "paid")] [(> ?id 2)]))))
+         (query '[?id] (into base '[[$p ?e :order/note ?note]
+                                   (or-join [[?status]] [(= ?status "paid")] [(= ?status "held")])
+                                   (or-join [[?note]] [(like ?note "pre%")] [(like ?note "other%")])]))]]
+    ;; These columns are only consumed inside the scoped OR bodies. No hint or
+    ;; whole-query SQL plan may supply the dependency accidentally.
+    (doseq [fusion? [true false]
+            :let [provider (source {:fusion? fusion? :relational? false :predicate-prefilters? false})]
+            q queries]
+      (is (= (d/q q (eager)) (d/q q provider)) (pr-str [fusion? q]))
+      (is (zero? (:live-sessions (pg/statistics provider)))))
+    (let [plan (d/explain {:run? false} (second queries)
+                 (source {:predicate-prefilters? false :relational? false}))]
+      (is (some #(= :union (:kind %)) (mapcat :operators (:regions plan)))))))
+
+
+(deftest bound-scalar-unions-delegate-complete-boolean-filters
+  (let [base '[[$p ?e :order/id ?id] [$p ?e :order/status ?status] [$p ?e :order/title ?title]
+               [$p ?other :order/id ?id]]
+        alternatives
+        ['(or-join [[?status ?title]]
+            [(= ?status "held")]
+            (and [(= ?status "paid")] [(like ?title "A%")]))
+         '(or-join [[?status ?title ?id]]
+            [(= ?status "held")]
+            (and [(= ?status "paid")]
+                 (or-join [[?title ?id]] [(like ?title "A%")] [(> ?id 1)])))
+         ;; Overlapping branches must not duplicate aggregate witnesses.
+         '(or-join [[?status ?title]] [(= ?status "paid")] [(like ?title "A%")])]
+        provider (source)]
+    (doseq [alternative alternatives find ['[?id] '[(count ?id)] '[(min ?id) (max ?id)]]
+            :let [q (query find (conj base alternative))
+                  plan (d/explain {:run? true} q provider)]]
+      (is (relational-plan? plan))
+      (is (= (set (d/q q (eager))) (set (d/q q provider))))
+      (is (zero? (:live-sessions (pg/statistics provider)))))
+    (let [q (assoc (query '[?id] (conj base (first alternatives))) :in '[$p ?wanted])
+          q (update q :where conj '[(= ?id ?wanted)])]
+      (is (relational-plan? (d/explain {:run? false} q provider 1)))
+      (is (= #{[1]} (d/q q provider 1))))
+    (doseq [alternative
+            ['(or-join [[?status ?title ?e]]
+                [(= ?status "held")]
+                (and [$p ?e :order/note ?note] [(like ?note "pre%")]))
+             '(or-join [[?status ?id]] [(= ?status "paid")] [(even? ?id)])]
+            :let [q (query '[?id] (conj base alternative))]]
+      (is (not (relational-plan? (d/explain {:run? false} q provider))))
+      (is (= (d/q q (eager)) (d/q q provider))))))
+
+(defn optional-fact [source entity attribute variable]
+  (list 'or-join [[entity] variable]
+        (list 'and [source entity attribute variable])
+        (list 'and (list 'not-join [entity] [source entity attribute '_])
+              [(list 'ground [nil]) [variable]])))
+
+(deftest scalar-boolean-filters-over-optional-nulls-retain-core-semantics
+  (let [provider (source)
+        q {:find '[(count ?id)] :in '[$p]
+           :where '[[$p ?e :order/id ?id] [$p ?e :order/status ?status]]}
+        q (update q :where into
+                  [(optional-fact '$p '?e :order/note '?note)
+                   '(or-join [[?note ?status]] [(= ?status "paid")] [(not= ?note "present")])])]
+    ;; Core not= accepts absent/nil; SQL NULL <> text is unknown.
+    (is (not (relational-plan? (d/explain {:run? false} q provider))))
+    (is (= #{[4]} (set (d/q q provider))))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
+(deftest independent-nullable-extrema-and-projections
+  (sql! (str "CREATE TABLE " (table "nullable_extrema")
+             " (id bigint PRIMARY KEY, a text COLLATE \"C\", b bigint)"))
+  (sql! (str "INSERT INTO " (table "nullable_extrema")
+             " VALUES (1,'Alpha',NULL),(2,'Zulu',1990),(3,NULL,2000),(4,NULL,NULL),"
+             "(5,'\uE000',NULL),(6,'" (String. (Character/toChars 0x10000)) "',1980)"))
+  (let [accepted (pg/accept-mapping (pg/discover *profile* [*schema* "nullable_extrema"])
+                   {:source-instance-id unit/source-id :relation-id :test/nullable-extrema
+                    :identity-attribute :row/id :attributes {:row/a "a" :row/b "b"}})
+        base {:find '[(min ?a) (min ?b)] :in '[$p]
+              :where [['$p '?e :row/id '?id]
+                      (optional-fact '$p '?e :row/a '?a)
+                      (optional-fact '$p '?e :row/b '?b)]
+              :query-source {:ignore-nil-extrema '#{?a ?b}
+                             :native-extrema {'?a {:source '$p :attribute :row/a}}}}]
+    (doseq [relational? [true false]
+            [predicate expected] [['(<= ?id 4) #{["Alpha" 1990]}]
+                                  ['(= ?id 1) #{["Alpha" nil]}]
+                                  ['(= ?id 3) #{[nil 2000]}]
+                                  ['(= ?id 4) #{[nil nil]}]
+                                  ['(> ?id 99) #{}]
+                                  ['(>= ?id 5) #{["\uE000" 1980]}]]
+            :let [provider (pg/source accepted (assoc *profile* :relational? relational?))
+                  q (update base :where conj [predicate])]]
+      (is (= expected (set (d/q q provider))) (pr-str [relational? predicate]))
+      (is (zero? (:live-sessions (pg/statistics provider)))))
+    (let [provider (pg/source accepted *profile*)
+          q (update base :where conj '[(<= ?id 4)])
+          tuples (-> q (assoc :find '[?a ?b]) (update :query-source dissoc :native-extrema :ignore-nil-extrema))]
+      (is (relational-plan? (d/explain {:run? true} q provider)))
+      (is (= #{["Alpha" nil] ["Zulu" 1990] [nil 2000] [nil nil]} (set (d/q tuples provider))))
+      (is (relational-plan? (d/explain {:run? true} tuples provider))))
+    (let [provider (pg/source accepted *profile*)
+          q (-> base (assoc :find '[(min ?b)])
+                (update :query-source dissoc :native-extrema :ignore-nil-extrema)
+                (update :where conj '[(<= ?id 4)]))]
+      (is (= #{[nil]} (set (d/q q provider))))
+      (is (not (relational-plan? (d/explain {:run? false} q provider)))))))
+
+
+(deftest nullable-projection-guards-keep-unrepresented-defaults-and-predicates-in-core
+  (let [base {:find '[?id ?note] :in '[$p]
+              :where [['$p '?e :order/id '?id]
+                      (optional-fact '$p '?e :order/note '?note)]}
+        q (update base :where conj '[(not= ?note "present")])
+        provider (source)]
+    (is (= #{[1 nil] [3 nil]} (d/q q provider)))
+    (is (not (relational-plan? (d/explain {:run? false} q provider))))
+    (let [different-default (list 'or-join '[[?e] ?note]
+                                 '(and [$p ?e :order/note ?note])
+                                 '(and (not-join [?e] [$p ?e :order/note _]) [(ground ["fallback"]) [?note]]))
+          q (assoc base :where [['$p '?e :order/id '?id] different-default])]
+      (is (= #{[1 "fallback"] [2 "present"] [3 "fallback"] [4 "present"]} (d/q q provider)))
+      (is (not (relational-plan? (d/explain {:run? false} q provider)))))))
+
+
+(deftest nullable-numeric-and-time-projections-use-sql-and-captured-fallback
+  (sql! (str "CREATE VIEW " (table "nullable_orders") " AS SELECT * FROM " (table "orders")))
+  (doseq [relation ["orders" "nullable_orders"]
+          :let [accepted (pg/accept-mapping (pg/discover *profile* [*schema* relation])
+                           (cond-> {:source-instance-id unit/source-id :relation-id :test/nullable-orders
+                                    :identity-attribute :row/id
+                                    :attributes {:row/note "note" :row/amount "amount" :row/stamp "stamp"}}
+                             (= relation "nullable_orders") (assoc :key-columns ["id"])))
+                provider (pg/source accepted *profile*)
+                q {:find '[(min ?note) (min ?amount) (min ?stamp)] :in '[$p]
+                   :where [['$p '?e :row/id '?id] '[(<= ?id 2)]
+                           (optional-fact '$p '?e :row/note '?note)
+                           (optional-fact '$p '?e :row/amount '?amount)
+                           (optional-fact '$p '?e :row/stamp '?stamp)]
+                   :query-source {:ignore-nil-extrema '#{?note ?amount ?stamp}
+                                  :native-extrema {'?note {:source '$p :attribute :row/note}}}}
+                stamp (Instant/parse "2026-10-20T12:34:56.123456Z")
+                tuples (-> q (assoc :find '[?note ?amount ?stamp])
+                           (update :query-source dissoc :native-extrema :ignore-nil-extrema))]]
+    (is (= #{["present" 10.2500M stamp]} (set (d/q q provider))))
+    (is (= #{[nil 10.2500M stamp] ["present" nil nil]} (set (d/q tuples provider))))
+    (is (= (= relation "orders") (boolean (relational-plan? (d/explain {:run? false} q provider)))))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
+(deftest nullable-extrema-window-preserves-its-policy-and-invalid-values-fail
+  (let [q {:find '[(min ?amount)] :in '[$p]
+           :where [['$p '?e :order/id '?id]
+                   (optional-fact '$p '?e :order/amount '?amount)]
+           :limit 1 :query-source {:ignore-nil-extrema '#{?amount}}}
+        provider (source)]
+    (is (= #{[10.2500M]} (set (d/q q provider))))
+    (is (= #{[nil]} (set (d/q (update q :where conj '[(= ?id 2)]) provider))))
+    (is (relational-plan? (d/explain {:run? false} q provider))))
+  (sql! (str "INSERT INTO " (table "orders") " (id,amount) VALUES (9,'NaN')"))
+  (doseq [relational? [true false]
+          :let [q {:find '[(min ?amount)] :in '[$p]
+                   :where [['$p '?e :order/id '?id]
+                           (optional-fact '$p '?e :order/amount '?amount)]
+                   :query-source {:ignore-nil-extrema '#{?amount}}}
+                provider (source {:relational? relational?})]]
+    (is (= :query-source/invalid (category #(d/q q provider))))
+    (is (zero? (:live-sessions (pg/statistics provider))))))

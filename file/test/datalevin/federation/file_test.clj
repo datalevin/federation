@@ -380,3 +380,13 @@
     (is (= :query-source/snapshot-lost (category #(d/q query provider))))
     (is (= 1 @opens))
     (is (clean?))))
+
+(deftest absent-scalar-and-empty-collection-attributes-match-eager-facts
+  (let [accepted (export! records) provider (source accepted) facts (eager accepted records)]
+    (doseq [attribute [:person/tag :person/score :person/amount]
+            :let [q {:find '[?e] :in '[$s]
+                     :where [['$s '?e :export/row '_]
+                             (list 'not-join '[?e] ['$s '?e attribute '_])]}]]
+      (is (= (d/q q facts) (d/q q provider)))
+      (is (clean?)))
+    (is (zero? (:live-spools (file/statistics provider))))))
