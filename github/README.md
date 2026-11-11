@@ -1,18 +1,22 @@
 # GitHub work-item lookups
 
-`org.clojars.huahaiy/datalevin-federation-github` is an optional, read-only
-adapter for a concrete workflow: join local triage priorities with live GitHub
-work-item titles, labels and assignees. It uses the repository issues endpoint,
-which includes issues and pull requests. It pins REST API version `2026-03-10`.
-See GitHub's [issues contract](https://docs.github.com/en/rest/issues/issues)
-and [API version policy](https://docs.github.com/en/rest/about-the-rest-api/api-versions).
+`org.clojars.huahaiy/datalevin-federation-github` joins live GitHub issues and
+pull requests with native Datalevin data and other sources. It reads titles,
+labels, assignees, and other fields through keyed lookups. Repository listings,
+search, and pagination are not supported.
 
-## Mapping and native join
+Use the repository's [setup instructions](../README.md#getting-started) to run
+the examples. The adapter uses the issues endpoint, which includes both issues
+and pull requests, and sends REST API version `2026-03-10`.
 
-Supply an explicit repository ID, locator and stable deployment UUID. Accepting
-or reopening a mapping performs no I/O and generates no new identity. Choose a
-different deployment UUID for another GitHub installation. Runtime profiles
-must bind that deployment to its intended API host and credentials.
+## Map a repository and query
+
+Supply the repository's numeric ID, owner, and name. Allocate and persist your
+own source UUID for the GitHub installation. Creating or reopening a mapping
+performs no API requests; the runtime profile supplies the host and credentials.
+
+This example creates a local database in `triage-db` and joins a priority record
+with its live issue title:
 
 ```clojure
 (require '[datalevin.core :as d]
@@ -31,30 +35,37 @@ must bind that deployment to its intended API host and credentials.
     {:compute-context-id :profiles/github-hello-world
      :token (System/getenv "GITHUB_TOKEN")}))
 
-;; The native schema declares repository, number and priority as db.type/long.
-;; The live source is scoped to repository 1296269, including closed items.
-(d/q '{:find [?priority ?title ?label]
-       :in [$ $github]
-       :where [[?t :triage/repository 1296269]
-               [?t :triage/number ?number]
-               [?t :triage/priority ?priority]
-               [(>= ?priority 9)]
-               [$github ?issue :github.issue/number ?number]
-               [$github ?issue :github.issue/title ?title]
-               [$github ?issue :github.issue/label ?label]]
-       :timeout 30000
-       :query-source {:consistency :best-effort
-                      :limits {:external-requests 64 :batch-rows 32}}}
-     @conn live)
+(let [conn (d/get-conn "triage-db"
+             {:triage/repository {:db/valueType :db.type/long}
+              :triage/number {:db/valueType :db.type/long}
+              :triage/priority {:db/valueType :db.type/long}})]
+  (try
+    (d/transact! conn [{:triage/repository 1296269
+                       :triage/number 1
+                       :triage/priority 10}])
+    (d/q '{:find [?priority ?title]
+           :in [$ $github]
+           :where [[?t :triage/repository 1296269]
+                   [?t :triage/number ?number]
+                   [?t :triage/priority ?priority]
+                   [(>= ?priority 9)]
+                   [$github ?issue :github.issue/number ?number]
+                   [$github ?issue :github.issue/title ?title]]
+           :timeout 30000
+           :query-source {:consistency :best-effort
+                          :limits {:external-requests 64 :batch-rows 32}}}
+         @conn live)
+    (finally
+      (d/close conn))))
 ```
 
-The identity attribute `:github.issue/key` is a tuple
-`[repository-id issue-number]`. Entity values are durable nominal `EntityRef`s
-in `[deployment-uuid :github/issue 0]`. A key or entity can seed a lookup directly;
-repository-local `:github.issue/number` also supports typed scalar joins with
-native long attributes. Native tuples currently have a broad SPI type, so use
-the scalar number join for native triage records. A key from another repository
-in the same accepted entity domain produces no facts and no issue request.
+## Attributes and identity
+
+The identity attribute `:github.issue/key` is `[repository-id issue-number]`.
+Entity values are `EntityRef`s identified by the source UUID, the `:github/issue`
+domain, and that key. A key or entity can start a lookup directly. Use the scalar
+`:github.issue/number` for joins with native long attributes, and filter native
+records to the accepted repository as shown above.
 
 Omitting `:attributes` accepts all supported fields:
 
@@ -67,126 +78,70 @@ Omitting `:attributes` accepts all supported fields:
 | `:github.issue/label`, `:github.issue/assignee-login` | String, many |
 | `:github.issue/assignee` | Nominal reference, many |
 
-Assignee identity is `[deployment-uuid :github/user 0]`, keyed by GitHub's numeric
-user ID. Duplicate collection elements become one fact; empty collections emit
-no facts. Missing/mistyped required fields fail. Unused response fields do not
-change accepted metadata or fingerprints. These fields describe work items;
+Assignee identity uses the source UUID and the `:github/user` domain, keyed by
+GitHub's numeric user ID. Duplicate collection elements become one fact; empty
+collections emit no facts. Missing or mistyped required fields fail the query.
 GitHub's issue `id` for a pull request is not its separate pull-request ID.
 
-## Persist and reopen
+## Runtime configuration
 
-Use `datalevin.federation.install/install!` with the normal source/relation
-metadata envelopes. The source body records `:provider :github/issues`, the
-accepted `:source-instance-id`, and a qualified `:profile` reference. The relation
-body records `:source` and `:accepted accepted`. Supply expected definition
-versions as in the [installer example](../README.md#persisted-definitions).
-After `load-definitions`, pass the saved relation's accepted mapping to
-`github/source` with an explicit runtime profile. Credentials, HTTP clients,
-and fetched records never belong in schema definitions. Used API/conversion
-contracts are verified on reopen; the installer's dependency manifest is allowed.
+A profile requires `:compute-context-id`, which identifies a compatible host
+and credential configuration. Reuse a source object for aliases that should
+share a session; use different context IDs for independent profiles.
 
-Acquisition makes one bounded repository GET and checks its numeric ID against
-the accepted mapping. A reused repository name fails as a stale definition.
-Redirects fail explicitly; refresh the accepted locator after verifying the
-numeric ID. Credentials are never forwarded to a redirect target.
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `:token` | unset | GitHub token; optional for public repositories. |
+| `:api-base` | `https://api.github.com` | API root, including an Enterprise API prefix when needed. |
+| `:request-timeout-ms` | `10000` | Total timeout for each request, including its body. |
+| `:max-response-bytes` | `262144` | Maximum response body size. |
+| `:max-json-nodes` | `4096` | Maximum parsed JSON nodes. |
 
-## Access, consistency and failure behavior
+HTTPS is required except for loopback HTTP. Set the query's top-level `:timeout`
+in milliseconds to bound the whole invocation. Request and memory limits apply
+across all sources in that query. The default response/parser settings reserve
+about 18.1 MiB of workspace, in addition to query results and other retained data.
 
-Advertised paths are entity lookup and value lookup on `:github.issue/key` or
-`:github.issue/number`. Arbitrary label/title filtering has no value index.
-Unbound scans, scoped listings, pagination, search, API batch endpoints and
-fusion are not implemented. A dependent open accepts at most 256 typed unique
-keys and 256 KiB of binding state, then performs bounded per-key GETs. The engine
-preserves repeated input witnesses and result multiplicity. A full output row
-window does not speculatively request the next key.
+## Read behavior and limits
 
-Reads are **best-effort**, with unstable replay and no data-version token.
-Separate attribute accesses or cursor reopens can observe different updates.
-Snapshot and statement requirements reject. No response cache invents a stronger
-view. Configure the same source object for aliases that must share a session.
-Use separate public compute-context IDs for independently acquired profiles.
+Queries need a bound entity, issue key, or issue number. Titles and labels have
+no lookup index, so a query asking for every title cannot run. Lookup batches
+accept at most 256 unique keys and 256 KiB of binding state, but the adapter
+still performs individual issue GETs. Requests are serialized.
 
-Every actual request, including repository verification, acquires a permit from
-one session limiter and the shared query ledger. Requests are serialized. There
-are no adapter retries: authorization, rate limits, redirects, transport failures,
-malformed/truncated JSON, mismatched work-item numbers and over-limit responses
-fail the query. Rate-limit responses stop immediately, following GitHub's
-[rate-limit guidance](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#handle-rate-limit-errors-appropriately).
-Direct SPI errors include a bounded numeric `Retry-After` when available; the
-engine redacts provider details. Applications decide when to run another query.
+Reads are **best-effort**. Separate attribute accesses can observe different
+updates; snapshot and statement consistency requirements are rejected. Each
+query first checks that the repository name still resolves to the accepted
+numeric ID. Renames or reused names require verifying and updating the mapping.
+Redirects fail without forwarding credentials.
 
-An issue 404 is an incomplete read, never certified absence: GitHub can mask an
-authorization failure with 404. Repository acquisition 401/403/404 fails access.
-A 403 with explicit rate-limit headers and a 429 report a limit failure. This
-conservative missing-key policy is intentional; a batch containing an unknown
-item fails instead of silently dropping it.
+Authorization failures, rate limits, timeouts, malformed or incomplete responses,
+and oversized responses fail the query. There are no automatic retries. An
+issue 404 also fails: it can mean that access was denied, so it cannot prove the
+issue is absent. Applications decide when to run another query.
 
-## Bounds and accounting
+`d/explain` reports request counts, decoded work items, emitted rows, and fetch
+time. `github/statistics` reports cumulative repository acquisition work and
+live sessions. Diagnostics omit tokens and response bodies.
 
-Runtime profile options, in addition to `:compute-context-id` and optional
-`:token`, are `:api-base`, `:request-timeout-ms` (10,000),
-`:max-response-bytes` (262,144) and `:max-json-nodes` (4,096).
-HTTPS is required except for loopback HTTP fixtures. API bases may include a
-GitHub Enterprise API prefix. Query timeouts use the ordinary top-level
-`:timeout` in milliseconds.
+## Save and reopen mappings
 
-Both headers and bodies obey the total request timeout. Explicit session
-cancellation, query cancellation and deadline expiry cancel pending HTTP work
-and close streams promptly. The parser caps nesting at 32, nodes, number length
-and strings; duplicate object fields and trailing data reject. Responses with
-non-identity content encoding reject. A conservative workspace of
-`65,536 + 8 * max-response-bytes + 4,096 * max-json-nodes` bytes is reserved before
-network/body/parser work. This covers the body, parsed nodes and projected
-references; it is about 18.1 MiB with defaults. A cursor retains only the current
-work item's selected attribute, bounded inputs and one pending row. Output
-windows usually reserve at most 64 KiB; one wider admissible row can expand the
-window within the caller's batch cap. All sessions/cursors release owned state
-idempotently, including partial acquisition failures.
+Use the [definition installer](../README.md#persisted-definitions) with provider
+`:github/issues`, the accepted source UUID, and a runtime profile reference.
+After `install/load-definitions`, pass the saved relation's `:accepted` mapping
+to `github/source` with the runtime profile. Store credentials separately from
+definitions.
 
-Cursor metrics report actual requests, consumed success-body bytes, decoded
-work items, emitted rows, exact owned batch charges and elapsed fetch time.
-`github/statistics` reports cumulative repository acquisition requests/bytes and
-live sessions separately. Estimates remain unknown. Error bodies are closed
-without being decoded or counted as consumed success bytes. No paths, tokens
-or response bodies appear in diagnostics.
+## Try the live example
 
-## Checks and live evidence
-
-From the companion root:
+From the repository root:
 
 ```sh
-clojure -M:test:github
 clojure -M:github-live
-# Optional explicit public repository/work-item inputs:
+# Optional owner, repository, numeric repository ID, and issue number:
 clojure -M:github-live octocat Hello-World 1296269 1
 ```
 
-The live command performs GitHub GETs and creates only a temporary in-memory
-native triage database. `GITHUB_TOKEN` is optional for public resources. It is
-excluded from the default suite. Per-module `lein test` and `lein jar` exercise
-and package the standalone optional artifact with Datalevin provided by the
-application. A compatible Datalevin checkout is required for the unreleased SPI.
-
-On 2026-10-22 the live native join returned work item 1, title
-`Edited README via GitHub`, state `closed`. The first query took 1,382 ms including
-cold startup/acquisition. A second execution's three cursors each made one GET
-and consumed 3,262 response bytes; one repository verification consumed 5,085
-bytes per invocation. Fetch times were about 31–41 ms per cursor. Both invocations
-closed every session. These are observations of a mutable public API, not
-calibrated cost estimates or comparative benchmarks.
-
-The deterministic loopback HTTP suite compares advertised lookups with eager
-facts and the shared `mapped-lookup-semantics!` gate. It checks scalar/reference
-many fields, native selection, persisted identity/reopen, separate repositories,
-repeated witnesses, binding IDs, exact narrow/wide batches, changing live replay,
-quotas, rate/authentication errors, redirects, malformed bodies, partial setup,
-blocked-body timeouts, cancellation and cleanup. The initial F3 API/export/
-native workflow, same-syntax required-head parity and native performance gates
-are signed off (2026-10-24). See the [workflow](../examples/README.md) and
-[read guarantees and limits](../README.md#read-guarantees-and-limits).
-Scoped listing and pagination require a separate advertised-path gate if added later.
-
-Validation (2026-10-22): the complete companion suite passes **116 tests /
-23,271 assertions**, including **11 / 151** GitHub checks. Standalone GitHub
-`lein test`, `lein jar`, companion lint, and shared-helper lint pass. The
-read-only public GitHub/native check passed separately.
+This makes read-only GitHub requests and joins the result with temporary native
+triage data. Set `GITHUB_TOKEN` for authenticated access. To also join release
+assignments from a file export, see the [release-triage example](../examples/README.md).

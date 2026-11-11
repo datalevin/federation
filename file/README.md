@@ -1,25 +1,27 @@
-# Immutable EDN Lines exports
+# EDN Lines file exports
 
-`org.clojars.huahaiy/datalevin-federation-file` reads an explicitly accepted
-export through Datalevin's v2 query-source SPI. It supports scalar and reference
-attributes, `:one` and `:many`, field/path extraction, embedded native joins,
-and export-scoped identity. Accesses are scans; the existing query engine
-performs joins, rules, and residual checks within its supported query subset.
+`org.clojars.huahaiy/datalevin-federation-file` exposes an EDN Lines export as a
+snapshot you can query and join with native Datalevin data or other sources.
+It supports scalar, collection, and reference attributes. Access uses file
+scans; each query copies and validates the entire export before reading facts.
 
-Each nonempty physical UTF-8 line contains exactly one EDN map. A final newline
-is optional; CRLF is accepted. Blank lines, additional forms, invalid UTF-8,
-and unknown reader tags reject. Standard EDN readers are used, with no
-application reader extensions or evaluation. Record byte and nesting limits
-are explicit parts of the accepted format. Values retain their EDN types;
-conversion version 1 performs no numeric or string coercion.
+Follow the repository's [setup instructions](../README.md#getting-started) to
+try the example.
+
+## Accept and query an export
+
+Create a file, inspect its contents with `manifest`, then explicitly map its
+fields to attributes. Keep the source UUID stable for your application; use a
+new export UUID for each capture.
 
 ```clojure
 (require '[datalevin.core :as d]
          '[datalevin.federation.file :as export])
 
-;; /tmp/people.ednl:
-;; {:name "Ada" :tags ["red" "red" nil "blue"]}
-;; {:name "Grace" :tags ["red"]}
+;; Create the example export.
+(spit "/tmp/people.ednl"
+      (str (pr-str {:name "Ada" :tags ["red" "red" nil "blue"]}) "\n"
+           (pr-str {:name "Grace" :tags ["red"]}) "\n"))
 
 ;; Allocate this UUID once for the external identity domain and persist it.
 (def source-id #uuid "12345678-1111-4111-8111-123456789abc")
@@ -51,94 +53,87 @@ conversion version 1 performs no numeric or string coercion.
 ;; => #{["Ada" "red"] ["Ada" "blue"] ["Grace" "red"]}
 ```
 
-Source construction and `-source-info` perform no I/O. `manifest` is an explicit
-inspection operation: it computes SHA-256, byte/record counts, and validates
-framing. Defaults are 16 KiB per record, depth 32, and a 1 GiB inspection cap.
-Options `:max-record-bytes` (at most 1 MiB), `:max-depth` (at most 128),
-`:max-bytes`, and `:check-active!` bound/cooperate with caller-owned inspection.
+`manifest` computes a digest, counts records and bytes, and validates the file
+format. Creating a source from an accepted mapping performs no I/O. The profile
+supplies the file's location when a query runs.
 
-`[:field key]` reads a string or keyword key. `[:path [key ...]]` traverses
-nested maps, treating a missing/null parent as absence and rejecting a non-map
-parent. Extraction does not flatten nested objects. `:elements` maps a declared
-collection to unordered EAV values; duplicates and null elements add no facts.
-Reference attributes use F0's complete nominal target/type contract. The scope
-describes the accepted file's view; the adapter applies no implicit tenant filter.
+## File format and mappings
 
-Every entity key is `[export-token physical-record-ordinal]`, with ordinals
-starting at 1. The token combines the explicit export UUID and content digest.
-Identical records at different ordinals remain distinct. Reopening or moving the
-same accepted export preserves identity; filtering and batching do not renumber
-records. A separately captured export uses a new UUID even when its bytes are
-identical. Domain/type descriptors stay stable across captures; row identities
-do not imply durable entity continuity. This adapter does not infer natural keys.
+Each UTF-8 line must contain exactly one EDN map. A final newline is optional
+and CRLF is accepted. Blank lines, extra forms, invalid UTF-8, and unknown reader
+tags are rejected. Standard EDN readers are used without application extensions
+or evaluation. Values retain their EDN types; conversion version `1` performs
+no numeric or string coercion.
 
-Persist `accepted` using
-[`install/install!`](../README.md#persisted-definitions): the source provider is
-`:file/export`, and the relation stores the accepted metadata. On reopen, take
-`:compiled relation-id :accepted` from `load-definitions` and pass it to
-`export/source` with the runtime profile. The manifest is recorded under
-`:dependencies :export`; the parser requirements and complete logical contracts
-participate in fingerprints. A new export is an explicit accepted refresh.
-Paths, streams, and runtime profiles are supplied separately from schema metadata.
+`[:field key]` reads a string or keyword key. `[:path [key ...]]` traverses nested
+maps: a missing or null parent contributes no fact, while a non-map parent is an
+error. `:shape :elements` maps a collection to many values; duplicates and null
+elements contribute no additional facts. Reference attributes declare the target
+entity's domain and key types; the [release-triage example](../examples/README.md)
+shows references shared with GitHub.
 
-Each query acquires one private copy before publishing its snapshot. Copying
-checks the exact byte count and digest, then validates all records, projected
-types, and the declared record count. A corrupt tail or known incomplete export
-fails even if `LIMIT` or a selective query would have skipped it. Later changes
-to the original file do not affect the pinned view. The next acquisition rejects
-drift against the recorded manifest. Aliases share acquisition; independent
-pattern scans replay the same private copy.
+The mapping's `:scope` describes the accepted export. It does not filter rows or
+apply a tenant boundary; create the intended export before accepting it.
 
-The full copy is charged to `:spill-bytes` before any backend read or file write.
-Metadata and bounded parser/projection workspace are charged to
-`:retained-bytes`. Projection validates one attribute of one record at a time;
-rows are never accumulated for the entire export. Cursor output reserves a
-bounded batch window within the requested caps before copying rows, and reports actual
-conservative value charges as `:byte-count`. Complete nominal type descriptors
-also contribute to that charge. A large batch cap does not force an equally
-large reservation; one wide row must still fit the caller's caps. Acquiring the private copy adds
-startup I/O and validation; it is not a selective indexed file lookup.
+| Manifest option | Default | Purpose |
+| --- | --- | --- |
+| `:max-record-bytes` | `16384` | Maximum bytes per record; configurable up to 1 MiB. |
+| `:max-depth` | `32` | Maximum nesting depth; configurable up to 128. |
+| `:max-bytes` | `1073741824` | Maximum bytes inspected. |
+| `:check-active!` | unset | Callback for caller-controlled cancellation during inspection. |
 
-Profiles require `:compute-context-id` and either `:path` or `:open-input`.
-Context IDs must distinguish incompatible profiles/views; aliases can reuse
-one source object. An opener receives the SPI acquisition request, must bound
-its setup with the supplied control, and returns an `InputStream` promptly.
-The adapter owns and closes that returned stream. A close must unblock reads.
-If setup fails before returning, the opener cleans up its own partial resources.
-`:reopen :once` permits one acquisition attempt; the query can still replay the
-private copy across multiple scans. A second query needs another source/input.
-`:spool-directory` optionally selects an existing local scratch directory.
+Pass options as the third argument to `manifest`.
 
-Backend acquisition uses the shared request/concurrency ledger. Cancellation
-closes active input/output handles. Success, failure, early stop, and repeated
-close release streams, reservations, and temporary copies. Plan handles own no
-file reader; cursors own their private-copy readers. The acquired guarantee is
-`:snapshot`, including when the caller permits weaker consistency.
+## Identity and refreshes
 
-SPI cursor metrics count records and actual buffered bytes read from the private
-copy; their external-request count is zero. `export/statistics` reports cumulative
-acquisition attempts, original bytes read, validated records, elapsed nanoseconds,
-failed captures, and live copies separately. These counters contain no paths or
-row values. Advisory estimates remain unknown. Neither acquisition work nor
-private-copy read work is presented as a calibrated cost model.
+An entity key is `[export-token physical-record-ordinal]`, with ordinals starting
+at `1`. The token combines the export UUID and content digest. Identical records
+on separate lines are distinct entities. Moving or reopening the same accepted
+export preserves identity; filtering does not renumber records.
 
-Run the adapter's real-file, fault, shared scan, persistence, and native-join checks:
+A new capture uses a new UUID even if its bytes are identical. Row identities do
+not carry across captures, and the adapter does not infer natural keys. Include
+business identifiers as attributes when you need to join successive exports.
 
-```sh
-clojure -M:test:file
-```
+Save `accepted` using the [definition installer](../README.md#persisted-definitions)
+with source provider `:file/export`. After `install/load-definitions`, pass the
+saved relation's `:accepted` mapping to `export/source` with its runtime profile.
+Refresh by accepting a new manifest and installing the replacement mapping with
+the current definition version. Keep paths and streams outside saved definitions.
 
-Validation (2026-10-21): **16 tests / 154 assertions** pass both in the workspace
-and with standalone `lein test`. The complete companion suite passes **105 /
-23,120**; lint is clean and `lein jar` builds the independent file artifact.
+## Runtime configuration
 
-The file artifact depends on companion `core` and the supplied Datalevin runtime;
-it adds no provider driver. For a Leiningen checkout build:
+Profiles require `:compute-context-id` and exactly one of `:path` or `:open-input`.
+Use different context IDs for incompatible profiles; aliases can reuse the same
+source object.
 
-```sh
-mkdir -p file/checkouts
-ln -sfn ../../../datalevin file/checkouts/datalevin
-ln -sfn ../../core file/checkouts/federation-core
-cd file
-lein jar
-```
+| Option | Purpose |
+| --- | --- |
+| `:path` | Path to the accepted export. |
+| `:open-input` | Function receiving the acquisition request and returning an `InputStream`. |
+| `:reopen` | `:many` by default; `:once` permits only one acquisition attempt. |
+| `:spool-directory` | Existing directory for temporary snapshot copies; defaults to the system temporary directory. |
+
+A custom opener must use the request's control to bound setup and return promptly.
+The adapter owns and closes the returned stream; closing it must unblock reads.
+The opener must clean up partial resources if it fails before returning. With
+`:reopen :once`, a second query needs a new source/input, though scans within the
+first query can replay its private copy.
+
+## Snapshots and resource limits
+
+Each query verifies the complete byte count, digest, record count, and mapped
+values before publishing its private snapshot. A corrupt tail fails even if a
+result limit would have skipped it. Later changes to the original file do not
+affect the active snapshot; a subsequent query rejects changed contents until
+you accept a new manifest. Aliases of the same source share one capture.
+
+The full temporary copy counts against `:query-source :limits :spill-bytes`.
+Parser workspace, metadata, and output batches count against `:retained-bytes`.
+Selective filters and small result limits do not reduce acquisition work.
+Timeouts, cancellation, and query completion close streams and remove private
+copies.
+
+`d/explain` reports scan work. `export/statistics` separately reports cumulative
+acquisition attempts, bytes read, validated records, failures, and live copies,
+without exposing paths or row values.

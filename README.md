@@ -1,112 +1,34 @@
 # datalevin-federation
 
-Datalevin's entity–attribute–value triple data model is a natural fit for data
-federation: it gives data from different systems a common shape that can be
-queried and joined with Datalog. This project brings Datalevin's query engine
-to the wider world of data.
+Query PostgreSQL, file exports, GitHub, and native Datalevin data together with
+Datalog. Federation adapters expose external records as entities and attributes,
+so you can join them using `d/q` without first importing all the data into
+Datalevin. Bindings and supported filters constrain external reads; `d/explain`
+shows the selected plan and execution metrics.
 
-The vision is to query across four types of data sources—other databases
-through SQL, files, APIs, and Datalevin databases—using ordinary Datalog.
-Federation adapters expose external records as entities and attributes, so you
-can join them with native Datalevin facts using `d/q` without first importing
-all the data.
-
-For native data, Datalevin's cost-based optimizer uses index counts and
-query-specific sampling to choose join orders and access paths. It pushes
-eligible filters into index scans and reduces intermediate results, so complex
-analytical joins can be expressed declaratively without hand-tuning clause order.
-
-Federated queries use bindings and filters to constrain external lookups. For
-example, a local priority filter can narrow the issue numbers sent to GitHub,
-reducing API requests and the data carried through later joins. The planner
-selects among each adapter's supported scans and lookups using the available
-bindings. Fresh cardinalities rank accesses, and bounded lookahead compares
-complete join paths and their expected fan-out. PostgreSQL supplies catalog
-counts and cost-budgeted filtered estimates. Same-entity fusion combines
-attribute patterns into one table access; dependent filtered joins can combine
-two accepted mappings. Complete paths with fresh time estimates also price
-batched cursor opens, request latency, and local row/column processing. Missing
-time estimates retain cardinality ranking; transfer-byte and index-aware
-backend execution costs remain further work.
-You can inspect the plan and execution metrics with `d/explain`.
-
-**Status:** federation adapters are development snapshots (`0.1.0-SNAPSHOT`).
-The PostgreSQL adapter has verified full-data JOB 6d and 17c wins; see its
-[benchmark results and methodology](postgres/README.md#planning-bounds-and-follow-up-priorities).
-The [latest full 113-query pass](doc/measurements/postgres-job-full113-post-fragments-2026-11-10.md)
-completes and verifies every original aggregate answer. Total adapter client
-time is **155.82 seconds versus native's 166.38 seconds**, 6.3% less in this
-single sample without warmups. Complete projected tuple sets verify for 107
-queries; six additional tuple checks exceed the unchanged 64 MiB result limit.
-There are no aggregate execution failures or result mismatches. Native timings
-vary between passes, so this is an observed advantage rather than a repeated
-full-suite win. Adapter time also rises from 140.28 s in the preceding pass;
-the report preserves the regressions and native timing variation. The
-[targeted follow-up](doc/measurements/postgres-job-31b-7c-17f-2026-11-10.md)
-explains the repaired 7c/17f failures and 31b's improved plan choice.
-Automatic SQL delegation preserves
-selective dependent plans; see the
-[single-SQL implementation report](doc/measurements/postgres-job-single-sql-2026-11-10.md).
-Independent minima over nullable columns now
-support [JOB 1a](doc/measurements/postgres-job-nullable-min-summary-2026-11-10.edn),
-with all three minima and 116 output tuples verified.
-A [planning optimization comparison](doc/measurements/postgres-job-cheap-planning-2026-11-10.md)
-reduces total adapter time for an eight-query cohort from 4.79 s to 1.67 s;
-1a/1b/1c run within about 4–9% of native in that separately measured cohort.
-A [fragment execution comparison](doc/measurements/postgres-job-fragment-work-2026-11-10.md)
-measures prepared reference decoders, narrower dependent boundaries, and fewer
-intermediate copies. It is a separate selected-query measurement; the full-suite
-rerun above includes these changes.
-Datalevin **1.2.8** introduced the query-source SPI. PostgreSQL's current
-pushdown paths require the matching **1.2.10** build with relational SPI support.
+**Status:** development snapshots (`0.1.0-SNAPSHOT`) for embedded JVM applications.
+The checkout instructions below use the matching Datalevin **1.2.10** development
+build, which includes the query-source extensions required by PostgreSQL.
 
 ## Data sources
 
-| Source type | Role | Current support |
-| --- | --- | --- |
-| Other databases (SQL) | Query relational tables alongside other sources. | [PostgreSQL](postgres/README.md) primary-key tables, declared-key views, partitioned parents, RLS profiles, temporal/enum values, and eligible SQL delegation; see [workload limits](postgres/README.md#workload-fit-and-current-gaps). |
-| Files | Query exports and file-based datasets. | [EDN Lines](file/README.md) exports with scalar and collection attributes; verified snapshot scans. |
-| APIs | Query data exposed by external services. | [GitHub](github/README.md) issue and pull-request lookups by entity, repository/issue key, or issue number; live, best-effort reads. |
-| Datalevin databases | Query native entities and attributes alongside external data. | Supplied directly to `d/q`; no adapter needed. |
+| Source | Supported access |
+| --- | --- |
+| [PostgreSQL](postgres/README.md) | Tables with primary keys, views with declared keys, partitioned tables, and RLS-protected tables; eligible filters, joins, and aggregates execute in SQL. |
+| [EDN Lines files](file/README.md) | Verified snapshots of exports, with scalar, collection, and reference attributes. |
+| [GitHub](github/README.md) | Live issue and pull-request lookups by entity, repository/issue key, or issue number. |
+| Native Datalevin | Pass databases directly to `d/q`; no adapter is needed. |
+| [Local relations](local/src/datalevin/federation/local.clj) | Application-owned `[entity attribute value]` facts with a declared schema. |
 
-GitHub is one example of an API source. Its current adapter supports fields
-such as titles, labels, and assignees, but not listings, search, or pagination.
-The repository also includes a [local relation adapter](local/src/datalevin/federation/local.clj)
-for application-owned `[entity attribute value]` facts with a declared schema,
-supporting snapshot scans and entity/value lookups.
-
-PostgreSQL's current fit is selective enrichment: use native records or another
-source to identify a small set of rows, then retrieve their scalar attributes.
-Eligible decimal/time and `LIKE` filters, flat same-snapshot joins, and supported
-aggregates can execute in PostgreSQL. Mixed native/SQL queries can export bounded
-customer bindings and return SQL-side joins and totals through the shared
-[fragment compiler](postgres/README.md#delegation-inside-mixed-source-queries). Broader reporting workloads still face
-significant gaps: arbitrary aggregates and scoped programs remain in core.
-Views, partitioned parents, and RLS-protected tables use bounded captures of all
-mapped columns, which can increase acquisition transfer and retained memory.
-Domains, arrays, and JSON mapping remain unsupported. Large scans can exhaust
-the default request budget. Candidate
-pruning preserves complete access coverage
-within the configured [planning bound](postgres/README.md#planning-bounds-and-follow-up-priorities).
-See the [delegation scope](postgres/README.md#filter-and-relational-delegation)
-for supported query shapes and fallback behavior.
-
-Parquet, dataset, and DataFusion adapters are planned and are not
-yet available in this repository. Contribution is welcome.
-
-For a working example, a release-triage query combines priorities stored in
-Datalevin, release assignments from a file export, and live issue titles from
-GitHub.
+GitHub supports keyed lookups, not repository listings or search. Files are
+scanned in full when their snapshots are acquired. See each adapter's guide for
+supported values, configuration, and limits.
 
 ## Getting started
 
-Use Datalevin **1.2.9** as your application's runtime for the current adapters,
-including PostgreSQL fusion. This repository's development workspace uses the
-Clojure CLI and a sibling Datalevin checkout at `../datalevin`. The commands
-below use that layout: the root `deps.edn` loads the checkout and all adapter
-sources.
-
-From this repository's root, compile Datalevin's Java classes:
+You need the Clojure CLI and a compatible Datalevin checkout at `../datalevin`.
+The root `deps.edn` loads that checkout and all adapter sources. From this
+repository's root, compile Datalevin's Java classes:
 
 ```sh
 cd ../datalevin
@@ -114,23 +36,24 @@ clojure -T:build compile-java
 cd ../federation
 ```
 
-Try the [release-triage example](examples/README.md):
+Run the [release-triage example](examples/README.md):
 
 ```sh
 clojure -M:workflow-live
 ```
 
-This makes read-only requests to the public `octocat/Hello-World` repository,
-creates a temporary export and native database, saves and reopens the mappings,
-and joins all three sources. It prints the result rows and query diagnostics,
-then removes its temporary files. `GITHUB_TOKEN` is optional for public
-repositories. To exercise the workflow with local fixtures instead:
+This joins priorities stored in Datalevin, release assignments from a temporary
+file export, and live issue titles from the public `octocat/Hello-World`
+repository. It saves and reopens the mappings, prints result rows and query
+diagnostics, and removes its temporary files. `GITHUB_TOKEN` is optional for
+public repositories. For a local fixture check without GitHub requests:
 
 ```sh
 clojure -M:test:workflow
 ```
 
-For the examples below, start a REPL with the workspace's sources and JVM options:
+To try the examples below, start a REPL with the workspace's sources and JVM
+options:
 
 ```sh
 clojure -Sdeps '{:aliases {:repl {:main-opts ["-r"]}}}' -M:test:repl
@@ -197,7 +120,7 @@ identities. Missing optional values contribute no facts. Collection attributes
 such as labels contribute one fact per distinct value. You can use these facts
 in joins, aggregates, and supported Datalog rules. Bound `not` and `not-join`
 fact bodies check attribute absence over external sources; see the
-[absence example](postgres/README.md#identity-types-and-absence). Ordinary tuple
+[absence example](postgres/README.md#nulls-and-absence). Ordinary tuple
 inputs still work through `:in`.
 
 See the [GitHub guide](github/README.md) for all supported attributes and the
@@ -251,76 +174,49 @@ uses the saved identities and mappings without discovering a new schema.
 
 ## Read guarantees and limits
 
-- GitHub reads are best-effort: separate requests may observe different updates.
+- GitHub reads are best-effort: separate requests can observe different updates.
   Local relations and accepted file exports provide snapshots. PostgreSQL
-  mappings sharing a source/profile use one read-only, repeatable-read
-  transaction. Views, partitioned parents, and RLS tables capture mapped rows
-  once before access, including volatile view values and policy results.
-  There is no atomic snapshot across independent sources.
-- PostgreSQL batches up to 256 lookup keys per SQL cursor and fetches 128 rows
-  per request by default. Eligible same-snapshot joins and aggregates are
-  delegated; public ordering and result windows remain in core. Check request and memory budgets for larger workloads; see
-  [bounds and lifecycle](postgres/README.md#bounds-and-lifecycle).
-- GitHub queries need an entity, key, or issue number to start a lookup. A query
-  that only asks for every title or label cannot run against this adapter.
-- File queries copy and validate the entire accepted export before scanning it.
-  Changed contents require explicitly accepting a new export. File row identities
-  are specific to that capture.
+  mappings sharing a source and runtime profile use one read-only,
+  repeatable-read transaction. Independent sources do not share an atomic
+  snapshot.
+- Views, partitioned parents, and RLS-protected PostgreSQL tables capture all
+  mapped rows before querying. File queries copy and validate the entire
+  accepted export. Allow for that startup work and memory or temporary storage.
 - Use `:timeout` and `:query-source :limits` to bound work. Quota exhaustion,
-  incomplete reads, and provider failures fail the query. GitHub requests are
-  not automatically retried.
-- Live adapters currently target embedded JVM `d/q` and `d/explain`. External
-  writes, remote execution of live adapters, and native-image or language-binding
-  support are outside the current supported scope.
+  incomplete reads, and provider failures fail the query instead of returning
+  partial results. GitHub and PostgreSQL requests are not automatically retried.
+- Changed file contents or incompatible database schema changes require
+  explicitly accepting a new mapping. Credentials, connections, and file paths
+  are supplied at runtime.
+- Live adapters support embedded JVM `d/q` and `d/explain`. External writes,
+  remote execution of live adapters, native images, and language bindings are
+  outside the supported scope.
 
-## Subprojects and releases
+<a id="subprojects-and-releases"></a>
 
-Each module has its own artifact at version `0.1.0-SNAPSHOT`:
+## Modules
 
-| Module | Artifact | Purpose |
-| --- | --- | --- |
-| [Core](core/project.clj) | `org.clojars.huahaiy/datalevin-federation-core` | Mapping compilation, entity identities, and saved definitions. |
-| [Local](local/project.clj) | `org.clojars.huahaiy/datalevin-federation-local` | Application-owned fact sources. |
-| [GitHub](github/project.clj) | `org.clojars.huahaiy/datalevin-federation-github` | GitHub work-item lookups; includes core. |
-| [File](file/project.clj) | `org.clojars.huahaiy/datalevin-federation-file` | EDN Lines exports; includes core. |
-| [PostgreSQL](postgres/project.clj) | `org.clojars.huahaiy/datalevin-federation-postgres` | Snapshot table access and scalar fusion; includes core and the JDBC driver. |
+Each module has version `0.1.0-SNAPSHOT` and the Maven group
+`org.clojars.huahaiy`:
 
-Use the modules your application needs. The local adapter takes a complete
-source descriptor and mapped facts; add core if you also need mapping APIs.
-Datalevin has Maven `provided` scope, so your application must supply the
-runtime. PostgreSQL declares **1.2.10** and requires the matching development
-build with its relational SPI extension. Core, local, file, and GitHub still
-declare `1.2.5`; applications supply their Datalevin runtime explicitly. The
-workspace uses the sibling checkout.
+| Artifact | Purpose |
+| --- | --- |
+| `datalevin-federation-core` | Mappings, entity identities, and saved definitions. |
+| `datalevin-federation-local` | Application-owned fact sources. |
+| `datalevin-federation-github` | GitHub work-item lookups; includes core. |
+| `datalevin-federation-file` | EDN Lines exports; includes core. |
+| `datalevin-federation-postgres` | PostgreSQL access; includes core and the JDBC driver. |
 
-## Development and further reading
+Use the modules your application needs. Datalevin has Maven `provided` scope,
+so your application must supply a compatible runtime. PostgreSQL requires the
+matching 1.2.10 build with relational query-source support. The checkout setup
+above supplies the runtime for all modules.
 
-Run the full suite or an individual adapter's tests from the repository root:
+## Guides
 
-```sh
-clojure -M:test
-clojure -M:test:core
-clojure -M:test:local
-clojure -M:test:file
-clojure -M:test:github
-```
-
-Tests use local fixtures and require no external service. The full and local
-suites need `sqlite3` on `PATH`; HTTP fixtures need permission to bind a temporary
-loopback port.
-
-PostgreSQL's real-driver tests are separate: set `POSTGRES_TEST_URL` for a
-disposable database and run `clojure -M:test:postgres`. See the
-[PostgreSQL guide](postgres/README.md#save-mappings-and-test) for setup and scope.
-
-- [Release-triage example](examples/README.md): combine native data, an export,
-  and GitHub.
-- [GitHub adapter guide](github/README.md): mapping, supported attributes, and
-  API read limits.
-- [File adapter guide](file/README.md): accepting and querying EDN Lines exports.
-- [PostgreSQL adapter guide](postgres/README.md): discovery, snapshots, fusion,
-  and supported SQL types.
-- [Datalevin query-source SPI](https://github.com/datalevin/datalevin/blob/master/doc/query-source-spi.md):
-  detailed query-source contracts and adapter requirements.
+- [Release-triage example](examples/README.md): join native data, an export, and GitHub.
+- [PostgreSQL](postgres/README.md): connect, map tables, query, and configure SQL delegation.
+- [GitHub](github/README.md): map work items and configure API lookups.
+- [Files](file/README.md): accept and query EDN Lines exports.
 
 Licensed under [EPL-2.0](LICENSE).
