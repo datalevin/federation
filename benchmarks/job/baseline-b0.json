@@ -1,0 +1,51 @@
+{
+  "baseline_id": "job-single-source-b0-2026-11-11",
+  "status": "frozen-exploratory-reference",
+  "purpose": "Preserve the evidence and implementation before subsequent federation optimizations; support a research-paper experiment lineage.",
+  "primary_progress_anchor": "federation/doc/measurements/job-duckdb-accio-full113-2026-11-11/duckdb/run.edn",
+  "anchor_rule": "First full 113-query version-2 pass in the DuckDB/Accio measurement sequence; selected by chronology, not fastest observed total. Compare Datalevin over all 113 original answers.",
+  "replicate_context": "federation/doc/measurements/job-duckdb-accio-full113-2026-11-11/accio/run.edn",
+  "studies": [
+    {
+      "id": "trino-drill",
+      "report": "federation/doc/measurements/job-competitors-full113-2026-11-11.md",
+      "raw_runs": [
+        "federation/doc/measurements/job-trino-full113-2026-11-11.edn",
+        "federation/doc/measurements/job-drill-full113-2026-11-11.edn",
+        "federation/doc/measurements/job-drill-full113-ansi-rerun-2026-11-11.edn"
+      ],
+      "note": "Historical format-1 evidence; Drill comparison includes 20 documented dialect reruns. Preserve the original failures and all paired controls."
+    },
+    {
+      "id": "duckdb-accio",
+      "report": "federation/doc/measurements/job-duckdb-accio-full113-2026-11-11.md",
+      "raw_runs": [
+        "federation/doc/measurements/job-duckdb-accio-full113-2026-11-11/duckdb/run.edn",
+        "federation/doc/measurements/job-duckdb-accio-full113-2026-11-11/accio/run.edn",
+        "federation/doc/measurements/job-duckdb-accio-full113-2026-11-11/alias-rerun/duckdb/run.edn",
+        "federation/doc/measurements/job-duckdb-accio-full113-2026-11-11/alias-rerun/accio/run.edn"
+      ],
+      "note": "Format-2 full passes and six-query alias reruns remain separate. Accio uses the documented stock-DuckDB compatibility bridge. Dingo was not run."
+    }
+  ],
+  "limitations": [
+    "One timed observation per query and mode, zero explicit warmups; exploratory coverage evidence rather than statistical or causal evidence.",
+    "Original dataset archive checksums unavailable; retained source catalog counts are estimates.",
+    "Versions, settings, plans, raw answers, failures, actual/submitted SQL and native controls are retained in each study.",
+    "Working trees were dirty. Measured-resource snapshots identify the original implementation; additional source trees are snapshots at freeze time, not proof every byte was measured.",
+    "No source database files, Maven caches, engine distributions, private credentials, or build outputs are included.",
+    "Historical optimization measurements are retained as context; they do not substitute for isolated ablations.",
+    "Do not combine studies with different correct-query subsets or phases into an unqualified full-suite speedup."
+  ],
+  "capture": {
+    "federation": [
+      "doc/measurements", "doc/experiments", "core/src", "postgres/src", "local/src", "file/src", "github/src",
+      "dev/src", "examples/src", "test", "core/test", "postgres/test", "local/test", "file/test", "github/test",
+      "benchmarks/job", "deps.edn", "README.md", "federation.md"
+    ],
+    "datalevin": [
+      "src", "resources", "deps.edn", "project.clj", "build.clj", "AGENTS.md",
+      "benchmarks/JOB-bench/queries", "benchmarks/JOB-bench/data/schema.sql", "benchmarks/JOB-bench/data/fkindexes.sql"
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+duckdb==2.0.0
+numpy==2.3.5
+JPype1==1.7.1
+packaging==26.3
+psycopg[binary]==3.3.4
+typing_extensions==4.16.0

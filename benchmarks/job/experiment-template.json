@@ -1,0 +1,13 @@
+{
+  "id": "O01-replace-with-optimization-name",
+  "parent": "job-single-source-b0-2026-11-11",
+  "kind": "single-change",
+  "mechanism": "Describe the one optimizer mechanism being changed",
+  "hypothesis": "State the expected effect on total client time and which workload feature explains it",
+  "code_revision": "Record both repository revisions and the candidate source archive digest",
+  "ablation": "Specify how to disable this mechanism while keeping other changes fixed",
+  "validation": "Record correctness checks and source-session cleanup checks",
+  "metrics": ["total client wall time", "planning time when available", "requests and bytes when available", "local intermediate rows when available"],
+  "unavailable_metrics": [],
+  "note": "Template only. Replace placeholder text; do not register as a completed measurement."
+}
