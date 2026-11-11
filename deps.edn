@@ -81,6 +81,9 @@
                                              "--enable-native-access=ALL-UNNAMED"
                                              "-Dclojure.compiler.direct-linking=true"]
                                   :main-opts ["-m" "datalevin.federation.job-comparison"]}
+           :job-progress {:extra-paths ["dev/src"]
+                          :jvm-opts ["-Dclojure.compiler.direct-linking=true"]
+                          :main-opts ["-m" "datalevin.federation.job-progress"]}
            :postgres-job-suite {:main-opts ["-m" "datalevin.federation.postgres-job-suite"]}
            :postgres-job-native {:main-opts ["-m" "datalevin.federation.postgres-job-native"]}
            :postgres {:replace-paths ["core/src" "postgres/src"]

@@ -1,233 +1,214 @@
-# JOB federation baselines
+# JOB federation benchmark
 
-Compare Datalevin's PostgreSQL adapter, native PostgreSQL, Trino's PostgreSQL
-connector, and Apache Drill's JDBC plugin on the original 113 JOB queries.
-All four read the same static PostgreSQL database. The launcher starts one
-competitor at a time, measures client wall time, retains answers and plans,
-and stops the service when the pass finishes or fails.
+Compare Datalevin's PostgreSQL adapter with native PostgreSQL, Trino, Apache
+Drill, DuckDB, and Accio on the original 113 Join Order Benchmark (JOB) queries.
+Datalevin runs equivalent Datalog through its PostgreSQL adapter. Every engine
+reads the same existing PostgreSQL database. The runners measure
+client wall time, check answers against PostgreSQL, save results and plans,
+and stop the services they start.
 
-The [first full comparison](../../doc/measurements/job-competitors-full113-2026-11-11.md)
-found 113 matching answers for Datalevin, 77 for Trino (36 text-collation
-differences), and 106 for Drill (seven five-minute timeouts after equivalent
-inequality spelling conversion). Those are historical coverage measurements,
-not repeated performance estimates. Use this workflow for new runs; the dated
-report retains its original harness snapshots and evidence.
+## Current baseline results
 
-## Prerequisites
+Reference measurements from **2026-11-11**, on macOS ARM64 with 12 logical CPUs,
+36 GiB RAM, and PostgreSQL 18.6 using UTF-8 and `en_US.UTF-8` collation:
 
-- Linux or macOS, Python **3.12+**, Clojure CLI, and a compatible Datalevin
-  **1.2.10 development checkout** at `../datalevin`. Follow the repository's
-  [checkout/build instructions](../../README.md#getting-started) before running.
-- Set `JAVA_HOME` to **Java 21** for the client, `TRINO_JAVA_HOME` to **Java 25**
-  (25.0.1 or later), and `DRILL_JAVA_HOME` to **Java 17**. These reproduce the
-  baseline JVM majors; JDKs are supplied by the operator. Exact JVM versions
-  are recorded. Trino's [deployment requirements](https://trino.io/docs/current/installation/deployment.html)
-  describe its supported runtime.
-- An existing PostgreSQL JOB import with its primary keys, foreign-key lookup
-  indexes, and collected statistics. The reference source is PostgreSQL 18.6,
-  UTF-8, `en_US.UTF-8` collation. Use a SELECT-only account where available.
-- Memory for PostgreSQL, the client, and one competitor together. The reference
-  machine had 36 GiB RAM and 12 logical CPUs. The configured ceilings below
-  are substantial; they are not measurements of actual peak use.
-- Free loopback HTTP ports 18080 (Trino), 18047 (Drill), and Drill RPC ports
-  31010–31012. The HTTP ports can be changed with CLI flags. No Docker required.
+| Baseline | Matching answers / 113 | Queries in timing total | Native PostgreSQL, s | Datalevin, s | Baseline, s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| DuckDB 2.0.0 + source-libc | 113 | 113 | 134.836 | 120.128 | 240.034 |
+| Accio + DuckDB 2.0 + source-libc | 113 | 113 | 126.619 | 115.443 | 174.528 |
+| Trino 484 | 77 | 70 | 52.106 | 41.834 | 131.152 |
+| Apache Drill 1.22.0 | 106 | 70 | 50.086 | 41.840 | 316.702 |
 
-[versions.json](versions.json) pins Trino **484**, Drill **1.22.0**, and Drill's
-PostgreSQL JDBC **42.7.13** distribution URLs and SHA-256 digests. Trino includes
-its own JDBC 42.7.14. The client JDBC version is pinned in [deps.edn](../../deps.edn).
-The installer verifies downloaded/cached bytes before extraction. It installs
-only Trino's PostgreSQL and required geospatial plugins; no other connectors
-participate. Installed directories are reused, so keep them unmodified.
+Answer coverage refers to all 113 queries. Timing totals sum per-query client
+wall times over the stated subset, with separate native/Datalevin controls for
+each row. The Trino and Drill totals use the **same 70 matching queries**;
+DuckDB and Accio totals use **all 113**. Every native and Datalevin control
+matches the original answer on all 113 queries.
 
-## Data and source configuration
+DuckDB and Accio use the **source-libc compatibility profile** to preserve
+PostgreSQL's text-minimum ordering. Its local Python sort-key cost is included.
+Accio uses its unmodified optimizer through a standard DuckDB execution bridge;
+this differs from its original custom scanner. The profile requires a source
+on the same host using a compatible libc locale.
 
-Use the May 2013 IMDb export used by the
-[original JOB](https://github.com/gregrahn/join-order-benchmark), available as
-[imdb.tgz](https://event.cwi.nl/da/job/imdb.tgz), with the 21-table
-[schema](../../../datalevin/benchmarks/JOB-bench/data/schema.sql) and
-[lookup indexes](../../../datalevin/benchmarks/JOB-bench/data/fkindexes.sql)
-in the matching Datalevin checkout. The queries are in
-`../datalevin/benchmarks/JOB-bench/queries`; `--corpus` can select another copy
-of those 113 files. The launcher verifies every SQL file against
-[corpus.sha256](corpus.sha256) before starting a service. This benchmark uses the original SQL outputs, including
-repeated columns and SQL NULL behavior.
+Trino has 36 text-collation mismatches. Drill has seven five-minute timeouts;
+its coverage includes documented syntax-equivalent inequality reruns. Failed
+and mismatching queries remain in the raw results and are excluded from the
+matching-subset timing totals above. Dingo has no measurement because a runnable
+artifact was unavailable.
 
-For a new import, prepare an **empty, dedicated database** using the upstream
-JOB loading instructions or the sibling
-[PostgreSQL loader](../../../datalevin/benchmarks/JOB-bench/src/datalevin_bench/postgres.clj).
-That loader expects CSVs under `benchmarks/JOB-bench/data`, defaults to the
-database `postgres`, drops/recreates its tables, loads CSV with a backslash
-escape, builds the supplied indexes, and runs `ANALYZE`. Use it only against
-an isolated installation intended for that import. Choose and record encoding
-and collation when creating the database. Do not reload or tune an existing
-comparison database between engine passes.
+These are exploratory measurements with **one sample per query and no explicit
+warmups**. The native answer oracle can warm caches, and timings vary between
+passes.
 
-Preserve the dataset archive/CSV checksums, schema/index checksums, import
-procedure, and exact row counts in a public text manifest. For example,
-`shasum -a 256 /path/to/job-data/*.csv` produces the CSV checksum portion.
-Pass the manifest with `--dataset-provenance`; its contents and SHA-256 are
-embedded in each run. A descriptive import identifier is also accepted for
-local exploration, but is weaker provenance. Source catalog estimates in the
-raw report are explicitly labeled estimates; they do not verify exact data
-identity. Publish the import manifest for a reproducible performance claim.
+## Requirements
 
-From this repository's root:
+- Linux or macOS, Python **3.12+**, Clojure CLI, and **Java 21** for the benchmark
+  client. Use a compatible Datalevin **1.2.10 development checkout** at
+  `../datalevin` and follow the [checkout/build instructions](../../README.md#getting-started).
+- An existing PostgreSQL JOB database with primary keys, foreign-key lookup
+  indexes, and collected statistics. Use a SELECT-only account where available.
+- Enough memory for PostgreSQL, the client and one competitor together. The
+  reference JVM ceilings are 8 GiB heap and 8 GiB direct memory; DuckDB has an
+  8 GiB memory limit and 16 GiB spill limit. Accio also starts a JVM. These are
+  configuration limits; actual peak RSS and network bytes are not measured.
+
+Install the runtimes needed for the engines you want to run:
+
+| Engine | Additional runtime | Default service ports |
+| --- | --- | --- |
+| Trino 484 | Java 25, version 25.0.1 or later | 18080 |
+| Apache Drill 1.22.0 | Java 17 | 18047 and RPC 31010–31012 |
+| DuckDB 2.0.0 | Python environment and PostgreSQL extension | 18081 |
+| Accio + DuckDB | DuckDB environment, Java 21 and Maven | 18081 |
+
+Engines run sequentially and can share a service port across passes. No Docker
+is required. [versions.json](versions.json) pins the Trino/Drill distributions
+and JDBC download checksums. [research-requirements.txt](research-requirements.txt)
+and the [DuckDB/Accio installation guide](RESEARCH.md#install) pin their Python
+packages and Accio source revision.
+
+## Prepare the data and connection
+
+Use the May 2013 IMDb export from the [original JOB](https://github.com/gregrahn/join-order-benchmark),
+available as [imdb.tgz](https://event.cwi.nl/da/job/imdb.tgz), with the supplied
+21-table [schema](../../../datalevin/benchmarks/JOB-bench/data/schema.sql) and
+[lookup indexes](../../../datalevin/benchmarks/JOB-bench/data/fkindexes.sql).
+Import once into a dedicated database and collect statistics before measuring.
+The sibling [PostgreSQL loader](../../../datalevin/benchmarks/JOB-bench/src/datalevin_bench/postgres.clj)
+drops/recreates tables, loads CSVs, builds indexes and runs `ANALYZE`; use it
+only for an isolated import. Keep data, indexes and statistics fixed between
+engine passes.
+
+The runners use `../datalevin/benchmarks/JOB-bench/queries` by default and verify
+all 113 SQL files against [corpus.sha256](corpus.sha256). `--corpus` can select
+another copy of the same pinned queries; `--schema` defaults to `public`.
+
+From this repository's root, configure the client and source:
 
 ```sh
 export JAVA_HOME=/path/to/jdk-21
-export TRINO_JAVA_HOME=/path/to/jdk-25
-export DRILL_JAVA_HOME=/path/to/jdk-17
 export POSTGRES_JOB_URL='jdbc:postgresql://127.0.0.1:5432/job'
 export POSTGRES_JOB_USER=job_reader
 export POSTGRES_JOB_PASSWORD='your-local-password'
 ```
 
-Omit the password variable for local authentication without a password. A JDBC
-`user` parameter is also accepted. The runner removes user/password URL
-parameters before writing configuration and puts credentials into private
-generated configuration. Simple database/schema identifiers are supported;
-use `--schema public` to override the schema. Other JDBC parameters, such as
-`sslmode`, are retained. The runner owns `currentSchema` and `options`, enforcing
-`default_transaction_read_only=on` and the selected source statement timeout.
-It never loads data, creates indexes, or runs maintenance `ANALYZE`.
+Omit the password variable for local authentication without a password. Simple
+database/schema identifiers are supported. Both runners enforce read-only
+source connections and the selected statement timeout. They do not load data,
+create indexes or run maintenance `ANALYZE`.
 
-## Run
+Prepare a text import manifest containing data-file checksums, schema/index
+checksums, import procedure, encoding/collation and exact row counts. Supply its
+path through `--dataset-provenance`; the runner embeds its contents and hash.
+A descriptive import identifier is accepted for local exploration. Recorded
+catalog row estimates are not exact data-identity checks.
 
-Download and verify the distributions once (about 1.3 GB compressed):
+## Run Trino or Drill
+
+Set the service JVMs and download the pinned distributions:
 
 ```sh
+export TRINO_JAVA_HOME=/path/to/jdk-25
+export DRILL_JAVA_HOME=/path/to/jdk-17
 python3 benchmarks/job/baselines.py fetch all
 ```
 
-By default, downloads and installations live under ignored
-`benchmarks/job/.work`. Global `--home /path/to/work` and
-`--downloads /path/to/cache` flags go **before** `fetch` or `run`. A shared cache
-must contain the archive names in `versions.json`; existing archives are
-checksum-checked. A changed/unrecognized installation requires a fresh home.
+Use `fetch trino` or `fetch drill` to install one engine. Downloads for both
+are about 1.3 GB compressed and are verified before extraction. Downloads and
+installations default to ignored `benchmarks/job/.work`. Global `--home` and
+`--downloads` flags go before `fetch` or `run`.
 
-Start with two queries, including one requiring Drill's inequality conversion:
+Start with a two-query smoke run:
 
 ```sh
 python3 benchmarks/job/baselines.py run all \
   --queries 6a,11a --timeout-ms 30000 \
   --dataset-provenance /path/to/import-manifest.txt \
-  --output benchmarks/job/.work/smoke
+  --output benchmarks/job/.work/trino-drill-smoke
 ```
 
-Run the full 113-query coverage pass:
+Run all 113 queries:
 
 ```sh
 python3 benchmarks/job/baselines.py run all \
   --dataset-provenance /path/to/import-manifest.txt \
-  --output benchmarks/job/.work/full113
+  --output benchmarks/job/.work/trino-drill-full113
 ```
 
-Defaults are **one sample, zero explicit warmups, and 300 seconds per call**.
-The historical full coverage pass took about an hour, dominated by Drill
-timeouts; allow substantially longer for repeated samples. To measure repeated
-observations, use a new output directory:
+Replace `run all` with `run trino` or `run drill` for a single comparison.
+Each competitor gets fresh native and Datalevin controls.
+
+## Run DuckDB or Accio
+
+Follow the [installation guide](RESEARCH.md#install) to create the Python
+environment, install DuckDB's PostgreSQL extension and build Accio if needed.
+Then run all 113 queries with matching source text-minimum semantics:
 
 ```sh
-python3 benchmarks/job/baselines.py run all --samples 3 --warmups 1 \
+python3 benchmarks/job/research_baselines.py all --text-min-order source-libc \
   --dataset-provenance /path/to/import-manifest.txt \
-  --output benchmarks/job/.work/repeated113
+  --output benchmarks/job/.work/duckdb-accio-full113
 ```
 
-`run trino` and `run drill` run individual comparisons, each with fresh paired
-native/Datalevin controls. Neither output directories nor raw result files are
-overwritten. Progress and exceptions go to each engine's `client.log`; its
-checkpointed `run.edn` grows after each query. Ctrl-C stops owned processes.
-An interrupted pass remains incomplete; start a new run instead of silently
-mixing old and new samples. An engine query failure is retained and the pass
-continues; a failed native oracle or setup aborts the pass.
+Replace `all` with `duckdb` or `accio` for one engine. For a smoke run, add
+`--queries 1a,1b,10c,15d,18a,27a --timeout-ms 30000` and use a new output directory.
+`--text-min-order binary` selects the earlier binary text ordering, which can
+differ from the source's answers. [Profile details and limits](RESEARCH.md#postgresql-text-minimum-compatibility)
+explain the required locale/provider checks and the measured local sorting cost.
 
-## Read and regenerate reports
+## Sampling and timing
 
-The launcher creates `OUTPUT/summary/README.md`, `summary.json`, `queries.csv`,
-`samples.csv`, and `plans.edn`. The per-engine directories retain the full
-`run.edn`, options, environment manifest, and service/client logs. Raw runs
-include query hashes, original/submitted SQL, answer rows, sample order,
-warmups, failures, PostgreSQL version/collation/settings, source table/index/
-statistics metadata, adapter budgets, JVM/host details, repository revisions,
-and 33 measured implementation fingerprints. The environment records pinned
-artifacts and config/runner hashes. Credentials are excluded from the manifest;
-generated catalog/storage credentials are removed on normal cleanup. Keep run
-directories private and inspect engine logs/profiles before publishing them.
+Both runners default to **one sample, zero explicit warmups, and a 300-second
+per-call deadline**. Add `--samples 3 --warmups 1` to either run command to retain
+repeated observations. Use a new output directory for every run. Allow about an
+hour for the reference Trino/Drill coverage pass, dominated by timeouts, and
+longer for repeated samples.
 
-Regenerate a report from any compatible version-2 runs into a new directory:
+Client wall time includes planning, cardinality estimation, connector work,
+execution, result consumption, decoding and cleanup. DuckDB/Accio local SQL
+adaptation and source-libc sorting are included. Service/JVM startup, schema/
+mapping discovery, Datalevin SQL-to-Datalog translation, native answer oracles,
+explicit warmups and diagnostic plan capture are outside the timed calls.
+
+An untimed native answer oracle precedes each query's measurements and can warm
+source caches. Mode order rotates by query and sample. The source must remain
+static: native and Datalevin use read-only repeatable-read transactions,
+while connector transaction behavior can differ. Correctness checks compare
+final aggregate answers, including NULLs, repeated output columns and collation.
+
+## Read the results
+
+Each run creates a summary and retains the evidence used to calculate it:
+
+| Output | Contents |
+| --- | --- |
+| `summary/README.md` and `summary/summary.json` | Coverage, exclusions and totals over the common matching query set |
+| `summary/queries.csv` and `summary/samples.csv` | Per-query and per-sample timings, statuses and call order |
+| `summary/plans.edn` | Captured plans and generated SQL |
+| `<engine>/run.edn` | Raw answers, samples, failures and diagnostics |
+| `<engine>/environment.json` | Versions, resources, source identity and implementation hashes |
+| `<engine>/client.log` and `service.log` | Progress and service diagnostics |
+
+A query enters a matching-subset total only when every timed sample in every
+compared mode/run returns the original native answer. Failures and mismatches
+stay visible. The reports also retain all attempted time, including failures;
+that total can have a different denominator from correct-answer timings.
+
+Regenerate a report from compatible version-2 runs into a new directory:
 
 ```sh
 clojure -M:job-baselines-report /path/to/new-summary \
-  /path/to/trino/run.edn /path/to/drill/run.edn
+  /path/to/duckdb/run.edn /path/to/accio/run.edn
 ```
 
-The report rejects incomplete runs, duplicate engines, changed SQL hashes,
-inconsistent answer flags, and differences in paired protocols, source
-metadata, expected answers, or measured implementation. Runs from different
-hosts/settings/implementations should be reported separately. Version-1 dated
-runs retain their archived analysis scripts.
+The report checks SQL hashes, answer flags, sampling, source settings and
+implementation compatibility. Historical format-1 runs retain their dated
+analysis programs in the linked reports. Use the [before/after guide](BASELINES.md)
+when comparing optimizer revisions or preserving a new reference.
 
-A query enters the common comparison only when **every timed sample in every
-mode and run returns the original native answer**. The report sums per-query
-medians over that identical subset, preserving separate native/Datalevin
-controls for each competitor. It also reports all attempted call time, including
-failures and mismatches, with a different denominator. It never labels an
-incomplete matching subset as a full-suite speed comparison. Individual samples
-and exclusions stay visible. Three samples support a better descriptive estimate
-than one; they do not by themselves establish statistical significance.
-
-## Measurement contract
-
-- Timed client calls include submission, planning, execution, result consumption,
-  decoding, and normal cleanup. Native uses fresh JDBC connections; competitors
-  use their HTTP query APIs and consume all response pages. Datalevin times `d/q`
-  through source cleanup. JVM/service startup, mapping discovery, SQL translation,
-  answer oracles, warmups, plan/profile capture, and report writing are excluded.
-- An untimed native answer oracle precedes each query's measurements and can warm
-  PostgreSQL's caches. Mode order rotates by query and sample; the order is in
-  every record. This is not a cold-cache test. Each competitor pass gets a fresh
-  client JVM and fresh service state. Avoid other workloads during measurement.
-- Native/Datalevin use read-only repeatable-read transactions. Connector
-  transaction behavior can differ; the source must remain static throughout.
-  The oracle checks final aggregate results, not all intermediate tuples.
-- Datalevin requests PostgreSQL's native text-extrema semantics. Trino's text
-  ordering can differ. Such differences remain mismatches; no collation rewrite
-  is applied to the oracle or measured SQL.
-- Drill receives token-level `!=` → `<>` normalization, preserving literals,
-  quoted identifiers and comments. These are equivalent PostgreSQL
-  [comparison operators](https://www.postgresql.org/docs/18/functions-comparison.html).
-  Both original and submitted SQL are retained. Native and Datalevin continue
-  using the original corpus. All 113 parsed query structures are regression-tested.
-- Connector optimization uses default automatic settings. There are no eager
-  join-pushdown overrides, passthrough queries, or per-query source tuning.
-  Trino EXPLAIN and Drill executed profiles (EXPLAIN fallback after failure) are
-  captured outside timing. Inspect them before attributing work to an engine.
-- [Resource settings](config/resources.json) and [Trino JVM flags](config/trino-jvm.config)
-  set 8 GiB heap and 8 GiB direct-memory ceilings per competitor; the client has
-  the same ceilings. Trino query memory is 6 GiB with 2 GiB heap headroom.
-  Datalevin allows 8 GiB retained query state and 16,384 external requests.
-  Configured ceilings are not equal measured RSS budgets. Actual wire bytes,
-  source request counts, and whole-process peak RSS are not measured.
-- Client deadlines and source statement timeouts use the selected limit;
-  cancellation/cleanup can add elapsed time. Failures are never counted as fast
-  successful answers. Diagnostic failures are retained independently.
-
-This is a single-source delegation/overhead baseline. Distributed scaling,
-split PostgreSQL placement, and native EAV/SQL/API workloads remain separate
-[federation milestones](../../federation.md#job-federation-comparisons).
-
-## Development checks
-
-```sh
-python3 -m unittest discover -s benchmarks/job -p 'test_*.py'
-clojure -M:test datalevin.federation.job-competitors-test
-```
-
-The two-query smoke command above validates real installation, service startup,
-read-only execution, plan capture, report generation, and shutdown. Use the full
-suite when changing query semantics or making performance claims. Publish both
-repository revisions (and any uncommitted source changes), the data manifest,
-raw runs, and summary together.
-
-The [workflow smoke evidence](../../doc/measurements/job-baselines-smoke-2026-11-11/README.md)
-records successful runs of both engines and the focused validation checks.
+Output directories are never overwritten. Progress is checkpointed after each
+query. A competitor query failure is recorded and the pass continues; a failed
+native oracle or setup aborts the pass. Ctrl-C stops owned services. Retain an
+interrupted checkpoint and start a new run. Keep run directories private and
+review logs/profiles before publishing them.

@@ -1,8 +1,8 @@
 # datalevin-federation
 
 Data federation allows using Datalevin to query heterogeneous data sources
-without having to moving data into Datalevin. This repository hosts the data
-source adapters. Each is released as its own clojars artifact.
+without having to copying all data into Datalevin. This repository hosts the
+data source adapters. Each is released as its own clojars artifact.
 
 Currently, we support query PostgreSQL, file exports, GitHub, and native
 Datalevin data together with Datalog. Federation adapters expose external
@@ -223,6 +223,10 @@ above supplies the runtime for all modules.
 - [PostgreSQL](postgres/README.md): connect, map tables, query, and configure SQL delegation.
 - [GitHub](github/README.md): map work items and configure API lookups.
 - [Files](file/README.md): accept and query EDN Lines exports.
-- [JOB baselines](benchmarks/job/README.md): reproduce comparisons with native PostgreSQL, Trino, and Drill.
+
+## Benchmarks
+
+- [JOB baselines](benchmarks/job/README.md): reproduce comparisons with native
+  PostgreSQL, Trino, Drill, DuckDB and Accio.
 
 Licensed under [EPL-2.0](LICENSE).

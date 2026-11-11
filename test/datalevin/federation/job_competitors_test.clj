@@ -10,6 +10,8 @@
            [java.nio.file.attribute FileAttribute]))
 
 (deftest comparison-options
+  (doseq [engine [:duckdb :accio]]
+    (is (= engine (:engine (competitors/options! {:engine engine :endpoint "http://localhost:18081"})))))
   (let [opts (competitors/options! {:engine :trino :endpoint "http://127.0.0.1:18080"})]
     (is (nil? (:queries opts)))
     (is (:drill-ansi-not-equal? opts))
@@ -56,6 +58,7 @@
                                     (range) [10 90 20])}) [:6a :11a])})
 
 (deftest fair-common-subset
+  (is (= [:6a :11a] (:common-correct-query-ids (report/summarize [(fixture :duckdb) (fixture :accio)]))))
   (let [trino (assoc-in (fixture :trino) [:results 1 :samples 0 :trino]
                       (assoc (sample 5) :answer-matches? false :rows #{["different"]}))
         drill (fixture :drill)
@@ -83,6 +86,7 @@
                    (assoc-in (fixture :trino) [:results 0 :samples 0 :trino :answer-matches?] false)]]
     (is (thrown? Exception (report/summarize [invalid]))))
   (doseq [different [(assoc-in (fixture :drill) [:implementation-sha256 "engine"] "changed")
+                     (assoc-in (fixture :drill) [:environment "semantics"] {"text_min_order" "source-libc"})
                      (assoc (fixture :drill) :native-settings #{["different"]})
                      (assoc-in (fixture :drill) [:options :timeout-ms] 1000)]]
     (is (thrown? Exception (report/summarize [(fixture :trino) different]))))
