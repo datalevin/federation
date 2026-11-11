@@ -15,6 +15,7 @@
                        datalevin.federation.postgres-test
                        datalevin.federation.postgres-job-test
                        datalevin.federation.postgres-job-suite-test
+                       datalevin.federation.job-competitors-test
                        datalevin.federation.workflow-test
                        datalevin.federation.local-test
                        datalevin.federation.local-batch-test

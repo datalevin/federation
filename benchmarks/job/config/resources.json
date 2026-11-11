@@ -1,0 +1,12 @@
+{
+  "trino": {
+    "query.max-memory": "6GB",
+    "query.max-memory-per-node": "6GB",
+    "memory.heap-headroom-per-node": "2GB"
+  },
+  "drill": {
+    "DRILL_HEAP": "8G",
+    "DRILL_MAX_DIRECT_MEMORY": "8G",
+    "DRILLBIT_CODE_CACHE_SIZE": "512M"
+  }
+}

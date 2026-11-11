@@ -13,3 +13,5 @@ checkouts/
 .lein-failures
 .nrepl-port
 .cpcache/
+/benchmarks/job/.work/
+__pycache__/

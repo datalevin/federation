@@ -415,3 +415,6 @@ using source provider `:postgres` and a runtime profile reference. After
 Refresh explicitly by discovering and accepting new metadata, then installing
 it with the current definition version. Keep credentials, connections, and
 fetched rows outside saved definitions.
+
+For repeatable full-query performance comparisons with native PostgreSQL,
+Trino, and Apache Drill, see the [JOB baseline workflow](../benchmarks/job/README.md).

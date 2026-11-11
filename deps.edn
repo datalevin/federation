@@ -66,6 +66,21 @@
                                      "--enable-native-access=ALL-UNNAMED"
                                      "-Dclojure.compiler.direct-linking=true"]
                           :main-opts ["-m" "datalevin.federation.postgres-job"]}
+           :job-baselines {:replace-paths ["core/src" "postgres/src" "dev/src"]
+                           :jvm-opts ["-Xms1g" "-Xmx8g" "-XX:MaxDirectMemorySize=8g"
+                                      "--add-opens=java.base/java.lang=ALL-UNNAMED"
+                                      "--add-opens=java.base/java.nio=ALL-UNNAMED"
+                                      "--add-opens=java.base/java.util=ALL-UNNAMED"
+                                      "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+                                      "--enable-native-access=ALL-UNNAMED"
+                                      "-Dclojure.compiler.direct-linking=true"]
+                           :main-opts ["-m" "datalevin.federation.job-competitors"]}
+           :job-baselines-report {:extra-paths ["dev/src"]
+                                  :jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                                             "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+                                             "--enable-native-access=ALL-UNNAMED"
+                                             "-Dclojure.compiler.direct-linking=true"]
+                                  :main-opts ["-m" "datalevin.federation.job-comparison"]}
            :postgres-job-suite {:main-opts ["-m" "datalevin.federation.postgres-job-suite"]}
            :postgres-job-native {:main-opts ["-m" "datalevin.federation.postgres-job-native"]}
            :postgres {:replace-paths ["core/src" "postgres/src"]

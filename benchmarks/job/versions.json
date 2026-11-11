@@ -1,0 +1,24 @@
+{
+  "trino": {
+    "version": "484",
+    "url": "https://repo.maven.apache.org/maven2/io/trino/trino-server/484/trino-server-484.tar.gz",
+    "sha256": "4b2d05f2e52fcc156b2f137cabc886353e5dde782d12bf71e290ffc13463b81a",
+    "archive": "trino.tar.gz",
+    "directory": "trino-server-484",
+    "java": 25
+  },
+  "drill": {
+    "version": "1.22.0",
+    "url": "https://archive.apache.org/dist/drill/1.22.0/apache-drill-1.22.0.tar.gz",
+    "sha256": "21bb0087ead2487f31ef04dd1cd2f41eaacb147b4f9880f81737b4894a3db4e4",
+    "archive": "drill.tar.gz",
+    "directory": "apache-drill-1.22.0",
+    "java": 17
+  },
+  "jdbc": {
+    "version": "42.7.13",
+    "url": "https://repo.maven.apache.org/maven2/org/postgresql/postgresql/42.7.13/postgresql-42.7.13.jar",
+    "sha256": "6e0e4cc2d8cae902084f8a2b18728b073a6fd9d1f87c9d8bff8f298c18185b93",
+    "archive": "postgresql-42.7.13.jar"
+  }
+}
