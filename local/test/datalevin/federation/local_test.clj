@@ -17,6 +17,74 @@
 (defn category [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo e (:error (ex-data e)))))
 
+(defn- clause-permutations [clauses]
+  (if (empty? clauses) [[]]
+      (mapcat (fn [i]
+                (map #(into [(nth clauses i)] %)
+                     (clause-permutations (into (subvec clauses 0 i) (subvec clauses (inc i))))))
+              (range (count clauses)))))
+
+(deftest mixed-source-clause-order-is-independent
+  (let [facts (row-facts [[1 "one"] [2 "two"]])
+        provider (local/source descriptor facts {:mode :lookup})
+        seed [[1] [2] [99]]
+        clauses '[[$seed ?raw] [(identity ?raw) ?first] [(identity ?first) ?second]
+                  [(identity ?second) ?id] [$s ?id :row/value ?value]]]
+    (doseq [where (clause-permutations clauses)]
+      (let [query {:find '[?id ?value] :in '[$seed $s] :where where}]
+        (is (= #{[1 "one"] [2 "two"]}
+               (d/q query seed facts)
+               (d/q query seed provider)) (pr-str where))))))
+
+(deftest mixed-source-rule-and-union-clause-order-is-independent
+  (let [facts (row-facts [[1 "one"] [2 "two"]])
+        provider (local/source descriptor facts {:mode :lookup})
+        seed [[1] [2] [99]]
+        clauses '[[$seed ?raw] [(identity ?raw) ?first] [(ground ?first) ?second]
+                  [(identity ?second) ?id] [?id :row/value ?value]]
+        rule-query '[:find ?id ?value :in $seed $s % :where ($s named ?id ?value)]
+        union-query '[:find ?id ?value :in $seed $s % :where ($s chosen ?id ?value)]]
+    (doseq [where (clause-permutations clauses)]
+      (let [rules [(into '[(named ?id ?value)] where)
+                   '[(chosen ?id ?value)
+                     (or-join [?id ?value] (named ?id ?value) (named ?id ?value))]]
+            inline {:find '[?id ?value] :in '[$seed $s]
+                    :where (mapv #(if (= '?id (first %)) (into ['$s] %) %) where)}
+            expected (d/q inline seed facts)]
+        (doseq [query [rule-query union-query]]
+          (is (= #{[1 "one"] [2 "two"]}
+                 expected
+                 (d/q query seed provider rules)) (pr-str [query where])))))))
+
+(deftest mixed-source-copy-cycles-retain-caller-types
+  (let [facts (row-facts [[1 "one"] [2 "two"]])
+        caller (local/source descriptor facts {:mode :scan})
+        callee (local/source (assoc descriptor :source-instance-id (random-uuid)) facts {:mode :lookup})
+        query '[:find ?copy ?value ?actual :in $caller $s % ?key
+                :where ($caller copied ?key ?copy ?value) [$s ?copy :row/value ?actual]]]
+    (doseq [copies ['[[(identity ?key) ?key] [(identity ?key) ?copy]]
+                    '[[(identity ?key) ?copy] [(identity ?copy) ?key]]]
+            where (clause-permutations (into '[[?e :row/value ?value]] copies))]
+      (let [rules [(into '[(copied ?key ?copy ?value)] where)]]
+        (is (= #{[1 "one" "one"] [1 "two" "one"]}
+               (d/q query caller callee rules 1)) (pr-str where))))))
+
+(deftest native-database-and-federated-clause-order-is-independent
+  (let [dir (u/tmp-dir (str "federation-clause-order-" (random-uuid)))
+        conn (d/get-conn dir {:native/key {:db/valueType :db.type/long}})
+        facts (row-facts [[1 "one"] [2 "two"]])
+        provider (local/source descriptor facts {:mode :lookup})
+        clauses '[[?e :native/key ?raw] [(identity ?raw) ?first] [(identity ?first) ?second]
+                  [(identity ?second) ?id] [$s ?id :row/value ?value]]]
+    (try
+      (d/transact! conn [{:native/key 1} {:native/key 2} {:native/key 99}])
+      (doseq [where [clauses (vec (reverse clauses))]]
+        (let [query {:find '[?id ?value] :in '[$ $s] :where where}]
+          (is (= #{[1 "one"] [2 "two"]}
+                 (d/q query @conn facts)
+                 (d/q query @conn provider)) (pr-str where))))
+      (finally (d/close conn) (u/delete-files dir)))))
+
 (deftest local-queries-match-eager-relations
   (let [rows [[1 "a"] [2 nil] [3 "b"] [4 "a"] [4 "a"]]
         s (pair-source descriptor rows)]
@@ -35,6 +103,83 @@
     (local/replace-rows! s (row-facts [[9 "new"]]))
     (is (= #{[9]} (d/q '[:find ?id :in $s :where [$s ?id :row/value _]] s)))
     (is (= descriptor (spi/-source-info s)))))
+
+(deftest rule-calls-receive-federated-caller-bindings
+  (let [rows [[1 "one"] [2 "two"]]
+        facts (row-facts rows)
+        callee-info (assoc descriptor :source-instance-id (random-uuid))
+        rules '[[(named ?entity ?label) [?entity :row/value ?label]]
+                [(wrapped ?label ?entity) (named ?entity ?label)]]]
+    (doseq [[caller-mode callee-mode] [[:scan :lookup] [:both :lookup]
+                                     [:lookup :scan] [:lookup :both]]
+            call '[($s named ?id ?value) ($s wrapped ?value ?id)
+                   (or-join [?id ?value] ($s named ?id ?value) ($s wrapped ?value ?id))]
+            caller-clause '[[$caller ?id :row/value _] ($caller named ?id _)]
+            where [[caller-clause call] [call caller-clause]]]
+      (let [caller (local/source descriptor facts {:mode caller-mode})
+            callee (local/source callee-info facts {:mode callee-mode})
+            query {:find '[?id ?value] :in '[$caller $s %] :where where}]
+        (is (= #{[1 "one"] [2 "two"]}
+               (d/q query facts facts rules)
+               (d/q query caller callee rules))
+            (pr-str [caller-mode callee-mode where]))))))
+
+(deftest federated-rule-bindings-preserve-correlations-and-witnesses
+  (let [facts (row-facts [[1 "one"] [2 "two"] [3 "three"]])
+        caller (pair-source descriptor [[1 "one"] [2 "wrong"] [3 "three"]])
+        callee (local/source (assoc descriptor :source-instance-id (random-uuid)) facts {:mode :lookup})
+        rules '[[(named ?entity ?label) [?entity :row/value ?label]]
+                [(named ?other ?text) [?other :row/value ?text]]]
+        query '{:find [?id ?value ?tag] :in [$caller $s % [[?tag]]]
+                :where [[$caller ?id :row/value ?value] ($s named ?id ?value)]}
+        tags [[:a] [:b] [:a]]]
+    (is (= #{[1 "one" :a] [1 "one" :b] [3 "three" :a] [3 "three" :b]}
+           (d/q query caller callee rules tags)))
+    (is (= 4 (:result-rows (d/explain {:run? true} query caller callee rules tags))))
+    (let [count-query (assoc query :find '[(count ?id) .] :with '[?tag])]
+      (is (= (d/q count-query (row-facts [[1 "one"] [2 "wrong"] [3 "three"]]) facts rules tags)
+             (d/q count-query caller callee rules tags))))
+    (is (= #{[1 "one" :a] [1 "one" :b]}
+           (d/q (update query :where conj '(not [$s ?id :row/value "three"]))
+                caller callee rules tags)))))
+
+(deftest federated-rules-require-a-real-caller-producer
+  (let [facts (row-facts [[1 "one"]])
+        caller (local/source descriptor facts {:mode :lookup})
+        callee (local/source (assoc descriptor :source-instance-id (random-uuid)) facts {:mode :lookup})
+        query '[:find ?id ?value :in $caller $s %
+                :where [$caller ?id :row/value _] ($s named ?id ?value)]]
+    (is (= :query-source/unsupported
+           (category #(d/q query caller callee '[[(named ?entity ?label) [?entity :row/value ?label]]]))))))
+
+(deftest federated-rules-can-bind-only-part-of-their-head
+  (let [caller (local/source descriptor (row-facts [[1 "one"]]) {:mode :scan})
+        callee (local/source (assoc descriptor :source-instance-id (random-uuid))
+                            (row-facts [[1 "one"] [2 "two"]]) {:mode :lookup})
+        consumer (local/source (assoc descriptor :source-instance-id (random-uuid))
+                              (row-facts [[10 "one"]]) {:mode :value})
+        query '[:find ?id ?other ?value :in $caller $s $consumer %
+                :where [$caller ?id :row/value _] ($s named ?id ?value)
+                [$consumer ?other :row/value ?value]]]
+    (is (= #{[1 10 "one"]}
+           (d/q query caller callee consumer '[[(named ?entity ?label) [?entity :row/value ?label]]])))))
+
+(deftest federated-rule-inputs-survive-caller-projection
+  (let [facts (row-facts [[1 "one"] [2 "two"]])
+        caller (local/source descriptor facts {:mode :scan})
+        requests (atom [])
+        observed (reify spi/IQuerySource
+                   (-source-info [_] (spi/-source-info caller))
+                   (-open-session [_ request] (spi/-open-session caller request))
+                   (-plan-source [_ session request]
+                     (swap! requests conj (select-keys request [:required-vars]))
+                     (spi/-plan-source caller session request)))
+        callee (local/source (assoc descriptor :source-instance-id (random-uuid)) facts {:mode :lookup})
+        query '[:find ?value :in $caller $s %
+                :where [$caller ?id :row/value _] ($s named ?id ?value)]]
+    (is (= #{["one"] ["two"]}
+           (d/q query observed callee '[[(named ?entity ?label) [?entity :row/value ?label]]])))
+    (is (= [#{'?id}] (mapv :required-vars @requests)))))
 
 (deftest pinned-aliases-and-native-views
   (let [dir (u/tmp-dir (str "federation-local-" (random-uuid)))
