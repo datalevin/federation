@@ -7,7 +7,31 @@ reads the same existing PostgreSQL database. The runners measure
 client wall time, check answers against PostgreSQL, save results and plans,
 and stop the services they start.
 
-## Current baseline results
+## Current adapter results
+
+The guarded demand and native-text MIN compiler is integrated into the
+PostgreSQL adapter. A **2026-11-17** comparison runs the original 113 queries
+in two fresh processes per revision, using the same engine and database:
+
+| Adapter revision | Pass | Datalevin, s | Native PostgreSQL, s |
+| --- | ---: | ---: | ---: |
+| baseline | 0 | 117.033 | 129.823 |
+| candidate | 0 | 85.634 | 128.418 |
+| candidate | 1 | 85.706 | 129.978 |
+| baseline | 1 | 116.622 | 126.785 |
+
+`baseline` is the production adapter before integration; `candidate` is the
+integrated compiler. The mean adapter total changes from
+**116.827 s to 85.670 s**
+(26.7% less). All 452 adapter calls match the original
+PostgreSQL aggregate answers. Each process makes one call per query and mode,
+with no per-query warmup; pass 1 reverses query order. Client timing includes
+acquisition, planning, execution, decoding and cleanup. Mapping setup is outside
+timing. Source fingerprints are stable, and per-query losses remain in the
+[production validation report](../../../datalevin/doc/measurements/federation-summary-production-2026-11-17/README.md).
+These results do not update the older competitor observations below.
+
+## Competitor reference results
 
 Reference measurements from **2026-11-11**, on macOS ARM64 with 12 logical CPUs,
 36 GiB RAM, and PostgreSQL 18.6 using UTF-8 and `en_US.UTF-8` collation:
@@ -44,7 +68,7 @@ passes.
 ## Requirements
 
 - Linux or macOS, Python **3.12+**, Clojure CLI, and **Java 21** for the benchmark
-  client. Use a compatible Datalevin **1.2.10 development checkout** at
+  client. Use the matching Datalevin **1.2.11 checkout** at
   `../datalevin` and follow the [checkout/build instructions](../../README.md#getting-started).
 - An existing PostgreSQL JOB database with primary keys, foreign-key lookup
   indexes, and collected statistics. Use a SELECT-only account where available.

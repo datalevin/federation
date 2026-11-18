@@ -11,9 +11,10 @@ first importing all the data into Datalevin. Bindings and supported filters
 constrain external reads; `d/explain` shows the selected plan and execution
 metrics.
 
-**Status:** development snapshots (`0.1.0-SNAPSHOT`) for embedded JVM applications.
-The checkout instructions below use the matching Datalevin **1.2.10** development
-build, which includes the query-source extensions required by PostgreSQL.
+**Release target:** **1.2.11** for embedded JVM applications. Federation modules
+use the same release version as Datalevin. The checkout instructions below use
+the matching Datalevin **1.2.11** build, which includes the query-source
+extensions required by PostgreSQL.
 
 ## Data sources
 
@@ -201,8 +202,8 @@ uses the saved identities and mappings without discovering a new schema.
 
 ## Modules
 
-Each module has version `0.1.0-SNAPSHOT` and the Maven group
-`org.clojars.huahaiy`:
+All modules share Datalevin's release version, starting with `1.2.11`, and the
+Maven group `org.clojars.huahaiy`:
 
 | Artifact | Purpose |
 | --- | --- |
@@ -212,9 +213,10 @@ Each module has version `0.1.0-SNAPSHOT` and the Maven group
 | `datalevin-federation-file` | EDN Lines exports; includes core. |
 | `datalevin-federation-postgres` | PostgreSQL access; includes core and the JDBC driver. |
 
-Use the modules your application needs. Datalevin has Maven `provided` scope,
-so your application must supply a compatible runtime. PostgreSQL requires the
-matching 1.2.10 build with relational query-source support. The checkout setup
+Use the modules your application needs, with the same version of Datalevin,
+federation core, and each adapter. Datalevin has Maven `provided` scope, so your
+application must supply the runtime explicitly. Version 1.2.11 includes the
+relational query-source support required by PostgreSQL. The checkout setup
 above supplies the runtime for all modules.
 
 ## Guides

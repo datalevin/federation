@@ -5,6 +5,8 @@
             [datalevin.federation.postgres.jdbc :as jdbc]
             [datalevin.federation.postgres.mapping :as pm]
             [datalevin.federation.postgres.plan :as plan]
+            [datalevin.federation.postgres.presence :as presence]
+            [datalevin.federation.postgres.summary :as summary]
             [datalevin.query.source.value :as value])
   (:import [java.math BigDecimal]
            [java.nio.charset StandardCharsets]
@@ -325,7 +327,7 @@
                             (do (require! (and (= 1 (count columns))
                                                 (#{"text" "varchar"} (first (:types (second expressions))))))
                                 (assoc-in state [:native-expressions (second val)]
-                                  {:sql (:raw-sql (second expressions))
+                                  {:sql (:raw-sql (second expressions)) :aliases #{alias}
                                    :collation (get-in accepted [:requirements :columns (first columns) :collation])})) state)
                     state (cond-> (assoc-in state [:tables key] table)
                             (not optional?)
@@ -339,6 +341,8 @@
                                        state (if before
                                                (let [sql (equivalent before expr true)]
                                                  (-> state (update :conditions conj sql)
+                                                     (update :nonnull into (:raw-sql before))
+                                                     (update :nonnull into (:raw-sql expr))
                                                      (update :edges conj {:sql sql
                                                                           :aliases (into (:aliases expr #{}) (:aliases before))
                                                                           :input? (boolean (:input? before))}))) state)
@@ -347,7 +351,7 @@
                                      (let [[sql params] (literal expr (get-in request [:bindings v]) true)]
                                        (-> state (update :conditions conj sql) (update :params into params))) state))
                             (unsupported!))) state (map vector [entity val] expressions))))
-            {:tables (array-map) :variables (:variables input {}) :conditions (if input ["b.ok"] []) :params (:params input [])} patterns)
+            {:tables (array-map) :nonnull #{} :variables (:variables input {}) :conditions (if input ["b.ok"] []) :params (:params input [])} patterns)
           state
           (reduce (fn [state {:keys [source-symbol terms]}]
                     (let [[entity [tag attribute] val] terms
@@ -371,6 +375,10 @@
           _ (require! (every? #(contains? native-expressions %) (keys native-specs)))
           filters (mapv #(condition-filter variables %) predicates)
           conditions (into (:conditions state) (map first filters))
+          demand? (and (not input) (not (:window request)) (not (:dependent-order? request)))
+          conditions (if demand?
+                       (:conditions (presence/normalize conditions variables predicates (:nonnull state)))
+                       conditions)
           params (into (:params state) (mapcat second) filters)
           _ (require! (<= (count params) 65535))
           ;; Preserve declaration order beyond ten aliases: lexical r10/r2
@@ -432,8 +440,20 @@
           ;; distinct intermediate relation. Other reducers keep Datalog's
           ;; distinct find/with witness semantics.
           extrema-only? (every? #(and (= :aggregate (:kind %)) (#{:min :max} (:operator %))) (:find request))
+          ;; These passes preserve all visible values and validation effects.
+          ;; Unsupported demands retain the ordinary join and reducer path.
+          protection (when demand?
+                       (summary/choose
+                         {:tables tables :input input :grouping grouping :window (:window request)
+                          :find (:find request) :with (:with request) :optional? (seq optional-patterns)
+                          :absence? (seq absences) :used used :variables variables
+                          :native-expressions native-expressions :conditions conditions
+                          :oversized oversized :params params :bad bad
+                          :binary-associations (::binary-associations request)}))
+          matched-from (if (:applied? protection) (:from protection) from)
+          matched-conditions (if (:applied? protection) (:conditions protection) conditions)
           matched (str "SELECT " (when-not extrema-only? "DISTINCT ")
-                       (str/join ", " distinct-select) " FROM " from " WHERE " (conjunction conditions))
+                       (str/join ", " distinct-select) " FROM " matched-from " WHERE " (conjunction matched-conditions))
           result (str "SELECT " (str/join ", " (map #(str %1 " AS " %2) output-expressions output-fields))
                       ", " (if aggregate? "bool_or(oversized)" "oversized") " AS oversized, "
                       (if aggregate? "bool_or(invalid)" "invalid") " AS invalid FROM matched"
@@ -447,7 +467,7 @@
                  (if window (:sql window)
                    (str " SELECT " too-large ", invalid, "
                         (str/join ", " (map #(str "CASE WHEN " safe " THEN " % " END") output-fields)) " FROM result")))
-       :params (into params (:params window)) :layout (mapv #(dissoc % :sql :modifier) outputs) :columns (:columns request)
+       :params (into (or (:params protection) params) (:params window)) :layout (mapv #(dissoc % :sql :modifier) outputs) :columns (:columns request)
        :physical-columns (count output-fields)
        :max-rows (when (and aggregate? (empty? grouping) (nil? window)) 1)})
     (catch clojure.lang.ExceptionInfo e (if (::unsupported (ex-data e)) nil (throw e)))))

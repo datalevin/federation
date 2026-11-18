@@ -1,11 +1,11 @@
-(defproject org.clojars.huahaiy/datalevin-federation-postgres "0.1.0-SNAPSHOT"
+(defproject org.clojars.huahaiy/datalevin-federation-postgres "1.2.11"
   :description "Snapshot PostgreSQL table access for Datalevin federation"
   :url "https://github.com/datalevin/federation"
   :license {:name "EPL-2.0" :url "https://www.eclipse.org/legal/epl-2.0/"}
   :dependencies [[org.clojure/clojure "1.12.6"]
                  [org.postgresql/postgresql "42.7.13"]
-                 [org.clojars.huahaiy/datalevin-federation-core "0.1.0-SNAPSHOT"]
-                 [datalevin "1.2.10" :scope "provided"]]
+                 [org.clojars.huahaiy/datalevin-federation-core "1.2.11"]
+                 [datalevin "1.2.11" :scope "provided"]]
   :filespecs [{:type :path :path "../LICENSE"}]
   :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
              "--add-opens=java.base/java.nio=ALL-UNNAMED"

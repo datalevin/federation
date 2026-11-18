@@ -281,6 +281,20 @@
         [(str "(" (str/join " OR " (map #(str "(" (first %) ")") filters)) ")")
          (vec (mapcat second filters))]))))
 
+(defn- range-prefilter [type column op x]
+  ;; Native mixed decimal/double ordering can round a decimal onto the cutoff.
+  ;; An adjacent representable double is a conservative outer bound. Keep the
+  ;; original predicate in the core and never use this bound in exact SQL.
+  (or (comparison-filter type column op x)
+      (when (and (= type "numeric") (#{:< :<= :> :>=} op))
+        (cond
+          (int? x) (comparison-filter type column op (BigDecimal/valueOf (long x)))
+          (and (instance? Double x) (Double/isFinite (double x)))
+          (let [lower? (#{:> :>=} op)
+                edge (if lower? (Math/nextDown (double x)) (Math/nextUp (double x)))]
+            (when (Double/isFinite edge)
+              (comparison-filter type column (if lower? :>= :<=) (BigDecimal. edge))))))))
+
 (defn predicates
   "Push matching scalar comparisons and supported LIKE calls as prefilters.
   Unsupported types and comparisons remain core residuals."
@@ -300,7 +314,7 @@
                        (when-let [filter (if (= op :like-any)
                                          (like-any-filter (pm/storage-type (get-in accepted [:requirements :columns column]))
                                                           (column-sql column) x)
-                                         ((if like? like-filter comparison-filter)
+                                         ((if like? like-filter range-prefilter)
                                           (pm/storage-type (get-in accepted [:requirements :columns column]))
                                           (column-sql column) op x))]
                          (assoc predicate :column column :filter filter)))))) (:clauses request)))))

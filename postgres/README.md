@@ -5,8 +5,8 @@ views with `d/q` and joins them with native Datalevin data or other sources.
 It supports scans, key and value lookups, and SQL delegation for eligible
 filters, joins, and aggregates.
 
-This development snapshot requires the matching **Datalevin 1.2.10** build with
-relational query-source support. Follow the repository's
+Adapter version **1.2.11** requires the matching **Datalevin 1.2.11** runtime
+with relational query-source support. Follow the repository's
 [setup instructions](../README.md#getting-started) to run these examples. The
 module includes the PostgreSQL JDBC driver; your application supplies Datalevin.
 
@@ -279,6 +279,22 @@ native text ordering for an aggregate, add a declaration to the quoted query:
 
 This changes the ordering contract for that variable; use it only when
 PostgreSQL's ordering is the intended result.
+
+For eligible scalar extrema queries, the SQL compiler can express qualification
+branches as nested `EXISTS` checks while retaining every row needed for output
+values and value validation. For native text `min`, it can also summarize a
+branch by its integer correlation key before joining. This can reduce the
+intermediate work that PostgreSQL must plan and execute.
+
+The summary rewrite requires native text ordering, a single compatible integer
+correlation key, and either one value table or that table joined through a
+physical three-integer-column association with a single-column primary key.
+Physical shape is checked using the complete catalog acquired for the query,
+including unmapped columns. Summaries are declined for grouping, windows,
+explicit input bindings, `:with`, optional or absent facts, mixed reducers,
+and row-dependent numeric or timestamp validation. Unsupported rewrites keep
+the ordinary eligible SQL plan. The same snapshot, collation, result-size,
+and lifecycle checks apply; no additional configuration is needed.
 
 Set `:whole-query-mode` consistently on the participating runtime profiles:
 

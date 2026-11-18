@@ -6,6 +6,9 @@
             [datalevin.federation.postgres.captured :as captured]
             [datalevin.federation.postgres.jdbc :as jdbc]
             [datalevin.federation.postgres.plan :as plan]
+            [datalevin.federation.postgres.presence :as presence]
+            [datalevin.federation.postgres.demand :as demand]
+            [datalevin.federation.postgres.summary :as summary]
             [datalevin.federation.postgres.relational :as relational]
             [datalevin.federation.postgres.mapping :as pm]
             [datalevin.federation.postgres.temporal :as temporal]
@@ -715,3 +718,97 @@
   (doseq [patterns [[] ["A%" "猫%"] ["A%" "%!x"] ["A%" nil] (vec (repeat 33 "A%"))]]
     (is (nil? (plan/like-any-filter "text" "r.x" patterns))))
   (is (nil? (plan/like-any-filter "int8" "r.x" ["%"]))))
+
+(defn- summary-table [alias relation columns used]
+  {:alias alias :columns used
+   :accepted {:requirements {:table ["pg_temp" relation] :kind "r" :row-security? false :columns columns
+                             :primary-key [{:column "id" :deferred? false :validated? true}]}}})
+
+(defn- summary-options [bridge?]
+  (let [value (summary-table "r0" "dtlv_e30_value"
+                    {"id" {:type "int4"} "owner" {:type "int4"} "value" {:type "text"}
+                     "number" {:type "numeric"} "stamp" {:type "timestamptz"}}
+                    (if bridge? #{"id" "value"} #{"id" "owner" "value"}))
+        bridge (summary-table "r1" "dtlv_e30_bridge" {"id" {:type "int4"} "value_id" {:type "int4"} "owner" {:type "int4"}}
+                      #{"id" "value_id" "owner"})
+        root (summary-table "r2" "dtlv_e30_root" {"id" {:type "int4"} "value" {:type "text"}} #{"id" "value"})
+        tables (if bridge? [value bridge root] [value root])]
+    {:tables tables :binary-associations #{["pg_temp" "dtlv_e30_bridge"]}
+     :find [{:kind :aggregate :operator :min :variable '?a} {:kind :aggregate :operator :min :variable '?b}]
+     :used ['?a '?b] :variables {'?a {:aliases #{"r0"}} '?b {:aliases #{"r2"}}}
+     :native-expressions {'?a {:aliases #{"r0"} :sql ["r0.\"value\""]} '?b {:aliases #{"r2"} :sql ["r2.\"value\""]}}
+     :oversized "FALSE" :bad "FALSE" :conditions (if bridge? ["r0.\"id\"=r1.\"value_id\"" "r1.\"owner\"=r2.\"id\""]
+                                     ["r0.\"owner\"=r2.\"id\""])
+     :params []}))
+
+
+(deftest summary-eligibility-and-parameter-order
+  (doseq [bridge? [false true]]
+    (let [o (summary-options bridge?) choice (summary/choose o)]
+      (is (:summary? choice))
+      (is (= (count (:tables o)) (count (re-seq #"ONLY" (:from choice)))))))
+  (let [o (assoc (summary-options false)
+                 :conditions ["r2.\"value\"=?::text" "r0.\"owner\"=r2.\"id\"" "r0.\"value\"=?::text"]
+                 :params ["z" "a"])
+        choice (summary/choose o)]
+    (is (:summary? choice))
+    (is (= ["a" "z"] (:params choice)))
+    (is (= [1 0] (:parameter-order choice))))
+  (doseq [modify [#(assoc-in % [:find 0 :operator] :count)
+                  #(assoc-in % [:find 0 :operator] :max)
+                  #(assoc % :input {:columns []}) #(assoc % :grouping ["a"])
+                  #(assoc % :window {:limit 1}) #(assoc % :with ['?a])
+                  #(assoc % :optional? true) #(assoc % :absence? true)
+                  #(assoc % :oversized "TRUE")
+                  #(assoc % :bad "r0.\"value\" IS NULL")
+                  #(assoc % :bad "?::boolean")
+                  #(update-in % [:tables 0 :columns] conj "number")
+                  #(update-in % [:tables 0 :columns] conj "stamp")
+                  #(assoc-in % [:tables 0 :accepted :requirements :row-security?] true)
+                  #(update % :conditions conj "r0.\"id\"=r2.\"id\"")
+                  #(update-in % [:tables 0 :accepted :requirements :columns] dissoc "owner")
+                  #(assoc-in % [:tables 0 :accepted :requirements :columns "owner" :type] "int8")]]
+    (let [o (modify (summary-options false))]
+      (is (= (demand/choose o) (summary/choose o)))))
+  (let [o (dissoc (summary-options true) :binary-associations)]
+    (is (= (demand/choose o) (summary/choose o)))))
+
+(deftest binary-association-needs-the-complete-physical-catalog
+  (let [catalog (get-in (summary-options true) [:tables 1 :accepted :requirements])]
+    (is (summary/binary-association? catalog))
+    (doseq [changed [(assoc-in catalog [:columns "unmapped"] {:type "int4"})
+                     (assoc catalog :row-security? true) (dissoc catalog :row-security?)
+                     (assoc catalog :kind "v") (assoc catalog :primary-key [])
+                     (assoc-in catalog [:columns "owner" :type] "text")]]
+      (is (not (summary/binary-association? changed))))))
+
+(deftest presence-proofs-preserve-composite-and-boolean-null-semantics
+  (let [a {:kind :predicate :operator :not= :args '[[:var ?a] [:const "a"]]}
+        b {:kind :predicate :operator := :args '[[:var ?b] [:const "b"]]}
+        variables {'?a {:raw-sql ["r0.a"]} '?b {:raw-sql ["r0.b"]}
+                   '?tuple {:raw-sql ["r0.x" "r0.y"]}}
+        conditions ["r0.a IS NOT NULL" "r0.b IS NOT NULL" "r0.x IS NOT NULL" "r0.y IS NOT NULL"]
+        normalized #(presence/normalize conditions variables [%] #{})]
+    (is (= #{'?a '?b} (presence/strict-variables {:kind :boolean :operator :and :clauses [a b]})))
+    (is (empty? (:removed (normalized {:kind :boolean :operator :or :clauses [a b]}))))
+    (is (= ["r0.a IS NOT NULL"] (:removed (normalized a))))
+    (is (empty? (:removed (normalized {:kind :predicate :operator :not= :args '[[:var ?tuple] [:const [1 2]]]}))))
+    (doseq [values [[] [nil]]]
+      (is (empty? (:removed (normalized {:kind :predicate :operator :not-in :args [[:var '?a] [:const values]]})))))))
+
+(deftest mixed-decimal-ranges-are-advisory
+  (let [candidate {:clauses [{:terms '[[:var ?e] [:const :order/amount] [:var ?x]]}]}
+        pushed (fn [op x]
+                 (-> (plan/predicates accepted candidate
+                       {:clauses [{:kind :predicate :operator op :args [[:var '?x] [:const x]]}]})
+                     first :filter))]
+    (is (= [24M] (second (pushed :< 24))))
+    (doseq [[op cutoff row] [[:>= 0.05 0.04999999999999999999M]
+                             [:<= 0.07 0.07000000000000000001M]
+                             [:>= -0.0 -1E-400M]]]
+      (let [[_ [edge]] (pushed op cutoff)]
+        (is (zero? (compare row cutoff)))
+        (is (if (= op :>=) (>= row edge) (<= row edge)))))
+    (is (nil? (pushed := 0.05)))
+    (is (nil? (pushed :< Double/NaN)))
+    (is (nil? (plan/comparison-filter "numeric" "x" :>= 0.05)))))

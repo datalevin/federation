@@ -9,6 +9,7 @@
             [datalevin.federation.postgres.plan :as plan]
             [datalevin.federation.postgres.relational :as relational]
             [datalevin.federation.postgres.statistics :as statistics]
+            [datalevin.federation.postgres.summary :as summary]
             [datalevin.query.source :as spi]
             [datalevin.query.source.value :as value])
   (:import [datalevin.utl QueryKey$KeySet]
@@ -315,7 +316,12 @@
                                        (ensure! view :open)
                                        [symbol (:accepted view)]))) sources)
             descriptor (get-in views [(:definition-fingerprint open) :descriptor])
-            query (assoc (:query plan) :sources sources)
+            query (assoc (:query plan) :sources sources
+                         ::relational/binary-associations
+                         (into #{} (keep (fn [view]
+                                           (when @(:binary-association? view)
+                                             (get-in view [:accepted :requirements :table]))))
+                               (vals views)))
             compiled (compile-relational! (:control request) accepted query (get-in context [:profile :max-row-bytes]) false)]
         (ensure! (and descriptor (= (:source-symbol open) (:symbol (first sources)))
                       (= (:definition-fingerprint open) (:definition-fingerprint (first sources)))
@@ -454,7 +460,8 @@
                              (ensure! (and (= d (descriptor accepted profile compiled))
                                            (= (:source-instance-id d) (get-in source [:descriptor :source-instance-id])))
                                       :acquisition)
-                             [(:definition-fingerprint d) (cond-> {:descriptor d :accepted accepted :statistics (atom nil)}
+                             [(:definition-fingerprint d) (cond-> {:descriptor d :accepted accepted :statistics (atom nil)
+                                                                         :binary-association? (atom false)}
                                                          (pm/spooled? accepted) (assoc :snapshot (atom nil) :indexes (atom {})))])))
                     (:source-descriptors request))
             context {:profile profile :control ctl :cancelled cancelled :limiter @limiter :metrics stats
@@ -482,7 +489,7 @@
                          (str "SELECT " (if narrow? (str/join "," (map jdbc/identifier (keys (:columns requirements)))) "1")
                               " FROM " (when (and narrow? (= "r" kind)) "ONLY ")
                               (jdbc/relation (:table requirements)) " LIMIT 0") [] (constantly nil)))
-          (doseq [{:keys [accepted statistics]} (vals views)]
+          (doseq [{:keys [accepted statistics binary-association?]} (vals views)]
             (let [columns (when (and (:statistics? profile)
                                      (not (false? (:datalevin.query.source/estimates? request)))
                                      (not (pm/spooled? accepted)))
@@ -491,6 +498,9 @@
                       (swap! reservations conj (spi/reserve! ctl {:retained-bytes (+ 1024 (* 512 (count columns)))})))
                   catalog (jdbc/catalog! context (get-in accepted [:requirements :table]) columns)]
               (pm/verify! accepted catalog)
+              ;; Reuse the complete acquisition catalog; no additional request
+              ;; or persistent mapping field is needed for physical arity.
+              (reset! binary-association? (summary/binary-association? catalog))
               (when columns (reset! statistics (:statistics catalog)))))
           (when (or narrow? (some #(#{"v" "m"} (get-in % [:accepted :requirements :kind])) (vals views)))
             (jdbc/verify-snapshot! context (mapv #(get-in % [:accepted :requirements :oid]) (vals views)) narrow?))

@@ -2997,3 +2997,67 @@
                 provider (source {:relational? relational?})]]
     (is (= :query-source/invalid (category #(d/q q provider))))
     (is (zero? (:live-sessions (pg/statistics provider))))))
+
+(defn- summary-fixture! [profile]
+  (doseq [ddl [(str "CREATE TABLE " (table "summary_value") " (id integer PRIMARY KEY, owner integer, v text, n numeric, stamp timestamptz)")
+               (str "CREATE TABLE " (table "summary_bridge") " (id integer PRIMARY KEY, value_id integer, owner integer)")
+               (str "CREATE TABLE " (table "summary_root") " (id integer PRIMARY KEY, v text)")
+               (str "INSERT INTO " (table "summary_value") " VALUES (1,10,'z',1,'2020-01-01'),(2,10,'a','NaN','infinity'),(3,20,'q',2,'2020-01-01'),(4,30,NULL,3,'2020-01-01'),(5,NULL,'0',4,'2020-01-01'),(6,40,'abcdefghijklmnop',5,'2020-01-01'),(7,50,'zzz','NaN','2020-01-01'),(8,50,'a',0,'2020-01-01')")
+               (str "INSERT INTO " (table "summary_bridge") " VALUES (1,1,10),(2,2,10),(3,2,10),(4,1,20),(5,4,30),(6,2,NULL)")
+               (str "INSERT INTO " (table "summary_root") " VALUES (10,'z'),(20,'a'),(30,'b'),(40,'abcdefghijklmnop'),(50,'c'),(60,'empty')")]]
+    (sql! ddl))
+  (mapv (fn [[relation attributes]]
+          (pg/source (pg/accept-mapping (pg/discover *profile* [*schema* relation])
+                       {:source-instance-id unit/source-id :relation-id (keyword "test" relation)
+                        :identity-attribute :row/id :attributes attributes}) profile))
+        [["summary_value" {:value/owner "owner" :value/text "v" :value/number "n" :value/stamp "stamp"}]
+         ["summary_bridge" {:bridge/value "value_id" :bridge/owner "owner"}]
+         ["summary_root" {:root/text "v"}]]))
+
+(defn- summary-query [bridge?]
+  {:find '[(min ?a) (min ?b)] :in (if bridge? '[$v $bridge $r] '[$v $r])
+   :where (into '[[$v ?v :value/text ?a] [$r ?r :root/text ?b] [$r ?r :row/id ?owner]]
+                (if bridge? '[[$v ?v :row/id ?vid] [$bridge ?e :bridge/value ?vid] [$bridge ?e :bridge/owner ?owner]]
+                    '[[$v ?v :value/owner ?owner]]))
+   :query-source {:native-extrema {'?a {:source '$v :attribute :value/text}
+                                   '?b {:source '$r :attribute :root/text}}}})
+
+(deftest native-min-summary-preserves-values-presence-and-invalid-witnesses
+  (let [statements (atom []) url (:jdbc-url *profile*)
+        pool (data-source #(intercepted-connection url (fn [s] (swap! statements conj s) s)))
+        profile (-> *profile* (dissoc :jdbc-url) (assoc :data-source pool :whole-query-mode :sql))
+        [v _ r :as providers] (summary-fixture! profile)
+        base (summary-query false)
+        run (fn [q] (reset! statements []) (set (d/q q v r)))
+        summarized? #(some (fn [s] (.contains ^String s "__dtlv_summary_key")) @statements)]
+    (is (= #{["a" "a"]} (run base)))
+    (is (summarized?))
+    (doseq [[extra expected] [['[[(= ?owner 30)]] #{}]
+                             ['[[(= ?owner 60)]] #{}]
+                             ['[[(= ?b "z")] [(= ?a "a")]] #{["a" "z"]}]
+                             ['[[(= ?owner 10)] [(= ?a "z")]] #{["z" "z"]}]]]
+      (is (= expected (run (update base :where into extra))))
+      (is (summarized?)))
+    ;; A non-minimal witness still carries an invalid numeric/timestamp effect.
+    (doseq [[attribute owner] [[:value/number 50] [:value/stamp 10]]]
+      (let [q (update base :where into [['$v '?v attribute '?invalid] [(list '= '?owner owner)]])]
+        (is (= :query-source/invalid (category #(run q))))
+        (is (not (summarized?)))))
+    (doseq [p providers] (is (zero? (:live-sessions (pg/statistics p)))))))
+
+(deftest binary-min-summary-rechecks-unmapped-physical-columns-without-statistics
+  (let [statements (atom []) url (:jdbc-url *profile*)
+        pool (data-source #(intercepted-connection url (fn [s] (swap! statements conj s) s)))
+        profile (-> *profile* (dissoc :jdbc-url) (assoc :data-source pool :whole-query-mode :sql :statistics? false))
+        providers (summary-fixture! profile)
+        q (summary-query true)
+        run #(do (reset! statements []) (set (apply d/q q providers)))
+        summarized? #(some (fn [s] (.contains ^String s "__dtlv_summary_key")) @statements)]
+    (is (= #{["a" "a"]} (run)))
+    (is (summarized?))
+    ;; The accepted mapping still has three columns. Eligibility must inspect
+    ;; the complete catalog on the next acquisition, including unmapped fields.
+    (sql! (str "ALTER TABLE " (table "summary_bridge") " ADD COLUMN unmapped integer"))
+    (is (= #{["a" "a"]} (run)))
+    (is (not (summarized?)))
+    (doseq [p providers] (is (zero? (:live-sessions (pg/statistics p)))))))
