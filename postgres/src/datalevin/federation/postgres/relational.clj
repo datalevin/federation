@@ -21,11 +21,39 @@
 
 (defn- expression [accepted alias columns type shape]
   (let [types (mapv #(pm/storage-type (get-in accepted [:requirements :columns %])) columns)]
-    (require! (every? #{"int2" "int4" "int8" "bool" "uuid" "text" "varchar" "bytea" "numeric" "timestamptz"} types))
+    (require! (every? #{"int2" "int4" "int8" "bool" "uuid" "text" "varchar" "bytea" "numeric" "timestamptz" "date"} types))
     {:sql (mapv #(text-column (str alias "." (jdbc/identifier %1)) %2) columns types)
      :raw-sql (mapv #(str alias "." (jdbc/identifier %)) columns)
      :types types :type type :shape shape :aliases #{alias}
      :modifier (when (= 1 (count columns)) (get-in accepted [:requirements :columns (first columns) :modifier]))}))
+
+(defn- decimal-expressions
+  "Exact, bounded arithmetic on fixed-scale NUMERIC operands. Integer-only
+  evaluation stays with the host, including its checked overflow semantics."
+  [vars calculations]
+  (require! (<= (count calculations) 8))
+  (reduce
+    (fn [vars {:keys [variable operator args]}]
+      (let [oper ({:+ "+" :- "-" :* "*"} operator)
+            operands (mapv (fn [[tag x]]
+                             (case tag
+                               :var (let [v (vars x) modifier (:modifier v)
+                                          n (or (:decimal-bound v)
+                                                (when (and (= ["numeric"] (:types v))
+                                                           (int? modifier) (>= modifier 4))
+                                                  ;; PostgreSQL's scale is signed and eleven bits wide.
+                                                  (let [m (- modifier 4) scale (bit-and m 2047)]
+                                                    (+ (bit-shift-right m 16) (abs (if (> scale 1023) (- scale 2048) scale))))))]
+                                      (require! (and n (= :scalar (:shape v))))
+                                      [(first (:sql v)) n])
+                               :const (do (require! (int? x)) [(str "(" (long x) ")::numeric") 20])
+                               (unsupported!))) args)
+            limit (inc (reduce + (map second operands)))]
+        (require! (and oper (= 2 (count args)) (nil? (vars variable))
+                       (some #(= :var (first %)) args) (<= limit 1000)))
+        (assoc vars variable {:shape :scalar :type :bigdec :types ["numeric"]
+                              :sql [(str "(" (ffirst operands) " " oper " " (first (second operands)) ")")]
+                              :decimal-bound limit}))) vars calculations))
 
 (defn- equivalent [a b strict?]
   (require! (and (= (:type a) (:type b)) (= (:shape a) (:shape b)) (= (count (:sql a)) (count (:sql b)))))
@@ -73,15 +101,18 @@
           (unsupported!)))
 
     (#{:in :not-in} operator)
-    (let [[[tag v] [other xs]] args expr (variables v)]
+    (let [[[tag v] [other xs]] args expr (variables v)
+          storage (first (:types expr))
+          integral? (#{"int2" "int4" "int8"} storage)
+          parameter (if integral? "?::int8" "?::text")]
       (require! (and (= tag :var) (= other :const) (= :scalar (:shape expr))
-                     (#{"text" "varchar"} (first (:types expr)))
-                     (or (sequential? xs) (set? xs)) (<= (count xs) 256)
-                     (every? #(or (nil? %) (text-value? %)) xs)))
+                     (or integral? (#{"text" "varchar"} storage))
+                     (or (sequential? xs) (set? xs)) (<= (count xs) (if integral? 8192 256))
+                     (every? #(or (nil? %) (if integral? (int? %) (text-value? %))) xs)))
       (let [xs (vec (sort (distinct (remove nil? xs))))]
         [(if (empty? xs) (if (= operator :in) "FALSE" "TRUE")
              (str (first (:sql expr)) (if (= operator :in) " IN (" " NOT IN (")
-                  (str/join "," (repeat (count xs) "?::text")) ")")) xs]))
+                  (str/join "," (repeat (count xs) parameter)) ")")) xs]))
   :else
   (let [[a b] args
         [a b operator] (if (= :const (first a)) [b a (plan/reverse-operator operator)] [a b operator])
@@ -92,14 +123,17 @@
         (let [[sql params] (literal expr (second b) false)]
           [(if (= operator :not=) (str "NOT (" sql ")") sql) params])
         (do (require! (= 1 (count (:sql expr))))
-            (or (plan/comparison-filter (first (:types expr)) (first (:sql expr)) operator (second b))
+            (or (when (and (= ["date"] (:types expr)) (instance? java.time.LocalDate (second b))
+                           (<= 1 (.getYear ^java.time.LocalDate (second b)) 9999))
+                  [(str (first (:sql expr)) " " (plan/operators operator) " ?::date") [(second b)]])
+                (plan/comparison-filter (first (:types expr)) (first (:sql expr)) operator (second b))
                 (unsupported!))))
       (let [other (variables (second b))]
         (require! (and (= :var (first b)) other))
         (if (#{:= :not=} operator)
           (let [sql (equivalent expr other false)] [(if (= operator :not=) (str "NOT (" sql ")") sql) []])
           (do (require! (and (= (:type expr) (:type other)) (= 1 (count (:sql expr)))
-                            (every? #{"int2" "int4" "int8" "numeric" "timestamptz"}
+                            (every? #{"int2" "int4" "int8" "numeric" "timestamptz" "date"}
                                     (concat (:types expr) (:types other)))))
               [(str (first (:sql expr)) " " (plan/operators operator) " " (first (:sql other))) []])))))))
 
@@ -252,27 +286,89 @@
                  " FROM window_guard AS g WHERE (g.oversized OR g.invalid) AND NOT EXISTS (SELECT 1 FROM selected)")]
     {:sql sql :params [(long limit) (long offset)]}))
 
-(defn- dependent-from
-  "Keep each dependent lookup behind the keys produced by its predecessors.
-  OFFSET 0 is a PostgreSQL planning fence; all original outer checks remain.
-  Edges contain only variable equalities, so moving copies adds no parameters."
-  [tables input edges]
-  (require! input)
-  (loop [pending (vec tables) known #{} out [(:sql input)]]
-    (if (empty? pending) (str/join " CROSS JOIN " out)
+(defn- table-sql [{:keys [alias accepted]}]
+  (str "ONLY " (jdbc/relation (get-in accepted [:requirements :table])) " AS " alias))
+
+(defn- dependent-lookups
+  "Order the tables by reachable equalities. Decline disconnected graphs."
+  [tables edges]
+  (loop [pending (vec tables) known #{} lookups []]
+    (if (empty? pending)
+      lookups
       (let [ready? (fn [{:keys [alias]}]
                      (some #(and ((:aliases %) alias)
                                  (every? (conj known alias) (:aliases %))
                                  (or (:input? %) (seq (filter known (:aliases %))))) edges))
             table (first (filter ready? pending))]
         (require! table)
-        (let [{:keys [alias accepted columns]} table
+        (let [alias (:alias table)
               available (conj known alias)
-              conditions (map :sql (filter #(and ((:aliases %) alias) (every? available (:aliases %))) edges))
-              sql (str "LATERAL (SELECT " (str/join ", " (map #(str alias "." (jdbc/identifier %)) (sort columns)))
-                       " FROM ONLY " (jdbc/relation (get-in accepted [:requirements :table])) " AS " alias
-                       " WHERE " (conjunction conditions) " OFFSET 0) AS " alias)]
-          (recur (filterv #(not= alias (:alias %)) pending) available (conj out sql)))))))
+              conditions (map :sql (filter #(and ((:aliases %) alias) (every? available (:aliases %))) edges))]
+          (recur (filterv #(not= alias (:alias %)) pending) available
+                 (conj lookups [table conditions])))))))
+
+(defn- keyed-lookup [[{:keys [alias columns] :as table} conditions]]
+  ;; OFFSET 0 fences the lookup. The outer query retains every semantic check.
+  (str "LATERAL (SELECT " (str/join ", " (map #(str alias "." (jdbc/identifier %)) (sort columns)))
+       " FROM " (table-sql table) " WHERE " (conjunction conditions) " OFFSET 0) AS " alias))
+
+(defn- protected-prefix-from [tables input [{:keys [alias columns]} :as lookup]]
+  ;; b.* carries the input ordinal, validity flag, typed keys and decimal scales.
+  ;; Prefix columns get their own names, even when a source column is named "ok".
+  (let [columns (map jdbc/identifier (sort columns))
+        fields (map-indexed (fn [i column] [(str "p" i) column]) columns)
+        select (map (fn [[field column]] (str alias "." column " AS " field)) fields)
+        restore (map (fn [[field column]] (str "b." field " AS " column)) fields)
+        cte (str "dtlv_restricted AS MATERIALIZED (SELECT b.*, " (str/join ", " select)
+                 " FROM " (:sql input) " CROSS JOIN " (keyed-lookup lookup) ")")
+        prefix (str "dtlv_restricted AS b CROSS JOIN LATERAL (SELECT " (str/join ", " restore) ") AS " alias)]
+    {:cte cte :from (str/join ", " (cons prefix (map table-sql (remove #(= alias (:alias %)) tables))))}))
+
+(defn- bound-from [tables input edges mode]
+  (require! input)
+  (let [lookups (dependent-lookups tables edges)]
+    (if (and (= :protected-prefix mode) (next lookups)
+             (= 1 (count (into #{} (comp (filter :input?) (mapcat :aliases)) edges))))
+      (protected-prefix-from tables input (first lookups))
+      {:from (str/join " CROSS JOIN " (cons (:sql input) (map keyed-lookup lookups)))})))
+
+(defn- fanout-query [key-field tables state from conditions params predicates filters variables]
+  ;; Each subquery emits counts for keys with at least one witness. Zeroes
+  ;; contribute nothing to either moment and the coordinator knows the domain.
+  (let [domain (second (second (:args (peek predicates))))
+        grouped (fn [field from where]
+                  (str "SELECT count(*)::float8 AS n FROM " from " WHERE " where " GROUP BY " field))
+        joined [{:kind :joined} (grouped key-field from (conjunction conditions)) params]
+        lookup (for [t tables, field (distinct (get-in state [:key-columns (:alias t)]))]
+                 [{:kind :lookup :source-symbol (:source-symbol t)}
+                  (grouped field (table-sql t)
+                           (str field " IN (" (str/join "," (repeat (count domain) "?")) ")")) domain])
+        ;; Price qualifying the key at its identity table before expanding a
+        ;; nonunique foreign key. Retain the other side's presence and joins.
+        identity-aliases (set (for [t tables
+                                    :let [ks (pm/key-columns (:accepted t))]
+                                    :when (and (= 1 (count ks))
+                                               (some #{(str (:alias t) "." (jdbc/identifier (first ks)))}
+                                                     (get-in state [:key-columns (:alias t)])))]
+                                (:alias t)))
+        early (filterv (fn [[p _]]
+                         (let [vars (keep (fn [[tag v]] (when (= tag :var) v)) (:args p))]
+                           (and (seq vars) (every? #(every? identity-aliases (:aliases (variables %))) vars))))
+                       (map vector (pop predicates) (pop filters)))
+        prefix (when (< 0 (count early) (dec (count filters)))
+                 (let [restricted (conj (mapv second early) (peek filters))]
+                   [{:kind :filtered-join :clause-ids (mapv (comp :id first) early)}
+                    (grouped key-field from (conjunction (into (:conditions state) (map first restricted))))
+                    (into (:params state) (mapcat second restricted))]))
+        stages (cond-> (into [joined] lookup) prefix (conj prefix))]
+    (when (<= (reduce + (map #(count (nth % 2)) stages)) 65535)
+      {:sql (str/join " UNION ALL "
+              (map-indexed (fn [i [_ sql]]
+                             (str "SELECT " i ",coalesce(sum(n),0),coalesce(sum(n*n),0)"
+                                  " FROM (" sql ") AS sampled")) stages))
+       :params (into [] (mapcat #(nth % 2)) stages) :stages (mapv first stages)})))
+
+(declare keyed-existence)
 
 (defn compile-query
   "Return a parameterized exact plan, or nil for a shape whose semantics have
@@ -293,6 +389,8 @@
           predicates (filterv #(#{:predicate :boolean} (:kind %)) (:clauses request))
           absences (filterv #(= :absence (:kind %)) (:clauses request))
           _ (require! (= (count (:clauses request)) (+ (count patterns) (count predicates) (count absences))))
+          sample-key (:datalevin.query.source/fanout-key request)
+          carrier (:datalevin.query.source/integer-reference-key request)
           native-specs (:datalevin.query.source/native-extrema request)
           source-order (zipmap (map :symbol (:sources request)) (range))
           state
@@ -317,7 +415,7 @@
                                  (assoc (expression accepted alias columns attribute-type
                                           (cond (= :custom (:kind attribute-type)) :ref (> (count columns) 1) :tuple :else :scalar))
                                         :nullable? optional?)]
-                    table {:alias alias
+                    table {:alias alias :source-symbol source-symbol
                            :ordinal (get-in tables [key :ordinal] [(source-order source-symbol) (count tables)])
                            :accepted accepted
                            :columns (into (get-in tables [key :columns] #{}) (concat (pm/key-columns accepted) columns))}
@@ -346,7 +444,9 @@
                                                      (update :edges conj {:sql sql
                                                                           :aliases (into (:aliases expr #{}) (:aliases before))
                                                                           :input? (boolean (:input? before))}))) state)
-                                       state (assoc-in state [:variables v] (or before expr))]
+                                       state (cond-> (assoc-in state [:variables v] (or before expr))
+                                               (and (::estimate? request) (= v sample-key) (= 1 (count (:sql expr))))
+                                               (update-in [:key-columns alias] (fnil conj []) (first (:sql expr))))]
                                    (if (contains? (:bindings request) v)
                                      (let [[sql params] (literal expr (get-in request [:bindings v]) true)]
                                        (-> state (update :conditions conj sql) (update :params into params))) state))
@@ -366,16 +466,32 @@
                           (update-in [:tables key :columns] into columns)
                           (update :conditions conj (str alias "." (jdbc/identifier (first columns)) " IS NULL")))))
                   state absences)
-          variables (:variables state)
+          variables (decimal-expressions (:variables state) (:datalevin.query.source/decimal-expressions request))
+          transport-vars
+          (if carrier
+            (let [expr (variables carrier)]
+              (require! (and (= :ref (:shape expr)) (= ref/type-name (get-in expr [:type :name]))
+                             (= [:long] (get-in expr [:type :parameters :key-types]))
+                             (= 1 (count (:sql expr))) (#{"int2" "int4" "int8"} (first (:types expr)))
+                             (not (contains? (:bindings request) carrier))
+                             (not-any? #(and (= carrier (:variable %)) (= :aggregate (:kind %))) (:find request))))
+              (assoc variables carrier (assoc expr :shape :scalar :type :long)))
+            variables)
           _ (doseq [{:keys [kind variable operator]} (:find request)
                     :when (and (= :aggregate kind) (:nullable? (variables variable)))]
               (require! (and (#{:min :max} operator)
                              (contains? (:datalevin.query.source/ignore-nil-extrema request) variable))))
           native-expressions (get state :native-expressions {})
           _ (require! (every? #(contains? native-expressions %) (keys native-specs)))
-          filters (mapv #(condition-filter variables %) predicates)
+          filters (mapv (fn [p]
+                          (let [membership? (and (= carrier sample-key) carrier (= :in (:operator p))
+                                                 (= [:var carrier] (first (:args p)))
+                                                 (= p (peek (:clauses request))))]
+                            (condition-filter (if membership? transport-vars variables) p))) predicates)
+          variables transport-vars
           conditions (into (:conditions state) (map first filters))
-          demand? (and (not input) (not (:window request)) (not (:dependent-order? request)))
+          bound-mode (or (:bound-join-mode request) (when (:dependent-order? request) :dependent))
+          demand? (and (not input) (not (:window request)) (not bound-mode))
           conditions (if demand?
                        (:conditions (presence/normalize conditions variables predicates (:nonnull state)))
                        conditions)
@@ -397,7 +513,7 @@
                                     (keep (fn [[sql type]]
                                             (case type
                                               "numeric" (str sql "::text IN ('NaN','Infinity','-Infinity')")
-                                              "timestamptz" (str "NOT isfinite(" sql ")") nil)) columns))))
+                                              ("timestamptz" "date") (str "NOT isfinite(" sql ")") nil)) columns))))
           invalid (str "COALESCE((" invalid "),FALSE)")
           bad (str "(" oversized ") OR (" invalid ")")
           used (vec (distinct (concat (map :variable (:find request)) (:with request))))
@@ -430,11 +546,10 @@
           grouping (vec (distinct (mapcat (fn [{:keys [kind variable]}]
                                           (when (= :variable kind) (cond-> (fields variable)
                                                                     (scale-fields variable) (conj (scale-fields variable))))) (:find request))))
-          from (if (:dependent-order? request) (dependent-from tables input (:edges state))
-                   ;; Leave the full graph to PostgreSQL's join search. A CROSS
-                   ;; JOIN tree can constrain graphs above join_collapse_limit.
-                   (str/join ", " (cond-> (mapv #(str "ONLY " (jdbc/relation (get-in % [:accepted :requirements :table])) " AS " (:alias %)) tables)
-                                             input (conj (:sql input)))))
+          bound (when bound-mode (bound-from tables input (:edges state) bound-mode))
+          ;; Leave unrestricted graphs to PostgreSQL, including above join_collapse_limit.
+          from (or (:from bound)
+                   (str/join ", " (cond-> (mapv table-sql tables) input (conj (:sql input)))))
           ;; MIN/MAX and the validation flags are insensitive to duplicates.
           ;; Let PostgreSQL aggregate the join directly instead of building a
           ;; distinct intermediate relation. Other reducers keep Datalog's
@@ -452,6 +567,17 @@
                           :binary-associations (::binary-associations request)}))
           matched-from (if (:applied? protection) (:from protection) from)
           matched-conditions (if (:applied? protection) (:conditions protection) conditions)
+          ;; The execution projection masks invalid values. That CASE hides the
+          ;; underlying key's ndistinct from PostgreSQL, often predicting just a
+          ;; few dozen groups even for a primary key with a million values.
+          ;; Estimate group count on the raw key in the same scoped FROM/WHERE.
+          estimate-key (when (and (::estimate? request) aggregate? (nil? input) (nil? bound)
+                                  (nil? (:window request)) (= 1 (count grouping))
+                                  (= 2 (count (:find request)))
+                                  (some #(= :sum (:operator %)) (:find request)))
+                         (some (fn [{:keys [kind variable]}]
+                                 (when (and (= :variable kind) (#{:long :string} (:type (variables variable))))
+                                   (first (:sql (variables variable))))) (:find request)))
           matched (str "SELECT " (when-not extrema-only? "DISTINCT ")
                        (str/join ", " distinct-select) " FROM " matched-from " WHERE " (conjunction matched-conditions))
           result (str "SELECT " (str/join ", " (map #(str %1 " AS " %2) output-expressions output-fields))
@@ -463,14 +589,52 @@
           too-large (str "oversized OR (" size ") > " (long max-row-bytes))
           safe (str "NOT (" too-large ") AND NOT invalid")
           window (when (:window request) (window-sql (:window request) outputs output-fields max-row-bytes))]
-      {:sql (str "WITH matched AS (" matched "), result AS (" result ")"
+      (or (when (:datalevin.query.source/existence-key request)
+            (keyed-existence request tables variables conditions invalid columns max-row-bytes))
+          (cond-> {:sql (str "WITH " (when-let [cte (:cte bound)] (str cte ", ")) "matched AS (" matched "), result AS (" result ")"
                  (if window (:sql window)
                    (str " SELECT " too-large ", invalid, "
                         (str/join ", " (map #(str "CASE WHEN " safe " THEN " % " END") output-fields)) " FROM result")))
        :params (into (or (:params protection) params) (:params window)) :layout (mapv #(dissoc % :sql :modifier) outputs) :columns (:columns request)
        :physical-columns (count output-fields)
-       :max-rows (when (and aggregate? (empty? grouping) (nil? window)) 1)})
+       :max-rows (when (and aggregate? (empty? grouping) (nil? window)) 1)}
+        (and (= :sample (::estimate? request)) sample-key (= :in (:operator (peek predicates)))
+             (= [:var sample-key] (first (:args (peek predicates)))) (nil? input) (nil? bound)
+             (<= 1 (count (second (second (:args (peek predicates))))) 256))
+        (assoc :fanout-query (fanout-query (first (:sql (variables sample-key))) tables state
+                                           from conditions params predicates filters variables))
+        estimate-key (assoc :size-query {:sql (str "SELECT " estimate-key ", sum(1::numeric) FROM " from
+                                                  " WHERE " (conjunction conditions) " GROUP BY " estimate-key)
+                                         :params params})
+        (:cte bound) (assoc :protected-prefix? true))))
     (catch clojure.lang.ExceptionInfo e (if (::unsupported (ex-data e)) nil (throw e)))))
+
+(defn- keyed-existence
+  "Return one integer key per qualifying outer key. A second EXISTS preserves
+  conversion errors from other qualifying witnesses when their type needs it."
+  [request tables variables conditions invalid columns max-row-bytes]
+  (let [v (:datalevin.query.source/existence-key request)
+        pred (peek (:clauses request))
+        xs (second (second (:args pred)))
+        field (first (:sql (variables v)))]
+    (when (and v (= [{:kind :variable :variable v}] (:find request)) (= 1 (count tables))
+               (empty? (:with request)) (nil? (:inputs request)) (nil? (:window request))
+               (= :in (:operator pred)) (= [:var v] (first (:args pred))) (vector? xs) (seq xs)
+               (= :long (:type (variables v))) (every? int? xs)
+               (= (last conditions) (first (predicate-filter variables pred)))
+               ;; Compiler-owned conditions before the final membership test
+               ;; are reused twice. Restrict this lowering to parameter-free predicates.
+               (not-any? #(str/includes? % "?") (butlast conditions)))
+      (let [qual (conjunction (conj (vec (butlast conditions)) (str field " = k.v")))
+            probe (str "SELECT 1 FROM " (table-sql (first tables)) " WHERE " qual)
+            guard (if (some (fn [[_ t]] (#{"numeric" "timestamptz" "date"} t)) columns)
+                    (str "EXISTS (" probe " AND (" invalid "))") "FALSE")
+            size (str "octet_length(k.v::text) > " (long max-row-bytes))]
+        {:sql (str "SELECT " size ", " guard ", CASE WHEN NOT (" size ") THEN k.v END "
+                   "FROM (SELECT DISTINCT v FROM (VALUES "
+                   (str/join "," (repeat (count xs) "(?::int8)")) ") AS bindings(v)) AS k WHERE EXISTS (" probe ")")
+         :params xs :columns (:columns request) :physical-columns 1
+         :layout [{:shape :scalar :type :long :types ["int8"]}]}))))
 
 (defn compile-fragment [views request max-row-bytes]
   (when (= :relational-fragment (:mode request))

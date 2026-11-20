@@ -50,7 +50,7 @@
   (let [profile (merge {:connect-timeout-ms 10000 :statement-timeout-ms 10000
                         :fetch-size 128 :max-row-bytes 16384 :fusion? true :relational? true
                         :statistics? true :filtered-statistics? true :predicate-prefilters? true
-                        :whole-query-mode :auto} profile)]
+                        :whole-query-mode :auto :bound-join-mode :dependent} profile)]
     (ensure! (= 1 (count (filter some? ((juxt :jdbc-url :data-source) profile)))) :profile)
     (when-let [url (:jdbc-url profile)]
       (ensure! (and (string? url) (str/starts-with? url "jdbc:postgresql:")) :profile))
@@ -63,6 +63,7 @@
                   (boolean? (:statistics? profile)) (boolean? (:filtered-statistics? profile))
                   (boolean? (:predicate-prefilters? profile))
                   (#{:auto :sql :dependent} (:whole-query-mode profile))
+                  (#{:dependent :protected-prefix} (:bound-join-mode profile))
                   (every? (fn [[k v]] (and (string? k) (string? v))) (:properties profile))) :profile)
     (when-let [role (:role profile)] (identifier role))
     (ensure! (and (or (nil? (:session-settings profile)) (map? (:session-settings profile)))
@@ -464,13 +465,51 @@
             (> (+ (.length output) n) 65536) nil
             :else (do (.append output buffer 0 n) (recur))))))))
 
-(defn explain-rows!
+(defn- receiver-rows [plan]
+  (letfn [(visit [node scale]
+            (let [rows (double (get node "Plan Rows"))
+                  children (remove #(#{"SubPlan" "InitPlan"} (get % "Parent Relationship")) (get node "Plans"))
+                  scale-child (if (and (#{"Gather" "Gather Merge"} (get node "Node Type")) (seq children))
+                                (* scale (/ rows (max 1.0 (double (get (first children) "Plan Rows"))))) scale)]
+              (if (or (get node "Join Type") (get node "Relation Name"))
+                (* rows scale)
+                (some #(visit % scale-child) children))))]
+    (or (visit plan 1.0) (double (get plan "Plan Rows")))))
+
+(defn explain-size!
   "Get PostgreSQL's estimated returned rows without running the supplied SELECT.
   Oversized/missing plans decline estimation. SQL and plan text stay private."
-  [context {:keys [sql params]}]
-  (when-let [text (first (query! context :acquisition
-                         (str "EXPLAIN (ANALYZE FALSE, FORMAT JSON) " sql) params
-                         #(explain-text context %)))]
-    (let [n (get-in (json/read-value text) [0 "Plan" "Plan Rows"])]
-      (when (and (number? n) (Double/isFinite (double n)) (not (neg? n)))
-        (double n)))))
+  ([context query] (explain-size! context query false))
+  ([context {:keys [sql params]} work?]
+   (when-let [text (first (query! context :acquisition
+                           (str "EXPLAIN (ANALYZE FALSE, FORMAT JSON) " sql) params
+                           #(explain-text context %)))]
+     (let [plan (get-in (json/read-value text) [0 "Plan"])
+           rows (get plan "Plan Rows") width (get plan "Plan Width")]
+       (when (every? #(and (number? %) (Double/isFinite (double %)) (not (neg? %))) [rows width])
+         (cond-> {:rows (double rows) :row-bytes (double width)}
+           work? (assoc :source-cost (get plan "Total Cost") :startup-cost (get plan "Startup Cost")
+                        :join-rows (receiver-rows plan))))))))
+
+(defn explain-rows! [context query] (:rows (explain-size! context query)))
+
+(defn sample-fanout!
+  "Run a small key-domain diagnostic under a local timeout. Rollback to the
+  savepoint restores both the snapshot transaction and its statement timeout."
+  [context {:keys [sql params stages]} budget-ms]
+  (let [start (System/nanoTime)
+        timeout (min budget-ms (get-in context [:profile :statement-timeout-ms]))]
+    (when (pos? timeout)
+      (execute! context :planning
+                (str "SAVEPOINT dtlv_fanout; SET LOCAL statement_timeout = " (long timeout)) [])
+      (try
+        (when (< (- (System/nanoTime) start) (* 1000000 (long timeout)))
+          (query! context :planning sql params
+                  (fn [^ResultSet rs]
+                    (let [i (.getInt rs 1)]
+                      [i (.getDouble rs 2) (.getDouble rs 3) (nth stages i)])) 65 nil))
+        (catch clojure.lang.ExceptionInfo e
+          (check! context)
+          (when-not (= :query/timeout (:error (ex-data e))) (throw e)))
+        (finally
+          (execute! context :planning "ROLLBACK TO SAVEPOINT dtlv_fanout; RELEASE SAVEPOINT dtlv_fanout" []))))))

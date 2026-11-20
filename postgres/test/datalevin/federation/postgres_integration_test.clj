@@ -340,19 +340,28 @@
                           (list symbol '?value cutoff))
             q {:find '[?id] :in '[$p] :timeout 30000
                :where [['$p '?e :row/id '?id] ['$p '?e attribute '?value] [predicate]]}
-            explained (d/explain {:run? true} q provider)]
-        (is (= (set (d/q q facts)) (set (d/q q provider))) (pr-str [attribute operator reverse?]))
-        (is (= n (:result-rows explained)))
-        (is (= n (read-rows explained)))
-        (is (some #(seq (:prefilters %)) (mapcat :steps (:regions explained))))))
+            explained (d/explain {:run? true} q provider)
+            case-label (pr-str [attribute predicate])]
+        (is (= (set (d/q q facts)) (set (d/q q provider))) case-label)
+        (is (= n (:result-rows explained)) case-label)
+        (is (= n (read-rows explained)) case-label)
+        (is (some #(contains? (:prefilters %) 2) (mapcat :steps (:regions explained))) case-label)))
     (let [q {:find '[?id] :in '[$p ?cutoff] :timeout 30000
              :where '[[$p ?e :row/id ?id] [$p ?e :row/amount ?amount] [(> ?amount ?cutoff)]]}]
       (is (= (set (d/q q facts 99M)) (set (d/q q provider 99M)))))
-    (let [q {:find '[?id] :in '[$p] :timeout 30000
-             :where '[[$p ?e :row/id ?id] [$p ?e :row/amount ?amount] [(> ?amount 99.0)]]}
-          explained (d/explain {:run? true} q provider)]
-      (is (= (set (d/q q facts)) (set (d/q q provider))))
-      (is (= 1000 (read-rows explained))))
+    ;; The decimal/double range includes 99.0000 in SQL. The core residual
+    ;; removes that row. Mixed equality has no conservative SQL prefilter.
+    (doseq [[predicate reads prefilter?] [['(> ?amount 99.0) 11 true]
+                                          ['(= ?amount 99.0) 1000 false]]]
+      (let [q {:find '[?id] :in '[$p] :timeout 30000
+               :where (conj '[[$p ?e :row/id ?id] [$p ?e :row/amount ?amount]] [predicate])}
+            explained (d/explain {:run? true} q provider)
+            expected (set (d/q q facts))]
+        (is (= expected (set (d/q q provider))) (pr-str predicate))
+        (is (= (count expected) (:result-rows explained)) (pr-str predicate))
+        (is (= reads (read-rows explained)) (pr-str predicate))
+        (is (= prefilter? (boolean (some #(contains? (:prefilters %) 2)
+                                         (mapcat :steps (:regions explained))))) (pr-str predicate))))
     (is (zero? (:live-sessions (pg/statistics provider))))))
 
 (deftest delegated-aggregates-preserve-find-with-and-empty-input-semantics
@@ -960,6 +969,49 @@
                        (object-array [(prepare (aget ^objects args 0))]) args)]
             (try (.invoke method connection args)
                  (catch InvocationTargetException e (throw (.getCause e))))))))))
+
+(deftest bound-join-modes-preserve-batch-ordinals-and-missing-keys
+  (let [clauses [{:id 0 :kind :pattern :source-symbol '$seed :terms '[[:var ?s] [:const :order/owner] [:var ?owner]]}
+                 {:id 1 :kind :pattern :source-symbol '$p :terms '[[:var ?p] [:const :order/owner] [:var ?owner]]}
+                 {:id 2 :kind :pattern :source-symbol '$p :terms '[[:var ?p] [:const :order/status] [:var ?status]]}
+                 {:id 3 :kind :pattern :source-symbol '$q :terms '[[:var ?q] [:const :order/status] [:var ?status]]}
+                 {:id 4 :kind :pattern :source-symbol '$q :terms '[[:var ?q] [:const :order/title] [:var ?title]]}
+                 {:id 5 :kind :predicate :operator :not= :args '[[:var ?title] [:const "excluded"]]}]
+        batches [[{:binding-id 19 :values [7]} {:binding-id 4 :values [99]} {:binding-id 25 :values [8]}]
+                 [{:binding-id 37 :values [7]}]]]
+    (doseq [mode [:dependent :protected-prefix]]
+      (let [statements (atom []) url (:jdbc-url *profile*)
+            pool (data-source #(intercepted-connection url (fn [sql] (swap! statements conj sql) sql)))
+            provider (pg/source *accepted* (-> *profile* (dissoc :jdbc-url)
+                                               (assoc :data-source pool :bound-join-mode mode)))
+            ctl (control/create) req (request provider ctl) session (spi/-open-session provider req)]
+        (try
+          (let [descriptor (spi/-source-info provider)
+                planning (assoc (planning-request provider req clauses []) :required-vars '#{?title}
+                                :datalevin.query.source/region-sources
+                                (mapv #(hash-map :symbol % :descriptor descriptor) '[$p $q $seed]))
+                alternative (some #(when (= #{1 2 3 4} (:covers %)) %)
+                                  (:alternatives (spi/-plan-joins provider session planning)))]
+            (is (some? alternative))
+            (when alternative
+              (is (= (= :protected-prefix mode) (.startsWith ^String (:id alternative) "join-prefix-")))
+              (doseq [bindings batches]
+                (let [cursor (open provider session req alternative bindings)
+                      expected (for [{:keys [binding-id values]} bindings
+                                     :let [owner (first values)] :when (#{7 8} owner)
+                                     title ["Alpha" "βeta"]]
+                                 [binding-id [owner title]])]
+                  (try
+                    (let [{:keys [rows ids]} (consume cursor ctl alternative true)]
+                      (is (= (frequencies expected) (frequencies (map vector ids rows)))))
+                    (finally (spi/-close-cursor! cursor)))))
+              (let [sql (some #(when (.contains ^String % " OFFSET 0") %) @statements)]
+                (is (some? sql))
+                (when sql
+                  (is (= (= :protected-prefix mode) (.contains ^String sql "dtlv_restricted AS MATERIALIZED")))
+                  (is (= (if (= :protected-prefix mode) 1 2) (count (re-seq #" OFFSET 0" sql))))))))
+          (finally (spi/-close-session! session) (control/close! ctl)))
+        (is (released? ctl))))))
 
 (deftest scalar-aggregates-use-direct-select-while-grouped-results-stay-paged
   (let [statements (atom []) url (:jdbc-url *profile*)
@@ -2847,6 +2899,25 @@
                  (source {:predicate-prefilters? false :relational? false}))]
       (is (some #(= :union (:kind %)) (mapcat :operators (:regions plan)))))))
 
+(deftest scoped-or-outputs-retain-unprojected-source-join-keys
+  (let [q '[:find (count ?title) . :in $p $seed :where
+            (or-join [?status]
+              (and [$seed ?seed :order/id 1]
+                   [$seed ?seed :order/status ?status]))
+            [$p ?e :order/status ?status]
+            [$p ?e :order/title ?title]]
+        facts (eager)
+        provider (source {:relational? false})
+        requested (atom nil)
+        observed (reify spi/IQuerySource
+                   (-source-info [_] (spi/-source-info provider))
+                   (-open-session [_ request] (spi/-open-session provider request))
+                   (-plan-source [_ session request]
+                     (reset! requested (:required-vars request))
+                     (spi/-plan-source provider session request)))]
+    (is (= 2 (d/q q facts facts) (d/q q observed provider)))
+    (is (contains? @requested '?status))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
 
 (deftest bound-scalar-unions-delegate-complete-boolean-filters
   (let [base '[[$p ?e :order/id ?id] [$p ?e :order/status ?status] [$p ?e :order/title ?title]
@@ -3061,3 +3132,150 @@
     (is (= #{["a" "a"]} (run)))
     (is (not (summarized?)))
     (doseq [p providers] (is (zero? (:live-sessions (pg/statistics p)))))))
+
+(defn placement-source [site name attributes]
+  (let [profile (assoc *profile* :compute-context-id site)
+        mapping (accept-relation name attributes
+                  {:source-instance-id (UUID/nameUUIDFromBytes (.getBytes (str site) "UTF-8"))
+                   :relation-id (keyword "placement" name) :identity-attribute :row/identity} profile)]
+    (pg/source mapping profile)))
+
+(deftest federated-placement-preserves-witnesses-and-correlated-inputs
+  (sql! (str "CREATE TABLE " (table "sale") " (id bigint PRIMARY KEY, b bigint, s bigint, amount numeric(12,2))"))
+  (sql! (str "INSERT INTO " (table "sale") " VALUES (1,1,2,5),(2,1,2,5),(3,2,1,9),(4,2,2,11)"))
+  (sql! (str "CREATE TABLE " (table "buyer") " (id bigint PRIMARY KEY,g text)"))
+  (sql! (str "INSERT INTO " (table "buyer") " VALUES (1,'yes'),(2,'no')"))
+  (sql! (str "CREATE TABLE " (table "supplier") " (id bigint PRIMARY KEY,g text)"))
+  (sql! (str "INSERT INTO " (table "supplier") " VALUES (2,'yes'),(1,'no')"))
+  (let [attrs {:sale/id "id" :sale/b "b" :sale/s "s" :sale/amount "amount"}
+        sale (placement-source :test/sales "sale" attrs)
+        buyer (placement-source :test/buyers "buyer" {:dim/id "id" :dim/g "g"})
+        supplier (placement-source :test/suppliers "supplier" {:dim/id "id" :dim/g "g"})
+        policy (fn [q & args] (mapv :policy (:regions (apply d/explain {:run? false} q args))))
+        star '{:find [(sum ?amount)] :with [?row] :in [$b $f $s]
+               :where [[$b ?buyer :dim/id ?b] [$b ?buyer :dim/g "yes"]
+                       [$s ?supplier :dim/id ?s] [$s ?supplier :dim/g "yes"]
+                       [$f ?row :sale/b ?b] [$f ?row :sale/s ?s] [$f ?row :sale/amount ?amount]]}
+        ranges '{:find [?id] :in [$f [[?b ?lo ?hi]]]
+                 :where [[$f ?row :sale/b ?b] [$f ?row :sale/s ?s] [$f ?row :sale/id ?id]
+                         [(< ?lo ?s)] [(< ?s ?hi)]]}
+        inputs [[1 0 2] [1 2 4] [2 0 2] [2 6 9] [2 0 2]]
+        exists '{:find [?g (count-distinct ?buyer)] :in [$b $f]
+                 :where [[$b ?buyer :dim/id ?b] [$b ?buyer :dim/g ?g]
+                         [$f ?sale :sale/b ?b] [$f ?sale :sale/s 2]]}
+        arithmetic '{:find [?b (sum ?v) ?g] :with [?sale] :in [$b $f]
+                     :where [[$b ?buyer :dim/id ?b] [$b ?buyer :dim/g ?g]
+                             [$f ?sale :sale/b ?b] [$f ?sale :sale/amount ?a]
+                             [(- 1 ?a) ?v]]}]
+    (is (= [:semijoin-reduction] (policy star buyer sale supplier)))
+    (is (= #{[10M]} (set (d/q star buyer sale supplier))))
+    (let [correlated (update star :where
+                       #(mapv (fn [clause] (if (= "yes" (peek clause)) (conj (pop clause) '?g) clause)) %))]
+      (is (not-any? #{:semijoin-reduction} (policy correlated buyer sale supplier)))
+      (is (= #{[19M]} (set (d/q correlated buyer sale supplier)))))
+    (is (= #{[3]} (set (d/q ranges sale inputs))))
+    (is (some #{:relational-fragment-v1} (policy ranges sale inputs)))
+    (let [filtered (update ranges :where conj '[(> ?lo 1)])]
+      (is (empty? (d/q filtered sale inputs)))
+      (is (not-any? #{:relational-fragment-v1} (policy filtered sale inputs))))
+    (is (= [:costed-site-join] (policy exists buyer sale)))
+    (is (= #{["yes" 1] ["no" 1]} (set (d/q exists buyer sale))))
+    (is (= [:costed-site-join] (policy arithmetic buyer sale)))
+    (is (= #{[1 -8M "yes"] [2 -18M "no"]} (set (d/q arithmetic buyer sale))))
+    (let [other (placement-source :test/other-channel "sale" attrs)
+          branch (fn [alias n]
+                   (list 'and [alias '?row :sale/b '?b] [alias '?row :sale/amount '?a]
+                         [alias '?row :sale/id '?id] [(list 'ground n) '?tag]))
+          union (fn [t] [(list 'or-join '[?b ?a ?id ?tag] (branch '$f 0) (branch '$g t))])
+          q {:find '[?b (sum ?a)] :with '[?tag ?id] :in '[$f $g] :where (union 1)}]
+      (is (= [:distributed-sum] (policy q sale other)))
+      (is (= #{[1 20M] [2 40M]} (set (d/q q sale other))))
+      (doseq [overlapping [(assoc q :with '[?id]) (assoc q :where (union 0))]]
+        (is (not-any? #{:distributed-sum} (policy overlapping sale other)))
+        (is (= #{[1 10M] [2 20M]} (set (d/q overlapping sale other)))))
+      (is (every? #(zero? (:live-sessions (pg/statistics %))) [sale buyer supplier other])))
+    (sql! (str "INSERT INTO " (table "buyer") " SELECT i,'yes' FROM generate_series(3,8195) i"))
+    (let [buyer (binding [*profile* (assoc *profile* :fetch-size 128)]
+                  (placement-source :test/buyers "buyer" {:dim/id "id" :dim/g "g"}))
+          plan (d/explain {:run? true} star buyer sale supplier)]
+      (is (= ['?s] (get-in plan [:regions 0 :placement :applied-keys])))
+      (is (= #{[10M]} (set (d/q star buyer sale supplier)))))))
+
+(deftest existence-placement-prices-a-small-and-a-large-target
+  (sql! (str "CREATE TABLE " (table "driver") " (id bigint PRIMARY KEY, g text)"))
+  (sql! (str "INSERT INTO " (table "driver") " SELECT i,'g' FROM generate_series(1,25) i"))
+  (sql! (str "CREATE TABLE " (table "target") " (id bigint PRIMARY KEY, k bigint)"))
+  (sql! (str "INSERT INTO " (table "target") " SELECT i,i FROM generate_series(1,25) i"))
+  (sql! (str "CREATE INDEX ON " (table "target") " (k)"))
+  (sql! (str "ANALYZE " (table "driver")))
+  (let [a (placement-source :test/left "driver" {:a/k "id" :a/g "g"})
+        b (placement-source :test/right "target" {:b/k "k"})
+        q '{:find [?g (count-distinct ?e)] :in [$a $b]
+            :where [[$a ?e :a/g ?g] [$a ?e :a/k ?k] [$b ?f :b/k ?k]]
+            :query-source {:planning {:link-rtt-ns 10000 :transfer-ns-per-byte 2
+                                      :estimate-max-requests 8 :estimate-budget-ms 1000}}}
+        check (fn [mode n]
+                (sql! (str "ANALYZE " (table "target")))
+                (is (= #{["g" n]} (set (d/q q a b))))
+                (let [placement (get-in (d/explain {:run? true} q a b) [:regions 0 :placement])]
+                  (is (= mode (:mode placement)) (pr-str placement))))]
+    (check :independent 25)
+    (sql! (str "INSERT INTO " (table "target") " SELECT i,i FROM generate_series(26,10000) i"))
+    (check :bound 25)
+    (sql! (str "ALTER TABLE " (table "target") " ADD COLUMN due date DEFAULT '2001-01-01', "
+               "ADD COLUMN arrived date DEFAULT '2001-01-02'"))
+    (let [dates (placement-source :test/right "target" {:b/k "k" :b/due "due" :b/arrived "arrived"})
+          q (update q :where into '[[$b ?f :b/due ?due] [$b ?f :b/arrived ?arrived] [(< ?due ?arrived)]])]
+      (is (= #{["g" 25]} (set (d/q q a dates))))
+      ;; A finite matching witness for key 1 must not hide an invalid second witness.
+      (sql! (str "INSERT INTO " (table "target") " VALUES (10001,1,'2001-01-01','infinity')"))
+      (is (= :query-source/invalid (category #(d/q q a dates))))
+      (is (zero? (:live-sessions (pg/statistics dates)))))))
+
+(deftest native-extremum-across-an-integer-reference-domain
+  (sql! (str "CREATE TABLE " (table "selected") " (id bigint PRIMARY KEY, bucket bigint, movie bigint)"))
+  (sql! (str "CREATE TABLE " (table "bucket") " (id bigint PRIMARY KEY, enabled boolean)"))
+  (sql! (str "INSERT INTO " (table "selected") " VALUES (1,1,1),(2,1,2),(3,1,2),(4,1,99),(5,2,3)"))
+  (sql! (str "INSERT INTO " (table "bucket") " VALUES (1,true),(2,false)"))
+  (let [type (get-in *accepted* [:identity :type])
+        selected (placement-source :selected "selected"
+                   {:s/bucket "bucket" :s/movie {:column "movie" :reference
+                                                 {:type type :domain (get-in type [:parameters :identity-domain-id])}}})
+        bucket (placement-source :selected "bucket" {:b/id "id" :b/enabled "enabled"})
+        orders (source)
+        q '{:find [(min ?t)] :in [$s $b $o]
+            :where [[$s ?r :s/bucket ?b] [$s ?r :s/movie ?movie] [$b ?bucket :b/id ?b]
+                    [$b ?bucket :b/enabled ?on] [(= ?on true)] [$o ?movie :order/title ?t]]
+            :query-source {:native-extrema {?t {:source $o :attribute :order/title}}}}
+        query! #(set (d/q % selected bucket orders))]
+    (is (= [:costed-site-join] (mapv :policy (:regions (d/explain {:run? false} q selected bucket orders)))))
+    (is (= #{["Alpha"]} (query! q) (query! (assoc-in q [:query-source :planning :estimate-max-requests] 0))))
+    (is (empty? (query! (update q :where conj '[(= ?b 42)]))))
+    (sql! (str "INSERT INTO " (table "bucket") " VALUES (7,true)"))
+    (let [extra (pg/source (accept-relation "bucket" {:c/id "id" :c/on "enabled"}) *profile*)
+          filtered (-> q (update :in conj '$c)
+                       (update :where into '[[$o ?movie :order/owner ?owner] [$c ?row :c/id ?owner]
+                                             [$c ?row :c/on ?ok] [(= ?ok true)]])
+                       (assoc-in [:query-source :planning] {:link-rtt-ns 1000 :estimate-budget-ms 1000}))
+          placement (get-in (d/explain {:run? true} filtered selected bucket orders extra)
+                            [:regions 0 :placement])]
+      (is (= #{["Alpha"]} (set (d/q filtered selected bucket orders extra))))
+      (is (= [:ordinary :filtered-receiver-transfer] ((juxt :mode :reason) placement)))
+      (is (zero? (:live-sessions (pg/statistics extra)))))
+    (sql! (str "UPDATE " (table "orders") " SET stamp='infinity' WHERE id=2"))
+    (is (= :query-source/invalid (category #(query! (update q :where conj '[$o ?movie :order/stamp ?stamp])))))
+    (is (every? #(zero? (:live-sessions (pg/statistics %))) [selected bucket orders]))))
+
+(deftest fanout-timeout-restores-the-receiver-transaction
+  (with-open [connection (DriverManager/getConnection (:jdbc-url *profile*))]
+    (let [metrics (atom {:external-requests 0})
+          context {:connection connection :cancelled (atom false) :profile (jdbc/profile! *profile*) :metrics metrics}
+          setting #(jdbc/query! context :planning "SELECT current_setting('statement_timeout'), txid_current_snapshot()::text" []
+                     (fn [rs] [(.getString ^java.sql.ResultSet rs 1) (.getString ^java.sql.ResultSet rs 2)]))]
+      (jdbc/begin! context)
+      (let [before (setting)
+            requests (:external-requests @metrics)]
+        (is (nil? (jdbc/sample-fanout! context {:sql "SELECT 0,1,1 FROM pg_sleep(1)" :params []} 50)))
+        (is (= 3 (- (:external-requests @metrics) requests)))
+        (is (= before (setting))))
+      (.rollback connection))))

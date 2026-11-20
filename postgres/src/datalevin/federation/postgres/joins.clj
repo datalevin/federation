@@ -57,7 +57,8 @@
         ordinal-column {:variable ordinal :type :long :nullable? false}
         inputs [ordinal-column required]
         query-columns (into [ordinal-column] outputs)
-        query {:mode :relational-fragment :semantics-version 1 :dependent-order? true
+        query {:mode :relational-fragment :semantics-version 1
+               :bound-join-mode (:bound-join-mode request :dependent)
                :clauses (into patterns predicates) :bindings (:bindings request)
                :sources (filterv #(some #{(:symbol %)} (map :source-symbol patterns))
                                  (:datalevin.query.source/region-sources request))
@@ -76,7 +77,7 @@
                             (some #(= :const (first (nth (:terms %) 2))) patterns)))
       (when-let [compiled (relational/compile-fragment accepted query maximum-row-bytes)]
         (merge (select-keys request [:source-symbol :region-id :scope-id])
-               {:id (str "join-" (str/join "-" (sort covered)) "-" (name boundary))
+               {:id (str (if (:protected-prefix? compiled) "join-prefix-" "join-") (str/join "-" (sort covered)) "-" (name boundary))
                 :definition-fingerprint (get-in request [:source-descriptor :definition-fingerprint])
                 :kind :join :anchor (first patterns) :clauses patterns :predicates predicates
                 :requires [required] :columns outputs :relational? true :join? true :ordinal? true

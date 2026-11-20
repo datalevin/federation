@@ -287,22 +287,37 @@
   ;; original predicate in the core and never use this bound in exact SQL.
   (or (comparison-filter type column op x)
       (when (and (= type "numeric") (#{:< :<= :> :>=} op))
-        (cond
-          (int? x) (comparison-filter type column op (BigDecimal/valueOf (long x)))
-          (and (instance? Double x) (Double/isFinite (double x)))
-          (let [lower? (#{:> :>=} op)
-                edge (if lower? (Math/nextDown (double x)) (Math/nextUp (double x)))]
-            (when (Double/isFinite edge)
-              (comparison-filter type column (if lower? :>= :<=) (BigDecimal. edge))))))))
+        (when-let [[sql params]
+                   (cond
+                     (int? x) (comparison-filter type column op (BigDecimal/valueOf (long x)))
+                     (and (instance? Double x) (Double/isFinite (double x)))
+                     (let [lower? (#{:> :>=} op)
+                           edge (if lower? (Math/nextDown (double x)) (Math/nextUp (double x)))]
+                       (when (Double/isFinite edge)
+                         (comparison-filter type column (if lower? :>= :<=) (BigDecimal. edge)))))]
+          [(str "(" sql " OR " column " IN ('NaN'::numeric,'Infinity'::numeric,'-Infinity'::numeric))") params]))))
+
+(defn- date-pair-filter [accepted column other op]
+  ;; Both bindings come from this fused row. Keep nonfinite values visible
+  ;; to the existing decoder, which reports them as invalid calendar dates.
+  (when (and other (#{:< :> :<= :>=} op)
+             (every? #(= "date" (pm/storage-type (get-in accepted [:requirements :columns %])))
+                     [column other]))
+    (let [a (column-sql column) b (column-sql other)]
+      [(str "(" a " " (operators op) " " b " OR NOT isfinite(" a ") OR NOT isfinite(" b "))") []])))
 
 (defn predicates
   "Push matching scalar comparisons and supported LIKE calls as prefilters.
   Unsupported types and comparisons remain core residuals."
   [accepted candidate request]
-  (let [vars (into {} (keep (fn [clause]
+  (let [;; A single integral identity projects its key as a long.
+        integral-id (when (= [:long] (get-in accepted [:identity :type :parameters :key-types]))
+                      (get-in accepted [:identity :attribute]))
+        vars (into {} (keep (fn [clause]
                               (let [[_ [_ a] [tag v]] (:terms clause)
                                     cs (pm/attribute-columns accepted a)]
-                                (when (and (= :var tag) (= 1 (count cs)))
+                                (when (and (= :var tag) (= 1 (count cs))
+                                           (or (= a integral-id) (get-in accepted [:attributes a :type])))
                                   [v (first cs)]))) (:clauses candidate)))]
     (vec (keep (fn [{:keys [kind operator args] :as predicate}]
                  (when (and (= kind :predicate) (= 2 (count args)))
@@ -310,13 +325,14 @@
                          [a b op] (if (and (not like?) (= :const (first a)))
                                     [b a (reverse-operator operator)] [a b operator])
                          [tag v] a [ctag x] b column (vars v)]
-                     (when (and (= :var tag) column (= :const ctag))
-                       (when-let [filter (if (= op :like-any)
-                                         (like-any-filter (pm/storage-type (get-in accepted [:requirements :columns column]))
-                                                          (column-sql column) x)
-                                         ((if like? like-filter range-prefilter)
-                                          (pm/storage-type (get-in accepted [:requirements :columns column]))
-                                          (column-sql column) op x))]
+                     (when (and (= :var tag) column)
+                       (when-let [filter (case ctag
+                                           :var (date-pair-filter accepted column (vars x) op)
+                                           :const (let [type (pm/storage-type (get-in accepted [:requirements :columns column]))]
+                                                    (if (= op :like-any)
+                                                      (like-any-filter type (column-sql column) x)
+                                                      ((if like? like-filter range-prefilter) type (column-sql column) op x)))
+                                           nil)]
                          (assoc predicate :column column :filter filter)))))) (:clauses request)))))
 
 (defn estimate-sql

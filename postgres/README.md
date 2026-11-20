@@ -304,6 +304,15 @@ Set `:whole-query-mode` consistently on the participating runtime profiles:
 | `:sql` | Prefer complete SQL whenever the query is eligible. |
 | `:dependent` | Keep whole-query execution in Datalevin while allowing filtered and dependent join pushdown. |
 
+For joins driven by batches of incoming keys, set `:bound-join-mode` on the
+participating profiles. The default `:dependent` fences each keyed lookup.
+With `:protected-prefix`, PostgreSQL materializes the lookup from the incoming
+keys into the one directly bound table and can reorder the remaining joins.
+When multiple tables are directly bound, the adapter uses the dependent plan.
+The materialization is per SQL statement. Each result retains its incoming binding
+ordinal. The option applies when Datalevin selects a bound join alternative.
+An applied prefix has an alternative ID beginning with `join-prefix-` in `d/explain`.
+
 Set `:relational? false` to disable relational delegation. All modes preserve
 type, collation, authorization, and expression checks. `d/explain` identifies
 whole-query plans with `:policy :relational-v1`. Plan-only explanation still
@@ -378,6 +387,7 @@ Use the same context ID only for compatible database, role, and settings.
 | `:fusion?` | `true` | Combine scalar attributes of one entity into one SQL access |
 | `:relational?` | `true` | Allow eligible SQL joins and aggregation |
 | `:whole-query-mode` | `:auto` | Prefer whole-query SQL automatically, or select `:sql` / `:dependent` for workload comparisons; semantic checks always apply |
+| `:bound-join-mode` | `:dependent` | Use `:protected-prefix` to materialize the first lookup of an eligible bound join |
 | `:statistics?` | `true` | Use catalog row estimates to plan accesses |
 | `:filtered-statistics?` | `true` | Allow bounded EXPLAIN probes for filtered row estimates; requires `:statistics?` |
 | `:role` | unset | Transaction-local PostgreSQL role |

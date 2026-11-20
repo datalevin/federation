@@ -211,8 +211,34 @@
         cursor)
       (catch Throwable e (spi/release! token) (throw e)))))
 
+(defn- date-terms [clauses encode?]
+  (letfn [(term [[tag x :as t]]
+            (cond (and encode? (= :const tag) (instance? java.time.LocalDate x))
+                  [::epoch-day (.toEpochDay ^java.time.LocalDate x)]
+                  (and (not encode?) (= ::epoch-day tag)) [:const (java.time.LocalDate/ofEpochDay (long x))]
+                  :else t))
+          (clause [c]
+            (case (:kind c)
+              :boolean (update c :clauses #(mapv clause %))
+              :predicate (update c :args #(mapv term %))
+              (:pattern :optional :absence) (update c :terms #(mapv term %))
+              c))]
+    (mapv clause clauses)))
+
+(defn- portable-query [request fields]
+  (let [q (select-keys request fields)
+        dates (into {} (keep (fn [[v x]] (when (instance? java.time.LocalDate x)
+                                            [v (.toEpochDay ^java.time.LocalDate x)]))) (:bindings q))
+        clauses (date-terms (:clauses q) true)]
+    (if (and (empty? dates) (= clauses (:clauses q))) q
+      (assoc q :clauses clauses :bindings (apply dissoc (:bindings q) (keys dates)) ::epoch-days dates))))
+
 (defn- compile-relational! [ctl views request max-row-bytes decline-on-limit?]
-  (let [n (count (filter #(#{:pattern :optional} (:kind %)) (:clauses request)))]
+  (let [request (if-let [dates (::epoch-days request)]
+                  (-> request (update :clauses date-terms false)
+                      (update :bindings merge (update-vals dates #(java.time.LocalDate/ofEpochDay (long %))))
+                      (dissoc ::epoch-days)) request)
+        n (count (filter #(#{:pattern :optional} (:kind %)) (:clauses request)))]
     (when (<= 1 n 32)
       (let [token (try (spi/reserve! ctl {:retained-bytes (+ 1048576 (* 32768 n n))})
                        (catch clojure.lang.ExceptionInfo e
@@ -252,6 +278,30 @@
           (ensure! (and compiled (= (:columns open) (:columns compiled))) :open)
           (cursor! session (accepted (:symbol (first sources)))
                    {:relational? true :query compiled :columns (:columns compiled) :requires [] :bindings {}} nil nil))))))
+
+(declare request-cost)
+
+(defn- session-relational-query [session open estimate?]
+  (let [{:keys [views request context]} session plan (:plan open) sources (:sources plan)
+        descriptor (get-in views [(:definition-fingerprint open) :descriptor])
+        _ (ensure! (and (= (select-keys request common) (select-keys open common))
+                        (seq sources) descriptor (= 0 (:region-id open))
+                        (= (:source-symbol open) (:symbol (first sources)))
+                        (= (:definition-fingerprint open) (:definition-fingerprint (first sources)))
+                        (= (:scope-id open) (get-in descriptor [:scope :id]))) :open)
+        accepted (into {} (map (fn [{:keys [symbol definition-fingerprint]}]
+                                 (let [view (views definition-fingerprint)]
+                                   (ensure! view :open)
+                                   [symbol (:accepted view)]))) sources)
+        query (assoc (:query plan) :sources sources ::relational/estimate? estimate?
+                     ::relational/binary-associations
+                     (into #{} (keep (fn [view]
+                                       (when @(:binary-association? view)
+                                         (get-in view [:accepted :requirements :table]))))
+                           (vals views)))
+        compiled (compile-relational! (:control request) accepted query (get-in context [:profile :max-row-bytes]) false)]
+    (ensure! (and compiled (= (:columns open) (:columns compiled))) :open)
+    [compiled (accepted (:symbol (first sources)))]))
 
 (defrecord Session [views request context info state reservations registration stats]
   spi/IQuerySourceSession
@@ -309,26 +359,28 @@
       (ensure! (and (= (select-keys request common) (select-keys open common))
                     (empty? (:cursors @state)) (= "relational" (:alternative-id open))
                     (not (contains? open :bindings))) :open)
-      (let [plan (:plan open)
-            sources (:sources plan)
-            accepted (into {} (map (fn [{:keys [symbol definition-fingerprint]}]
-                                     (let [view (views definition-fingerprint)]
-                                       (ensure! view :open)
-                                       [symbol (:accepted view)]))) sources)
-            descriptor (get-in views [(:definition-fingerprint open) :descriptor])
-            query (assoc (:query plan) :sources sources
-                         ::relational/binary-associations
-                         (into #{} (keep (fn [view]
-                                           (when @(:binary-association? view)
-                                             (get-in view [:accepted :requirements :table]))))
-                               (vals views)))
-            compiled (compile-relational! (:control request) accepted query (get-in context [:profile :max-row-bytes]) false)]
-        (ensure! (and descriptor (= (:source-symbol open) (:symbol (first sources)))
-                      (= (:definition-fingerprint open) (:definition-fingerprint (first sources)))
-                      (= (:scope-id open) (get-in descriptor [:scope :id])) (= 0 (:region-id open))
-                      compiled (= (:columns open) (:columns compiled))) :open)
-        (cursor! this (accepted (:symbol (first sources)))
-                 {:relational? true :query compiled :columns (:columns compiled) :requires [] :bindings {}} nil nil))))
+      (let [[compiled accepted] (session-relational-query this open false)]
+        (cursor! this accepted {:relational? true :query compiled :columns (:columns compiled) :requires [] :bindings {}} nil nil))))
+  spi/IRelationalEstimateSession
+  (-estimate-relational [this open]
+    (locking state
+      (active! this)
+      (when (and (get-in context [:profile :statistics?]) (empty? (:cursors @state)))
+        (let [[compiled _] (session-relational-query this open true)
+              latency (request-cost this)]
+          (when (and latency (<= 1 (:fetch-size (:profile context))))
+            (when-let [size (jdbc/explain-size! context (or (:size-query compiled) compiled) (:receiver-work? open))]
+              (assoc size :request-ns latency :fetch-rows (get-in context [:profile :fetch-size]))))))))
+  spi/IRelationalFanoutSession
+  (-sample-relational [this open]
+    (locking state
+      (active! this)
+      (when (and (get-in context [:profile :statistics?]) (empty? (:cursors @state)))
+        (let [start (System/nanoTime)
+              [compiled _] (session-relational-query this open :sample)
+              remaining (- (:budget-ms open) (quot (- (System/nanoTime) start) 1000000))]
+          (when-let [query (:fanout-query compiled)]
+            (jdbc/sample-fanout! context query remaining))))))
   spi/IRelationalFragmentSession
   (-open-relational-fragment-cursor [this open] (open-fragment! this open))
   spi/IQuerySourceTextExtrema
@@ -373,6 +425,8 @@
                  :datalevin.query.source/absence-relational? true
                  :datalevin.query.source/boolean-filters-relational? true
                  :datalevin.query.source/nullable-projections-relational? true ::accepted accepted)
+    (and (:relational? profile) (not= :dependent (:whole-query-mode profile)) (not (pm/spooled? accepted)))
+    (assoc :datalevin.query.source/integer-domain-limit 8192 :datalevin.query.source/integer-reference-key? true)
     (:predicate-prefilters? profile)
     (assoc :datalevin.query.source/predicate-prefilters #{:like-any})))
 
@@ -664,9 +718,12 @@
                               :constraints plan/constraints
                               :estimate (statistics/with-request-cost (:estimate candidate) true
                                           (request-cost session) (:fetch-size profile))
-                              :explain {:label "PostgreSQL filtered dependent join"}})
+                              :explain {:label (if (get-in candidate [:query :protected-prefix?])
+                                                 "PostgreSQL protected-prefix join"
+                                                 "PostgreSQL filtered dependent join")}})
                            (catch Throwable e (spi/release! token) (throw e)))))
-                     (joins/alternatives views request (:max-row-bytes profile)))
+                     (joins/alternatives views (assoc request :bound-join-mode (:bound-join-mode profile))
+                                         (:max-row-bytes profile)))
                (finally (spi/release! scratch))))))}))
   spi/IQuerySourceEstimation
   (-estimation-info [_ session request]
@@ -690,7 +747,7 @@
           {:columns (:columns request)
            :plan {:sources (mapv (fn [{:keys [symbol descriptor]}]
                                   {:symbol symbol :definition-fingerprint (:definition-fingerprint descriptor)}) sources)
-                  :query (select-keys request [:mode :semantics-version :clauses :bindings :find :with :columns :window :datalevin.query.source/ignore-nil-extrema])}}))))
+                  :query (portable-query request [:mode :semantics-version :clauses :bindings :find :with :columns :window :datalevin.query.source/ignore-nil-extrema])}}))))
   spi/IRelationalQuerySource
   (-plan-relational [_ request]
     (when (and (:relational? profile) (not= :dependent (:whole-query-mode profile)))
@@ -703,7 +760,7 @@
           {:columns (:columns request)
            :plan {:sources (mapv (fn [{:keys [symbol descriptor]}]
                                   {:symbol symbol :definition-fingerprint (:definition-fingerprint descriptor)}) sources)
-                  :query (select-keys request [:mode :semantics-version :clauses :bindings :find :with :columns :datalevin.query.source/native-extrema :datalevin.query.source/ignore-nil-extrema])}}))))
+                  :query (portable-query request [:mode :semantics-version :clauses :bindings :find :with :columns :datalevin.query.source/existence-key :datalevin.query.source/integer-reference-key :datalevin.query.source/fanout-key :datalevin.query.source/decimal-expressions :datalevin.query.source/native-extrema :datalevin.query.source/ignore-nil-extrema])}}))))
   spi/IRelationalFragmentSource
   (-plan-relational-fragment [_ request]
     (when (and (:relational? profile) (= :relational-fragment (:mode request)) (seq (:inputs request)))
@@ -714,7 +771,7 @@
           {:columns (:columns request) :constraints (select-keys plan/constraints [:max-binding-rows :max-binding-bytes])
            :plan {:sources (mapv (fn [{:keys [symbol descriptor]}]
                                   {:symbol symbol :definition-fingerprint (:definition-fingerprint descriptor)}) sources)
-                  :query (select-keys request [:mode :semantics-version :clauses :bindings :find :with :columns :inputs :datalevin.query.source/ignore-nil-extrema])}}))))
+                  :query (portable-query request [:mode :semantics-version :clauses :bindings :find :with :columns :inputs :datalevin.query.source/ignore-nil-extrema])}}))))
   spi/IQuerySource
   (-source-info [_] descriptor)
   (-open-session [this request] (acquire this request))

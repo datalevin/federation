@@ -188,6 +188,38 @@
   (doseq [mode [nil true :always "sql"]]
     (is (thrown? Exception (jdbc/profile! (assoc profile :whole-query-mode mode))))))
 
+(deftest bound-join-profile-modes
+  (is (= :dependent (:bound-join-mode (jdbc/profile! profile))))
+  (doseq [mode [:dependent :protected-prefix]]
+    (is (= mode (:bound-join-mode (jdbc/profile! (assoc profile :bound-join-mode mode))))))
+  (doseq [mode [nil :auto :sql]]
+    (is (thrown? clojure.lang.ExceptionInfo (jdbc/profile! (assoc profile :bound-join-mode mode))))))
+
+(deftest protected-prefix-requires-one-directly-bound-table-and-a-connected-continuation
+  (let [views {'$a accepted '$b accepted}
+        column {:variable '?key :type :bigdec :nullable? false}
+        query {:mode :relational-fragment :semantics-version 1 :sources [{:symbol '$a} {:symbol '$b}]
+               :inputs [column] :input-bindings [{:binding-id 0 :values [1.00M]}]
+               :find [{:kind :variable :variable '?key}] :columns [column] :with [] :bindings {}
+               :clauses [{:id 0 :kind :pattern :source-symbol '$a
+                          :terms '[[:var ?e] [:const :order/amount] [:var ?key]]}
+                         {:id 1 :kind :pattern :source-symbol '$b
+                          :terms '[[:var ?e] [:const :order/title] [:const "item"]]}]}
+        compile (fn [request mode]
+                  (relational/compile-fragment views (assoc request :bound-join-mode mode) 4096))
+        prefix (compile query :protected-prefix)
+        dependent (compile query :dependent)]
+    (is (:protected-prefix? prefix))
+    (is (= 1 (count (re-seq #" OFFSET 0" (:sql prefix)))))
+    (is (= 2 (count (re-seq #" OFFSET 0" (:sql dependent)))))
+    (is (= [1.00M "item"] (:params prefix) (:params dependent)))
+    (is (= (dissoc dependent :sql) (dissoc prefix :sql :protected-prefix?)))
+    (let [ambiguous (assoc-in query [:clauses 1 :terms] '[[:var ?e] [:const :order/amount] [:var ?key]])]
+      (is (= dependent (relational/compile-fragment views (assoc query :dependent-order? true) 4096)))
+      (is (some? (compile ambiguous :dependent)))
+      (is (= (compile ambiguous :dependent) (compile ambiguous :protected-prefix))))
+    (is (nil? (compile (assoc-in query [:clauses 1 :terms 0] [:var '?unconnected]) :protected-prefix)))))
+
 (defn relational-request [find columns predicates]
   {:mode :relational :semantics-version 1 :sources [{:symbol '$p}]
    :clauses (into [{:id 0 :kind :pattern :source-symbol '$p
@@ -812,3 +844,15 @@
     (is (nil? (pushed := 0.05)))
     (is (nil? (pushed :< Double/NaN)))
     (is (nil? (plan/comparison-filter "numeric" "x" :>= 0.05)))))
+
+(deftest same-row-calendar-comparison
+  (let [cat (update catalog :columns merge {"start_date" {:type "date" :type-id 1082 :not-null? true}
+                                            "end_date" {:type "date" :type-id 1082 :not-null? true}})
+        mapping (pg/accept-mapping cat (assoc declaration :attributes {:o/start "start_date" :o/end "end_date"}))
+        facts [{:terms '[[:var ?e] [:const :o/start] [:var ?a]]}
+               {:terms '[[:var ?e] [:const :o/end] [:var ?b]]}]
+        request {:clauses [{:kind :predicate :operator :< :args '[[:var ?a] [:var ?b]]}]}
+        filters #(mapv :filter (plan/predicates mapping {:clauses %} request))]
+    (is (= [["(r.\"start_date\" < r.\"end_date\" OR NOT isfinite(r.\"start_date\") OR NOT isfinite(r.\"end_date\"))" []]]
+           (filters facts)))
+    (is (empty? (filters (take 1 facts))))))
