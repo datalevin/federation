@@ -8,10 +8,13 @@
            [java.sql Connection DriverManager PreparedStatement ResultSet SQLException]
            [java.util IdentityHashMap Properties]
            [java.util.concurrent ArrayBlockingQueue Callable Executor ExecutorService
-            Future Semaphore ThreadFactory ThreadPoolExecutor TimeUnit TimeoutException]))
+            Future Semaphore ThreadFactory ThreadPoolExecutor TimeUnit TimeoutException]
+           [org.postgresql.util PSQLException ServerErrorMessage]))
 
-(defn fail! [error phase]
-  (throw (ex-info "PostgreSQL query source failed" {:error error :phase phase})))
+(defn fail!
+  ([error phase] (fail! error phase nil))
+  ([error phase data]
+   (throw (ex-info "PostgreSQL query source failed" (assoc data :error error :phase phase)))))
 
 (defn ensure! [condition phase]
   (when-not condition (fail! :query-source/invalid phase)))
@@ -47,7 +50,7 @@
   (when resource (try (.close ^AutoCloseable resource) (catch Exception _ nil))))
 
 (defn profile! [profile]
-  (let [profile (merge {:connect-timeout-ms 10000 :statement-timeout-ms 10000
+  (let [profile (merge {:connect-timeout-ms 10000
                         :fetch-size 128 :max-row-bytes 16384 :fusion? true :relational? true
                         :statistics? true :filtered-statistics? true :predicate-prefilters? true
                         :whole-query-mode :auto :bound-join-mode :dependent} profile)]
@@ -56,8 +59,11 @@
       (ensure! (and (string? url) (str/starts-with? url "jdbc:postgresql:")) :profile))
     (when-let [pool (:data-source profile)]
       (ensure! (instance? javax.sql.DataSource pool) :profile))
-    (doseq [k [:connect-timeout-ms :statement-timeout-ms :max-row-bytes]]
+    (doseq [k [:connect-timeout-ms :max-row-bytes]]
       (ensure! (and (integer? (k profile)) (<= 1 (k profile) 1048576)) :profile))
+    (when (contains? profile :statement-timeout-ms)
+      (let [ms (:statement-timeout-ms profile)]
+        (ensure! (and (integer? ms) (<= 1 ms Integer/MAX_VALUE)) :profile)))
     (ensure! (and (integer? (:fetch-size profile)) (<= 1 (:fetch-size profile) 256)
                   (boolean? (:fusion? profile)) (boolean? (:relational? profile))
                   (boolean? (:statistics? profile)) (boolean? (:filtered-statistics? profile))
@@ -76,6 +82,15 @@
 (defn check! [{:keys [control cancelled]}]
   (when control (spi/check-active! control))
   (when @cancelled (fail! :query-source/cancelled :execution)))
+
+(defn- statement-timeout-ms [{:keys [profile control]}]
+  (let [cap (:statement-timeout-ms profile)
+        remaining (when control (spi/remaining-time-ms control))]
+    (if (some? remaining)
+      ;; The control reports whole milliseconds rounded down. Let its deadline
+      ;; fire before PostgreSQL's timeout when the invocation has less time.
+      (min (or cap Integer/MAX_VALUE) (inc (min remaining (dec Integer/MAX_VALUE))))
+      (or cap 10000))))
 
 (defn checkout-deadline
   "One deadline shared by admission and the primary checkout. A later validation
@@ -174,14 +189,22 @@
 (defn translate! [context phase ^SQLException error]
   (check! context)
   (let [state (.getSQLState error)]
-    (fail! (cond
-             (= "57014" state) :query/timeout
-             (or (= "42501" state) (and state (str/starts-with? state "28"))) :query-source/unauthorized
-             (and state (str/starts-with? state "22")) :query-source/invalid
-             (or (#{"57P01" "57P02" "57P03"} state)
-                 (and state (str/starts-with? state "08"))) :query-source/snapshot-lost
-             (and state (str/starts-with? state "42")) :query-source/stale-definition
-             :else :query-source/provider) phase)))
+    (if (= "57014" state)
+      ;; PostgreSQL also uses 57014 for user and driver cancellations. Expose
+      ;; only a fixed keyword when the server identifies its statement timeout.
+      (let [server (when (instance? PSQLException error)
+                     (.getServerErrorMessage ^PSQLException error))]
+        (fail! :query/timeout phase
+               (when (and server (= "canceling statement due to statement timeout"
+                                    (.getMessage ^ServerErrorMessage server)))
+                 {:limit :statement-timeout})))
+      (fail! (cond
+               (or (= "42501" state) (and state (str/starts-with? state "28"))) :query-source/unauthorized
+               (and state (str/starts-with? state "22")) :query-source/invalid
+               (or (#{"57P01" "57P02" "57P03"} state)
+                   (and state (str/starts-with? state "08"))) :query-source/snapshot-lost
+               (and state (str/starts-with? state "42")) :query-source/stale-definition
+               :else :query-source/provider) phase))))
 
 (defn request!
   "Admit a real round trip. The callback fully consumes its bounded result."
@@ -198,12 +221,12 @@
                     #(-> % (update :count inc) (update :elapsed-ns + (- (System/nanoTime) started)))))
            (close! permit)))))
 
-(defn statement ^PreparedStatement [{:keys [connection profile control]} sql params]
+(defn statement ^PreparedStatement [{:keys [connection] :as context} sql params]
   (let [stmt (.prepareStatement ^Connection connection sql)]
     (try
-      (.setQueryTimeout stmt (int (max 1 (quot (+ 999 (min (:statement-timeout-ms profile)
-                                                          (or (when control (spi/remaining-time-ms control))
-                                                              Long/MAX_VALUE))) 1000))))
+      ;; Keep the driver as a fallback and give the server time to report its
+      ;; reason before the driver's whole-second cancellation can race it.
+      (.setQueryTimeout stmt (int (inc (quot (+ 999 (statement-timeout-ms context)) 1000))))
       (doseq [[i x] (map-indexed vector params)] (.setObject stmt (inc (int i)) x))
       stmt
       (catch Throwable e (close! stmt) (throw e)))))
@@ -235,7 +258,7 @@
   (.setAutoCommit ^Connection connection false)
   (execute! context :acquisition "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY" [])
   (execute! context :acquisition "SET LOCAL search_path = pg_catalog" [])
-  (execute! context :acquisition (str "SET LOCAL statement_timeout = " (:statement-timeout-ms profile)) [])
+  (execute! context :acquisition (str "SET LOCAL statement_timeout = " (statement-timeout-ms context)) [])
   (execute! context :acquisition "SET LOCAL row_security = on" [])
   (execute! context :acquisition "SET LOCAL IntervalStyle = iso_8601" [])
   (when-let [role (:role profile)]
@@ -498,7 +521,7 @@
   savepoint restores both the snapshot transaction and its statement timeout."
   [context {:keys [sql params stages]} budget-ms]
   (let [start (System/nanoTime)
-        timeout (min budget-ms (get-in context [:profile :statement-timeout-ms]))]
+        timeout (min budget-ms (statement-timeout-ms context))]
     (when (pos? timeout)
       (execute! context :planning
                 (str "SAVEPOINT dtlv_fanout; SET LOCAL statement_timeout = " (long timeout)) [])

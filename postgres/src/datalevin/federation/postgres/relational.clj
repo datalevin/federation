@@ -21,7 +21,7 @@
 
 (defn- expression [accepted alias columns type shape]
   (let [types (mapv #(pm/storage-type (get-in accepted [:requirements :columns %])) columns)]
-    (require! (every? #{"int2" "int4" "int8" "bool" "uuid" "text" "varchar" "bytea" "numeric" "timestamptz" "date"} types))
+    (require! (every? #{"int2" "int4" "int8" "bool" "uuid" "text" "varchar" "bytea" "numeric" "timestamptz" "date" "timestamp"} types))
     {:sql (mapv #(text-column (str alias "." (jdbc/identifier %1)) %2) columns types)
      :raw-sql (mapv #(str alias "." (jdbc/identifier %)) columns)
      :types types :type type :shape shape :aliases #{alias}
@@ -59,7 +59,11 @@
   (require! (and (= (:type a) (:type b)) (= (:shape a) (:shape b)) (= (count (:sql a)) (count (:sql b)))))
   (conjunction
     (mapcat (fn [x y type other]
-              (require! (= (pm/types type) (pm/types other)))
+              ;; PostgreSQL coerces other calendar types to timestamp in SQL.
+              ;; Datalevin equality keeps their Java representations distinct.
+              (require! (if (or (= "timestamp" type) (= "timestamp" other))
+                          (= type other)
+                          (= (pm/types type) (pm/types other))))
               (cond-> [(str x " = " y)]
                 (and strict? (= type "numeric")) (conj (str (or (get (:scales a) (.indexOf ^java.util.List (:sql a) x)) (str "scale(" x ")"))
                                                                    " = " (or (get (:scales b) (.indexOf ^java.util.List (:sql b) y)) (str "scale(" y ")"))))))
@@ -513,7 +517,7 @@
                                     (keep (fn [[sql type]]
                                             (case type
                                               "numeric" (str sql "::text IN ('NaN','Infinity','-Infinity')")
-                                              ("timestamptz" "date") (str "NOT isfinite(" sql ")") nil)) columns))))
+                                              ("timestamptz" "date" "timestamp") (str "NOT isfinite(" sql ")") nil)) columns))))
           invalid (str "COALESCE((" invalid "),FALSE)")
           bad (str "(" oversized ") OR (" invalid ")")
           used (vec (distinct (concat (map :variable (:find request)) (:with request))))
@@ -627,7 +631,7 @@
                (not-any? #(str/includes? % "?") (butlast conditions)))
       (let [qual (conjunction (conj (vec (butlast conditions)) (str field " = k.v")))
             probe (str "SELECT 1 FROM " (table-sql (first tables)) " WHERE " qual)
-            guard (if (some (fn [[_ t]] (#{"numeric" "timestamptz" "date"} t)) columns)
+            guard (if (some (fn [[_ t]] (#{"numeric" "timestamptz" "date" "timestamp"} t)) columns)
                     (str "EXISTS (" probe " AND (" invalid "))") "FALSE")
             size (str "octet_length(k.v::text) > " (long max-row-bytes))]
         {:sql (str "SELECT " size ", " guard ", CASE WHEN NOT (" size ") THEN k.v END "

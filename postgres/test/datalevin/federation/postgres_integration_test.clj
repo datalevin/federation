@@ -15,7 +15,7 @@
             [datalevin.util :as u])
   (:import [java.lang.reflect Proxy InvocationHandler InvocationTargetException Method]
            [java.sql Connection DriverManager]
-           [java.time Instant]
+           [java.time Instant LocalDateTime]
            [java.util UUID]
            [java.util.concurrent ArrayBlockingQueue CountDownLatch TimeUnit]
            [javax.sql DataSource ConnectionEventListener]
@@ -840,6 +840,35 @@
     (is (zero? (:live-sessions (pg/statistics provider))))
     (control/close! ctl)))
 
+(deftest statement-timeout-follows-the-invocation-and-honors-explicit-caps
+  (doseq [[timeout-ms profile-options expected?]
+          [[nil {} #(= 10000 %)]
+           [60000 {} #(< 10000 % 60001)]
+           [60000 {:statement-timeout-ms 1200000} #(< 10000 % 60001)]
+           [60000 {:statement-timeout-ms 250} #(= 250 %)]]]
+    (let [ctl (control/create {:timeout-ms timeout-ms})]
+      (try
+        (with-open [conn (DriverManager/getConnection (:jdbc-url *profile*))]
+          (let [context {:connection conn :profile (jdbc/profile! (merge *profile* profile-options))
+                         :control ctl :cancelled (atom false)}]
+            (jdbc/begin! context)
+            (is (expected? (first (jdbc/query! context :acquisition
+                                    "SELECT setting::bigint FROM pg_settings WHERE name='statement_timeout'"
+                                    [] #(.getLong ^java.sql.ResultSet % 1)))))))
+        (finally (control/close! ctl)))))
+  (let [provider (source {:statement-timeout-ms 500})
+        q '{:find [(count ?e)] :in [$p] :where [[$p ?e :order/title ?title]] :timeout 5000}]
+    (.setAutoCommit ^Connection *db* false)
+    (try
+      (sql! (str "LOCK TABLE " (table "orders") " IN ACCESS EXCLUSIVE MODE"))
+      (is (= {:error :query/timeout :phase :acquisition :limit :statement-timeout}
+             (select-keys (error #(d/q q provider)) [:error :phase :limit])))
+      (is (= {:error :query/timeout}
+             (select-keys (error #(d/q (assoc q :timeout 150) provider)) [:error :limit])))
+      (finally (.rollback ^Connection *db*) (.setAutoCommit ^Connection *db* true)))
+    (is (= #{[3]} (set (d/q q provider))))
+    (is (zero? (:live-sessions (pg/statistics provider))))))
+
 (deftest shared-scan-and-lookup-conformance
   ;; Scalar attributes are the supported subset of the shared gate's :many role.
   (doseq [fusion? [false true]]
@@ -1396,6 +1425,29 @@
     (is (empty? (d/q '[:find ?id :in $p [?z ...] :where [$p ?e :row/id ?id] [$p ?e :row/zoned ?z]]
                        provider [(java.time.OffsetTime/parse "12:34:56+18:00")])))
     (is (= accepted (read-string (pr-str accepted))))))
+
+(deftest timestamp-windows-delegate-grouped-counts-at-microsecond-boundaries
+  (sql! (str "CREATE TABLE " (table "events") " (id bigint PRIMARY KEY, stamp timestamp, category bigint)"))
+  (sql! (str "INSERT INTO " (table "events") " VALUES "
+             "(1,'2024-03-10 02:00:00.000000',7),(2,'2024-03-10 02:00:00.000001',7),"
+             "(3,'2024-03-10 02:00:00.000002',8),(4,'2024-03-10 02:00:00.000003',8),(5,NULL,8)"))
+  (let [accepted (accept-relation "events" {:row/stamp "stamp" :row/category "category"})
+        provider (pg/source accepted *profile*)
+        lo (LocalDateTime/parse "2024-03-10T02:00:00.000000001")
+        hi (LocalDateTime/parse "2024-03-10T02:00:00.000002001")
+        q '{:find [?category (count ?e)] :in [$p ?lo ?hi]
+            :where [[$p ?e :row/stamp ?stamp] [(>= ?stamp ?lo)] [(< ?stamp ?hi)]
+                    [$p ?e :row/category ?category]]}
+        constants (assoc q :in '[$p]
+                           :where (assoc (:where q) 1 [(list '>= '?stamp lo)] 2 [(list '> hi '?stamp)]))]
+    (doseq [[query args] [[q [lo hi]] [constants []]]]
+      (is (relational-plan? (apply d/explain {:run? false} query provider args)))
+      (is (= #{[7 1] [8 1]} (set (apply d/q query provider args)))))
+    (sql! (str "INSERT INTO " (table "events") " VALUES (6,'infinity',8)"))
+    (let [q '{:find [?category (count ?e)] :in [$p]
+              :where [[$p ?e :row/stamp ?stamp] [$p ?e :row/category ?category]]}]
+      (is (relational-plan? (d/explain {:run? false} q provider)))
+      (is (= :query-source/invalid (category #(d/q q provider)))))))
 
 (deftest temporal-sentinels-fail-without-silent-conversion
   (doseq [[type literal] [["date" "infinity"] ["timestamp" "-infinity"] ["time" "24:00:00"] ["timetz" "24:00:00+00"]]]

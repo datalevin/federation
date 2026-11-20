@@ -264,7 +264,9 @@ does not imply that the PostgreSQL column has an index.
 | Ordering and windows | Eligible whole-query projections with integral, decimal, boolean, or `Instant` sort keys, offset, and limit. |
 
 Temporal bounds for `Instant`, `LocalDate`, and `LocalDateTime` must be in years
-0001–9999. Offset-time ordering and interval comparisons execute locally.
+0001–9999. Grouped queries can delegate `timestamp` ranges with `LocalDateTime`
+literals or inputs. Bounds preserve wall-clock time and account for PostgreSQL's
+microsecond precision. Offset-time ordering and interval comparisons execute locally.
 Unsupported LIKE patterns, custom escape arguments, dynamic patterns, and other
 membership collections also stay local. Decimal min/max require fixed column
 scale; floating-point aggregation and unrestricted integral sums stay local.
@@ -381,7 +383,7 @@ Use the same context ID only for compatible database, role, and settings.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `:connect-timeout-ms` | `10000` | Maximum admission plus initial-checkout wait; also bounds each validation checkout |
-| `:statement-timeout-ms` | `10000` | PostgreSQL statement timeout |
+| `:statement-timeout-ms` | Remaining query time, or `10000` for calls without a deadline | Optional per-statement cap, in milliseconds, from 1 to 2,147,483,647 |
 | `:fetch-size` | `128` | Maximum rows per explicit server-cursor fetch; up to 256, reduced when needed to admit cursor workspace |
 | `:max-row-bytes` | `16384` | Maximum combined SQL text size of materialized values and keys per fact-access row, or the final returned row for delegated SQL |
 | `:fusion?` | `true` | Combine scalar attributes of one entity into one SQL access |
@@ -398,7 +400,10 @@ Use the same context ID only for compatible database, role, and settings.
 ## Bounds and lifecycle
 
 Set the query's `:timeout` and `:query-source :limits` to bound the whole
-invocation. Defaults allow 1,024 external requests and 1 GiB of retained memory,
+invocation. An explicit `:statement-timeout-ms` can end a PostgreSQL statement
+earlier. A server-reported statement timeout carries `:error :query/timeout`
+and `:limit :statement-timeout` when the driver exposes that reason in English.
+Defaults allow 1,024 external requests and 1 GiB of retained memory,
 shared by provider state, joins, and results. Connection setup, catalog reads,
 and cursor fetches consume requests. At 128 rows per fetch, a 100,000-row scan
 needs 782 fetches plus setup; multiple accesses share the budget.
