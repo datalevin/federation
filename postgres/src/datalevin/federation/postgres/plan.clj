@@ -153,6 +153,36 @@
 (def operators {:= "=" :not= "<>" :< "<" :<= "<=" :> ">" :>= ">="})
 (def reverse-operator {:= := :not= :not= :< :> :<= :>= :> :< :>= :<=})
 
+(defn independent-rows-upper-bound
+  "Bound the independent EAV scan of one entity by its integral primary-key
+  interval. Ignore other filters since they can only reduce this bound."
+  [accepted clauses]
+  (let [patterns (filterv #(= :pattern (:kind %)) clauses)
+        [key-column :as key-columns] (pm/key-columns accepted)
+        identity (get-in accepted [:identity :attribute])
+        entity (get-in patterns [0 :terms 0])]
+    (when (and (= 1 (count key-columns)) (= :var (first entity))
+               (#{"int2" "int4" "int8"} (pm/storage-type (get-in accepted [:requirements :columns key-column])))
+               (every? #(= entity (get-in % [:terms 0])) patterns))
+      (when-let [key-term (some (fn [{[_ a v] :terms}]
+                                  (when (and (= [:const identity] a) (= :var (first v))) v)) patterns)]
+        (let [[lo hi]
+              (reduce (fn [[lo hi :as span] {:keys [kind operator args]}]
+                        (let [[a b] args
+                              [lhs rhs op] (if (= :const (first a)) [b a (reverse-operator operator)] [a b operator])
+                              x (second rhs)]
+                          (if (and (= :predicate kind) (= key-term lhs) (= :const (first rhs)) (int? x))
+                            (case op
+                              := [(max lo x) (min hi x)]
+                              :> [(max lo (inc' x)) hi]
+                              :>= [(max lo x) hi]
+                              :< [lo (min hi (dec' x))]
+                              :<= [lo (min hi x)]
+                              span)
+                            span))) [Long/MIN_VALUE Long/MAX_VALUE] clauses)
+              n (max 0 (inc' (-' hi lo)))]
+          (when (<= n Long/MAX_VALUE) (long n)))))))
+
 (defn comparison-filter
   "Compile a comparison with matching scalar representations. Timestamp
   cutoffs are reduced to exact microsecond comparisons before binding; the

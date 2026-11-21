@@ -2372,6 +2372,37 @@
 (defn fragment-plan? [explanation]
   (some #(= :relational-fragment-v1 (:policy %)) (:regions explanation)))
 
+(deftest bounded-postgres-identity-range-can-drive-indexed-native-lookups
+  (sql! (str "CREATE TABLE " (table "window_events") " (id bigint PRIMARY KEY, name text, stamp timestamp)"))
+  (sql! (str "INSERT INTO " (table "window_events")
+             " SELECT i, 'key-' || i, timestamp '2024-01-01' + i * interval '1 day' FROM generate_series(1,64) i"))
+  (let [provider (pg/source (accept-relation "window_events" {:row/name "name" :row/stamp "stamp"}) *profile*)
+        base '{:find [?id ?name] :in [$ $events ?lo ?hi]
+               :where [[$events ?e :row/id ?id] [(<= ?lo ?id)] [(< ?id ?hi)]
+                       [$events ?e :row/name ?key] [?n :host/key ?key] [?n :host/source :active]
+                       [?n :host/name ?name]]}
+        bounded (-> base (update :in into '[?start ?end])
+                         (update :where into '[[$events ?e :row/stamp ?ts] [(>= ?ts ?start)] [(< ?ts ?end)]]))
+        start (LocalDateTime/parse "2024-01-03T00:00") end (LocalDateTime/parse "2024-01-05T00:00")
+        conn (d/create-conn nil {:host/key {:db/valueType :db.type/string}
+                                :host/source {:db/valueType :db.type/keyword}
+                                :host/name {:db/valueType :db.type/string}}
+                           {:kv-opts {:inmemory? true} :background-sampling? false})]
+    (try
+      (d/transact! conn [{:host/key "key-2" :host/source :active :host/name "name-2"}])
+      (is (fragment-plan? (d/explain {:run? false} bounded @conn provider 1 5 start end)))
+      (is (= #{[2 "name-2"]} (set (d/q bounded @conn provider 1 5 start end))))
+      (d/transact! conn (mapv #(hash-map :host/key (str "key-" %) :host/source :active :host/name (str "name-" %))
+                              (cons 1 (range 3 65))))
+      (doseq [[q args expected] [[base [] #{[1 "name-1"] [2 "name-2"] [3 "name-3"] [4 "name-4"]}]
+                                 [bounded [start end] #{[2 "name-2"] [3 "name-3"]}]]]
+        (let [plan (apply d/explain {:run? true} q @conn provider 1 5 args)]
+          (is (not (fragment-plan? plan)))
+          (is (= :access (get-in plan [:regions 0 :operators 0 :kind])))
+          (is (= (count expected) (read-rows plan)))
+          (is (= expected (set (apply d/q q @conn provider 1 5 args))))))
+      (finally (d/close conn)))))
+
 (defn fragment-fixture! [customers orders-per-customer f]
   (sql! (str "CREATE TABLE " (table "fragment_orders") " (id bigint PRIMARY KEY, customer bigint)"))
   (sql! (str "CREATE TABLE " (table "fragment_items") " (id bigint PRIMARY KEY, order_id bigint, price numeric(18,4))"))

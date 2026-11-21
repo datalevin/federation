@@ -424,6 +424,7 @@
                  :datalevin.query.source/native-extrema-relational? true
                  :datalevin.query.source/absence-relational? true
                  :datalevin.query.source/boolean-filters-relational? true
+                 :datalevin.query.source/independent-rows-upper-bound? true
                  :datalevin.query.source/nullable-projections-relational? true ::accepted accepted)
     (and (:relational? profile) (not= :dependent (:whole-query-mode profile)) (not (pm/spooled? accepted)))
     (assoc :datalevin.query.source/integer-domain-limit 8192 :datalevin.query.source/integer-reference-key? true)
@@ -768,10 +769,15 @@
             views (into {} (map (fn [{:keys [symbol descriptor]}] [symbol (::accepted descriptor)])) sources)]
         (when (and (= descriptor (:descriptor (first sources))) (every? some? (vals views))
                    (compile-relational! (:control request) views request (:max-row-bytes profile) true))
-          {:columns (:columns request) :constraints (select-keys plan/constraints [:max-binding-rows :max-binding-bytes])
-           :plan {:sources (mapv (fn [{:keys [symbol descriptor]}]
-                                  {:symbol symbol :definition-fingerprint (:definition-fingerprint descriptor)}) sources)
-                  :query (portable-query request [:mode :semantics-version :clauses :bindings :find :with :columns :inputs :datalevin.query.source/ignore-nil-extrema])}}))))
+          (let [independent-rows (when (and (:datalevin.query.source/independent-rows-upper-bound? request)
+                                            (:fusion? profile) (= 1 (count sources)) (not (pm/spooled? accepted))
+                                            (every? #(= :variable (:kind %)) (:find request)))
+                                   (plan/independent-rows-upper-bound accepted (:clauses request)))]
+            (cond-> {:columns (:columns request) :constraints (select-keys plan/constraints [:max-binding-rows :max-binding-bytes])
+                     :plan {:sources (mapv (fn [{:keys [symbol descriptor]}]
+                                            {:symbol symbol :definition-fingerprint (:definition-fingerprint descriptor)}) sources)
+                            :query (portable-query request [:mode :semantics-version :clauses :bindings :find :with :columns :inputs :datalevin.query.source/ignore-nil-extrema])}}
+              (some? independent-rows) (assoc :datalevin.query.source/independent-rows-upper-bound independent-rows)))))))
   spi/IQuerySource
   (-source-info [_] descriptor)
   (-open-session [this request] (acquire this request))
